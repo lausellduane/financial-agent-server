@@ -5,4 +5,6 @@ import { app } from "./server.js";
 // HTTP requests arrive through the Workers fetch handler below.
 app.listen(4000);
 
+export { Ledger } from "./ledger.js";
+
 export default httpServerHandler({ port: 4000 });

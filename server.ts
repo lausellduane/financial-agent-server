@@ -53,9 +53,76 @@ function ollamaModel(): string {
   return process.env.OLLAMA_MODEL || "llama3.1:latest";
 }
 
-// Isolate memory. Survives across requests only on the same Worker isolate.
-// Production needs a Durable Object; see docs/cloudflare-workers-spike.md.
+// Current Llama 3.1 8B instruct model on Workers AI. The older
+// llama-3.1-8b-instruct-fp8-fast id is no longer in the catalog.
+const DEFAULT_WORKERS_AI_MODEL = "@cf/meta/llama-3.1-8b-instruct-fast";
+
+function workersAiModel(): string {
+  return process.env.WORKERS_AI_MODEL || DEFAULT_WORKERS_AI_MODEL;
+}
+
+type LlmProvider = "workers-ai" | "ollama";
+
+function llmProvider(): LlmProvider {
+  const configured = process.env.LLM_PROVIDER?.trim().toLowerCase();
+  if (configured === "workers-ai" || configured === "ollama") return configured;
+  return onWorkers() ? "workers-ai" : "ollama";
+}
+
+type ChatTurn = { role: "system" | "user"; content: string };
+
+function workersAiText(result: unknown): string {
+  if (typeof result === "string") return result;
+  if (result && typeof result === "object" && "response" in result) {
+    const response = (result as { response?: unknown }).response;
+    if (typeof response === "string") return response;
+  }
+  return "";
+}
+
+async function completeChat(messages: ChatTurn[]): Promise<string> {
+  if (llmProvider() === "workers-ai") {
+    const { env } = await import("cloudflare:workers");
+    const result = await env.AI.run(workersAiModel(), {
+      messages,
+      temperature: 0,
+      max_tokens: 2048,
+    });
+    const text = workersAiText(result);
+    if (!text) throw new Error("Workers AI returned an empty response");
+    return text;
+  }
+
+  const response = await ollamaClient().chat({
+    model: ollamaModel(),
+    messages,
+    options: { temperature: 0 },
+  });
+  return response.message.content;
+}
+
+// Node keeps the statement in this process. The Worker stores it in the
+// Ledger Durable Object (SQLite), which survives isolate eviction.
 let transactionData: Record<string, string>[] = [];
+
+const LEDGER_NAME = "statement";
+
+async function readLedger(): Promise<Record<string, string>[]> {
+  if (!onWorkers()) return transactionData;
+  const { env } = await import("cloudflare:workers");
+  const stub = env.LEDGER.get(env.LEDGER.idFromName(LEDGER_NAME));
+  return stub.load();
+}
+
+async function writeLedger(rows: Record<string, string>[]): Promise<void> {
+  if (!onWorkers()) {
+    transactionData = rows;
+    return;
+  }
+  const { env } = await import("cloudflare:workers");
+  const stub = env.LEDGER.get(env.LEDGER.idFromName(LEDGER_NAME));
+  await stub.replace(rows);
+}
 
 const GROCERY_TOKENS = [
   "COSTCO",
@@ -1125,28 +1192,24 @@ async function classifyUnknownMerchants(
       .map((name, index) => `${index + 1}. ${name}`)
       .join("\n");
 
-    const response = await ollamaClient().chat({
-      model: ollamaModel(),
-      messages: [
-        {
-          role: "system",
-          content: `You classify bank merchant strings as ${category.name} or not.
+    const content = await completeChat([
+      {
+        role: "system",
+        content: `You classify bank merchant strings as ${category.name} or not.
 ${category.name} = ${category.llmInclude}.
 NOT ${category.name} = ${category.llmExclude}.
 If unsure, do NOT include it.
 Return ONLY JSON: {"indexes":[1,4]}
 indexes are the 1-based catalog numbers that ARE ${category.name}.`,
-        },
-        {
-          role: "user",
-          content: `Catalog:\n${catalog}`,
-        },
-      ],
-      options: { temperature: 0 },
-    });
+      },
+      {
+        role: "user",
+        content: `Catalog:\n${catalog}`,
+      },
+    ]);
 
     try {
-      const parsed = extractJson(response.message.content) as {
+      const parsed = extractJson(content) as {
         indexes?: unknown;
       };
       const indexes = Array.isArray(parsed.indexes) ? parsed.indexes : [];
@@ -1157,7 +1220,7 @@ indexes are the 1-based catalog numbers that ARE ${category.name}.`,
       }
     } catch (error) {
       console.error("Merchant classification parse failed:", error);
-      console.error("Raw model output:", response.message.content);
+      console.error("Raw model output:", content);
     }
   }
 
@@ -1399,12 +1462,10 @@ async function answerFromLedger(
     )
     .join("\n");
 
-  const response = await ollamaClient().chat({
-    model: ollamaModel(),
-    messages: [
-      {
-        role: "system",
-        content: `You answer questions about a cash-management ledger.
+  const content = await completeChat([
+    {
+      role: "system",
+      content: `You answer questions about a cash-management ledger.
 Use ONLY the listed transactions. Spending/charges are usually negative; deposits are usually positive.
 Never write code. Never invent rows.
 Return ONLY JSON: {"indexes":[1,4]}
@@ -1412,16 +1473,14 @@ indexes are 1-based catalog numbers that answer the question.
 For a single transaction (highest, a named merchant, latest), return one index.
 For a set (all Chipotle, all last week), return every matching index.
 If nothing matches, {"indexes":[]}`,
-      },
-      {
-        role: "user",
-        content: `Question: ${question}\n\nLedger:\n${catalog}`,
-      },
-    ],
-    options: { temperature: 0 },
-  });
+    },
+    {
+      role: "user",
+      content: `Question: ${question}\n\nLedger:\n${catalog}`,
+    },
+  ]);
 
-  const parsed = extractJson(response.message.content) as {
+  const parsed = extractJson(content) as {
     indexes?: unknown;
   };
   const indexes = Array.isArray(parsed.indexes) ? parsed.indexes : [];
@@ -1504,24 +1563,21 @@ app.post(
         return;
       }
 
-      transactionData = await parseCsv(rawCsv);
-      const fields = transactionData[0] ? Object.keys(transactionData[0]) : [];
-      const displayFields = transactionData.length
-        ? pickDisplayFields(transactionData)
-        : null;
-      const columns = fields.map((field) =>
-        columnStats(transactionData, field),
-      );
+      const rows = await parseCsv(rawCsv);
+      await writeLedger(rows);
+      const fields = rows[0] ? Object.keys(rows[0]) : [];
+      const displayFields = rows.length ? pickDisplayFields(rows) : null;
+      const columns = fields.map((field) => columnStats(rows, field));
       console.log("Upload schema:", { fields, displayFields, columns });
       res.json({
         message: "Data ingested successfully!",
-        count: transactionData.length,
+        count: rows.length,
         fields,
         mappedFields: displayFields,
         columns,
-        sampleRows: transactionData.slice(0, 3),
+        sampleRows: rows.slice(0, 3),
         sampleMerchants: displayFields?.description
-          ? uniqueMerchants(transactionData, displayFields.description, 15)
+          ? uniqueMerchants(rows, displayFields.description, 15)
           : [],
       });
     } catch (error) {
@@ -1533,6 +1589,7 @@ app.post(
 
 app.post("/api/query", async (req: Request, res: Response): Promise<any> => {
   const { question } = req.body;
+  const transactionData = await readLedger();
   if (!transactionData.length) {
     return res
       .status(400)
@@ -1650,11 +1707,22 @@ app.post("/api/query", async (req: Request, res: Response): Promise<any> => {
   }
 });
 
-app.get("/api/health", (_req: Request, res: Response) => {
-  res.json({
-    ok: true,
-    runtime: onWorkers() ? "cloudflare-workers" : "node",
-  });
+app.get("/api/health", async (_req: Request, res: Response) => {
+  try {
+    const rows = await readLedger();
+    const provider = llmProvider();
+    res.json({
+      ok: true,
+      runtime: onWorkers() ? "cloudflare-workers" : "node",
+      llm: provider,
+      model: provider === "workers-ai" ? workersAiModel() : ollamaModel(),
+      ledger: onWorkers() ? "durable-object" : "memory",
+      rows: rows.length,
+    });
+  } catch (error) {
+    console.error("Health check failed:", error);
+    res.status(500).json({ ok: false, error: "Ledger is unavailable." });
+  }
 });
 
 export { app };

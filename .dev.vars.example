@@ -1,6 +1,9 @@
 # Copy to .dev.vars for local `wrangler dev`. .dev.vars is gitignored.
 # Names only. Do not commit real values.
 #
+# Workers AI uses the AI binding. No model key goes here.
+# Set these only when LLM_PROVIDER=ollama (local Node, or a Worker forced onto Ollama).
+#
 # OLLAMA_HOST=
 # OLLAMA_API_KEY=
 # CORS_ORIGIN=

@@ -11,9 +11,31 @@
   "observability": {
     "enabled": true
   },
-  // Non-secret configuration. Secrets are set with `wrangler secret put`
-  // and are listed by name in docs/cloudflare-workers-spike.md.
+  // Workers AI has no local model. `remote: true` sends AI.run to the
+  // account during `wrangler dev`. That call needs a Cloudflare token.
+  "ai": {
+    "binding": "AI",
+    "remote": true
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "LEDGER",
+        "class_name": "Ledger"
+      }
+    ]
+  },
+  "exports": {
+    "Ledger": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  },
+  // Non-secret configuration. Names of optional secrets are in
+  // docs/cloudflare-workers-spike.md. Workers AI uses the binding, not a key.
   "vars": {
+    "LLM_PROVIDER": "workers-ai",
+    "WORKERS_AI_MODEL": "@cf/meta/llama-3.1-8b-instruct-fast",
     "OLLAMA_MODEL": "llama3.1:latest"
   },
   // Paid plan only. The default is 30s of CPU; Free is 10ms and cannot run
