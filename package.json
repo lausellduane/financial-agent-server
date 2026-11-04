@@ -7,7 +7,7 @@
     "start": "tsx server.ts",
     "dev:worker": "wrangler dev",
     "check:worker": "wrangler deploy --dry-run --outdir dist",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "tsx --test workers-ai-text.test.ts"
   },
   "repository": {
     "type": "git",

@@ -8,6 +8,7 @@ import { Readable } from "node:stream";
 import { Ollama } from "ollama/browser";
 import process from "node:process";
 import { fileURLToPath } from "url";
+import { describeAiResult, workersAiText } from "./workers-ai-text.js";
 
 // 👇 RECREATE __dirname FOR ES MODULES
 // Workers bundles do not always set import.meta.url. Node (tsx) does.
@@ -71,15 +72,6 @@ function llmProvider(): LlmProvider {
 
 type ChatTurn = { role: "system" | "user"; content: string };
 
-function workersAiText(result: unknown): string {
-  if (typeof result === "string") return result;
-  if (result && typeof result === "object" && "response" in result) {
-    const response = (result as { response?: unknown }).response;
-    if (typeof response === "string") return response;
-  }
-  return "";
-}
-
 async function completeChat(messages: ChatTurn[]): Promise<string> {
   if (llmProvider() === "workers-ai") {
     const { env } = await import("cloudflare:workers");
@@ -88,8 +80,12 @@ async function completeChat(messages: ChatTurn[]): Promise<string> {
       temperature: 0,
       max_tokens: 2048,
     });
-    const text = workersAiText(result);
-    if (!text) throw new Error("Workers AI returned an empty response");
+    const text = await workersAiText(result);
+    if (!text) {
+      throw new Error(
+        `Workers AI returned an empty response (${describeAiResult(result)})`,
+      );
+    }
     return text;
   }
 

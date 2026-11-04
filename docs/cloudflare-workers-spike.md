@@ -30,7 +30,7 @@ The cost note priced `@cf/meta/llama-3.1-8b-instruct-fp8-fast`. That id is no lo
 | `ollama` | The `ollama` package, host `OLLAMA_HOST` or `http://127.0.0.1:11434`. |
 | unset | Workers AI on the Workers runtime, Ollama under Node. |
 
-Temperature is 0 on both paths. Workers AI `max_tokens` is 2048 so a long index list is not cut at the model's default of 256. The reply text is `response` on the Workers AI result, and `message.content` on the Ollama result. Both go through the same JSON parser.
+Temperature is 0 on both paths. Workers AI `max_tokens` is 2048 so a long index list is not cut at the model's default of 256. Ollama text is `message.content`. Workers AI is not always `{ response: string }`: a JSON reply can come back as an object on `response`, and some models put the text on `choices[0].message.content` with `response` null. `workersAiText` accepts those, plus a `{ result: ... }` envelope and an SSE stream. The live deploy's model questions failed with "empty response" because the parser only kept a string `response`.
 
 ## Can it run on the Workers runtime?
 
@@ -147,7 +147,7 @@ The default path has no Worker secrets, so the action's `secrets` input stays em
 | --- | --- |
 | CPU time | **Free plan is a blocker.** Free allows 10 ms of CPU per request. Paid allows 30 seconds by default and up to 5 minutes. Parsing and the keyword tables are CPU. Waiting on Workers AI is not. This config keeps 30 seconds. |
 | Wall clock | No hard cap on an HTTP request while the client stays connected. A category question can call the model several times, and the UI waits for one JSON body. A slow reply can outlast a phone even though Workers keeps the connection open. |
-| Workers AI locally | **Not executed here.** `wrangler dev` refuses to start the remote AI proxy without `CLOUDFLARE_API_TOKEN`. `wrangler dev --local` reaches `env.AI.run` and returns `Binding AI needs to be run remotely`. |
+| Workers AI locally | `wrangler dev` refuses to start the remote AI proxy without `CLOUDFLARE_API_TOKEN`. `wrangler dev --local` reaches `env.AI.run` and returns `Binding AI needs to be run remotely`. The first live deploy did call the model; questions failed until `workersAiText` accepted a parsed JSON `response` and a `choices` message. |
 | Bundle size | 1.6 MiB uncompressed. Limit 64 MiB. |
 | Memory | 128 MB for the isolate. The Durable Object holds the statement outside that heap. |
 | Cold start | The statement survives isolate eviction. Startup itself must finish within 1 second. This bundle is small enough that the limit is not the risk. |
