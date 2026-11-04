@@ -1,0 +1,6 @@
+# Copy to .dev.vars for local `wrangler dev`. .dev.vars is gitignored.
+# Names only. Do not commit real values.
+#
+# OLLAMA_HOST=
+# OLLAMA_API_KEY=
+# CORS_ORIGIN=

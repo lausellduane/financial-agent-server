@@ -4,19 +4,57 @@ import multer from "multer";
 import csv from "csv-parser";
 import fs from "fs";
 import path from "path"; // Crucial for Windows backslash normalization
-import ollama from "ollama";
+import { Readable } from "node:stream";
+import { Ollama } from "ollama/browser";
+import process from "node:process";
 import { fileURLToPath } from "url";
 
 // 👇 RECREATE __dirname FOR ES MODULES
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+// Workers bundles do not always set import.meta.url. Node (tsx) does.
+const moduleUrl = import.meta.url;
+const __filename =
+  typeof moduleUrl === "string" && moduleUrl.length > 0
+    ? fileURLToPath(moduleUrl)
+    : "";
+const __dirname = __filename ? path.dirname(__filename) : "/tmp";
 
 const app: Express = express();
-app.use(cors());
+
+// Workers populates process.env from wrangler vars and secrets
+// (compatibility date on or after 2025-04-01). dotenv is not used here.
+const corsOrigin = process.env.CORS_ORIGIN;
+app.use(cors(corsOrigin ? { origin: corsOrigin } : undefined));
 app.use(express.json());
 
-// Explicitly use path.join to ensure correct Windows backslash pathing
-const upload = multer({ dest: path.join(__dirname, "uploads") });
+function onWorkers(): boolean {
+  const nav = (globalThis as { navigator?: { userAgent?: string } }).navigator;
+  return nav?.userAgent === "Cloudflare-Workers";
+}
+
+// Workers' /tmp is a per-request virtual disk. Multer's disk engine writes
+// the upload and then the file is gone, so Workers keeps the CSV in memory.
+// Node still uses a real directory next to this file (Windows path safe).
+const upload = multer(
+  onWorkers()
+    ? { storage: multer.memoryStorage() }
+    : { dest: path.join(__dirname, "uploads") },
+);
+
+function ollamaClient(): Ollama {
+  const host = process.env.OLLAMA_HOST;
+  const apiKey = process.env.OLLAMA_API_KEY;
+  return new Ollama({
+    ...(host ? { host } : {}),
+    ...(apiKey ? { headers: { Authorization: `Bearer ${apiKey}` } } : {}),
+  });
+}
+
+function ollamaModel(): string {
+  return process.env.OLLAMA_MODEL || "llama3.1:latest";
+}
+
+// Isolate memory. Survives across requests only on the same Worker isolate.
+// Production needs a Durable Object; see docs/cloudflare-workers-spike.md.
 let transactionData: Record<string, string>[] = [];
 
 const GROCERY_TOKENS = [
@@ -1087,8 +1125,8 @@ async function classifyUnknownMerchants(
       .map((name, index) => `${index + 1}. ${name}`)
       .join("\n");
 
-    const response = await ollama.chat({
-      model: "llama3.1:latest",
+    const response = await ollamaClient().chat({
+      model: ollamaModel(),
       messages: [
         {
           role: "system",
@@ -1361,8 +1399,8 @@ async function answerFromLedger(
     )
     .join("\n");
 
-  const response = await ollama.chat({
-    model: "llama3.1:latest",
+  const response = await ollamaClient().chat({
+    model: ollamaModel(),
     messages: [
       {
         role: "system",
@@ -1422,19 +1460,11 @@ function formatMatches(
   return lines.join("\n");
 }
 
-app.post(
-  "/api/upload",
-  upload.single("file"),
-  (req: Request, res: Response): any => {
-    if (!req.file) return res.status(400).json({ error: "No file uploaded" });
-
-    const results: Record<string, string>[] = [];
-    // Windows file streams require clean absolute system string references
-    const targetPath = path.resolve(req.file.path);
-    const rawCsv = fs.readFileSync(targetPath, "utf8");
-    const skipLines = countCsvSkipLines(rawCsv);
-
-    fs.createReadStream(targetPath)
+function parseCsv(rawCsv: string): Promise<Record<string, string>[]> {
+  const skipLines = countCsvSkipLines(rawCsv);
+  const results: Record<string, string>[] = [];
+  return new Promise((resolve, reject) => {
+    Readable.from([rawCsv])
       .pipe(
         csv({
           skipLines,
@@ -1442,33 +1472,62 @@ app.post(
         }),
       )
       .on("data", (data) => results.push(normalizeRow(data)))
-      .on("end", () => {
-        transactionData = results;
+      .on("end", () => resolve(results))
+      .on("error", reject);
+  });
+}
+
+app.post(
+  "/api/upload",
+  upload.single("file"),
+  async (req: Request, res: Response) => {
+    if (!req.file) {
+      res.status(400).json({ error: "No file uploaded" });
+      return;
+    }
+
+    try {
+      let rawCsv: string;
+      if (req.file.buffer) {
+        rawCsv = req.file.buffer.toString("utf8");
+      } else if (req.file.path) {
+        // Windows file streams require clean absolute system string references
+        const targetPath = path.resolve(req.file.path);
+        rawCsv = fs.readFileSync(targetPath, "utf8");
         try {
-          fs.unlinkSync(targetPath); // File system cleanup
+          fs.unlinkSync(targetPath);
         } catch (err) {
           console.error("File lock warning on Windows: ", err);
         }
-        const fields = transactionData[0] ? Object.keys(transactionData[0]) : [];
-        const displayFields = transactionData.length
-          ? pickDisplayFields(transactionData)
-          : null;
-        const columns = fields.map((field) =>
-          columnStats(transactionData, field),
-        );
-        console.log("Upload schema:", { fields, displayFields, columns });
-        res.json({
-          message: "Data ingested successfully!",
-          count: transactionData.length,
-          fields,
-          mappedFields: displayFields,
-          columns,
-          sampleRows: transactionData.slice(0, 3),
-          sampleMerchants: displayFields?.description
-            ? uniqueMerchants(transactionData, displayFields.description, 15)
-            : [],
-        });
+      } else {
+        res.status(400).json({ error: "No file uploaded" });
+        return;
+      }
+
+      transactionData = await parseCsv(rawCsv);
+      const fields = transactionData[0] ? Object.keys(transactionData[0]) : [];
+      const displayFields = transactionData.length
+        ? pickDisplayFields(transactionData)
+        : null;
+      const columns = fields.map((field) =>
+        columnStats(transactionData, field),
+      );
+      console.log("Upload schema:", { fields, displayFields, columns });
+      res.json({
+        message: "Data ingested successfully!",
+        count: transactionData.length,
+        fields,
+        mappedFields: displayFields,
+        columns,
+        sampleRows: transactionData.slice(0, 3),
+        sampleMerchants: displayFields?.description
+          ? uniqueMerchants(transactionData, displayFields.description, 15)
+          : [],
       });
+    } catch (error) {
+      console.error("Upload parse failed:", error);
+      res.status(500).json({ error: "Failed to read the uploaded report." });
+    }
   },
 );
 
@@ -1591,4 +1650,21 @@ app.post("/api/query", async (req: Request, res: Response): Promise<any> => {
   }
 });
 
-app.listen(4000, () => console.log("Backend active on http://localhost:4000"));
+app.get("/api/health", (_req: Request, res: Response) => {
+  res.json({
+    ok: true,
+    runtime: onWorkers() ? "cloudflare-workers" : "node",
+  });
+});
+
+export { app };
+
+const entry = process.argv[1];
+const isNodeEntry = !!entry && !!__filename && path.resolve(entry) === __filename;
+
+if (isNodeEntry) {
+  const port = Number(process.env.PORT ?? 4000);
+  app.listen(port, () =>
+    console.log(`Backend active on http://localhost:${port}`),
+  );
+}

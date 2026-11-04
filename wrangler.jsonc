@@ -1,0 +1,24 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "financial-agent-server",
+  "main": "worker.ts",
+  "compatibility_date": "2026-11-04",
+  // This date turns on the Node.js compatibility layer, including the
+  // node:http server APIs and the in-memory node:fs virtual filesystem.
+  // On dates on or after 2026-08-04 that layer is already on. Leave the
+  // nodejs_compat flag unset; it is redundant here and does not add APIs.
+  "workers_dev": true,
+  "observability": {
+    "enabled": true
+  },
+  // Non-secret configuration. Secrets are set with `wrangler secret put`
+  // and are listed by name in docs/cloudflare-workers-spike.md.
+  "vars": {
+    "OLLAMA_MODEL": "llama3.1:latest"
+  },
+  // Paid plan only. The default is 30s of CPU; Free is 10ms and cannot run
+  // this app. Ignored by `wrangler dev`.
+  "limits": {
+    "cpu_ms": 30000
+  }
+}
