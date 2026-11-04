@@ -8,6 +8,13 @@ import { Readable } from "node:stream";
 import { Ollama } from "ollama/browser";
 import process from "node:process";
 import { fileURLToPath } from "url";
+import {
+  accessMiddleware,
+  ledgerId,
+  onWorkers,
+  type AccessIdentity,
+} from "./access.js";
+import { MAX_LEDGER_ROWS, MAX_UPLOAD_BYTES, PORT } from "./constants.js";
 import { describeAiResult, workersAiText } from "./workers-ai-text.js";
 
 // 👇 RECREATE __dirname FOR ES MODULES
@@ -23,23 +30,35 @@ const app: Express = express();
 
 // Workers populates process.env from wrangler vars and secrets
 // (compatibility date on or after 2025-04-01). dotenv is not used here.
-const corsOrigin = process.env.CORS_ORIGIN;
-app.use(cors(corsOrigin ? { origin: corsOrigin } : undefined));
-app.use(express.json());
+const LOCAL_DEV_ORIGINS = ["http://localhost:8081", "http://localhost:19006"];
 
-function onWorkers(): boolean {
-  const nav = (globalThis as { navigator?: { userAgent?: string } }).navigator;
-  return nav?.userAgent === "Cloudflare-Workers";
+function allowedOrigins(): string[] | false {
+  const configured = (process.env.CORS_ORIGIN ?? "")
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter((origin) => origin.length > 0 && origin !== "*");
+  if (onWorkers()) return configured.length > 0 ? configured : false;
+  return configured.length > 0 ? configured : LOCAL_DEV_ORIGINS;
 }
+
+app.use((req, res, next) => {
+  cors({
+    origin: allowedOrigins(),
+    allowedHeaders: ["Content-Type", "Cf-Access-Jwt-Assertion"],
+  })(req, res, next);
+});
+app.use(express.json());
+app.use("/api", accessMiddleware);
 
 // Workers' /tmp is a per-request virtual disk. Multer's disk engine writes
 // the upload and then the file is gone, so Workers keeps the CSV in memory.
 // Node still uses a real directory next to this file (Windows path safe).
-const upload = multer(
-  onWorkers()
+const upload = multer({
+  ...(onWorkers()
     ? { storage: multer.memoryStorage() }
-    : { dest: path.join(__dirname, "uploads") },
-);
+    : { dest: path.join(__dirname, "uploads") }),
+  limits: { fileSize: MAX_UPLOAD_BYTES },
+});
 
 function ollamaClient(): Ollama {
   const host = process.env.OLLAMA_HOST;
@@ -97,26 +116,31 @@ async function completeChat(messages: ChatTurn[]): Promise<string> {
   return response.message.content;
 }
 
-// Node keeps the statement in this process. The Worker stores it in the
-// Ledger Durable Object (SQLite), which survives isolate eviction.
+// Node keeps one statement in this process. The Worker stores each Access
+// identity in its own Ledger Durable Object.
 let transactionData: Record<string, string>[] = [];
 
-const LEDGER_NAME = "statement";
-
-async function readLedger(): Promise<Record<string, string>[]> {
+async function readLedger(
+  identity: AccessIdentity | undefined,
+): Promise<Record<string, string>[]> {
   if (!onWorkers()) return transactionData;
+  if (!identity) throw new Error("Missing Access identity");
   const { env } = await import("cloudflare:workers");
-  const stub = env.LEDGER.get(env.LEDGER.idFromName(LEDGER_NAME));
+  const stub = env.LEDGER.get(env.LEDGER.idFromName(ledgerId(identity)));
   return stub.load();
 }
 
-async function writeLedger(rows: Record<string, string>[]): Promise<void> {
+async function writeLedger(
+  rows: Record<string, string>[],
+  identity: AccessIdentity | undefined,
+): Promise<void> {
   if (!onWorkers()) {
     transactionData = rows;
     return;
   }
+  if (!identity) throw new Error("Missing Access identity");
   const { env } = await import("cloudflare:workers");
-  const stub = env.LEDGER.get(env.LEDGER.idFromName(LEDGER_NAME));
+  const stub = env.LEDGER.get(env.LEDGER.idFromName(ledgerId(identity)));
   await stub.replace(rows);
 }
 
@@ -1515,7 +1539,7 @@ function formatMatches(
   return lines.join("\n");
 }
 
-function parseCsv(rawCsv: string): Promise<Record<string, string>[]> {
+export function parseCsv(rawCsv: string): Promise<Record<string, string>[]> {
   const skipLines = countCsvSkipLines(rawCsv);
   const results: Record<string, string>[] = [];
   return new Promise((resolve, reject) => {
@@ -1560,7 +1584,13 @@ app.post(
       }
 
       const rows = await parseCsv(rawCsv);
-      await writeLedger(rows);
+      if (rows.length > MAX_LEDGER_ROWS) {
+        res.status(413).json({
+          error: `Statement has ${rows.length} rows. The limit is ${MAX_LEDGER_ROWS}.`,
+        });
+        return;
+      }
+      await writeLedger(rows, res.locals.access);
       const fields = rows[0] ? Object.keys(rows[0]) : [];
       const displayFields = rows.length ? pickDisplayFields(rows) : null;
       const columns = fields.map((field) => columnStats(rows, field));
@@ -1585,7 +1615,7 @@ app.post(
 
 app.post("/api/query", async (req: Request, res: Response): Promise<any> => {
   const { question } = req.body;
-  const transactionData = await readLedger();
+  const transactionData = await readLedger(res.locals.access);
   if (!transactionData.length) {
     return res
       .status(400)
@@ -1703,23 +1733,31 @@ app.post("/api/query", async (req: Request, res: Response): Promise<any> => {
   }
 });
 
-app.get("/api/health", async (_req: Request, res: Response) => {
-  try {
-    const rows = await readLedger();
-    const provider = llmProvider();
-    res.json({
-      ok: true,
-      runtime: onWorkers() ? "cloudflare-workers" : "node",
-      llm: provider,
-      model: provider === "workers-ai" ? workersAiModel() : ollamaModel(),
-      ledger: onWorkers() ? "durable-object" : "memory",
-      rows: rows.length,
-    });
-  } catch (error) {
-    console.error("Health check failed:", error);
-    res.status(500).json({ ok: false, error: "Ledger is unavailable." });
-  }
+app.get("/api/health", (_req: Request, res: Response) => {
+  const provider = llmProvider();
+  res.json({
+    ok: true,
+    runtime: onWorkers() ? "cloudflare-workers" : "node",
+    llm: provider,
+    model: provider === "workers-ai" ? workersAiModel() : ollamaModel(),
+    ledger: onWorkers() ? "durable-object" : "memory",
+  });
 });
+
+app.use(
+  (
+    error: unknown,
+    _req: Request,
+    res: Response,
+    next: (error?: unknown) => void,
+  ) => {
+    if (error instanceof multer.MulterError && error.code === "LIMIT_FILE_SIZE") {
+      res.status(413).json({ error: "File is larger than 5 MB." });
+      return;
+    }
+    next(error);
+  },
+);
 
 export { app };
 
@@ -1727,7 +1765,7 @@ const entry = process.argv[1];
 const isNodeEntry = !!entry && !!__filename && path.resolve(entry) === __filename;
 
 if (isNodeEntry) {
-  const port = Number(process.env.PORT ?? 4000);
+  const port = Number(process.env.PORT ?? PORT);
   app.listen(port, () =>
     console.log(`Backend active on http://localhost:${port}`),
   );

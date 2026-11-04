@@ -1,6 +1,6 @@
 # Cloudflare Workers spike
 
-**Recommendation: run this API on Workers Paid.** The Worker calls Workers AI through an `AI` binding and stores the uploaded statement in a SQLite Durable Object. Local Node (`npm start`) still calls Ollama and keeps the statement in process memory. The provider is `LLM_PROVIDER`. The Workers Free plan cannot run this stack. This environment has no Cloudflare token, so the model was not executed and nothing was deployed.
+**Recommendation: run this API on Workers Paid, behind Cloudflare Access.** The Worker verifies the `Cf-Access-Jwt-Assertion` JWT on every `/api` route, stores each person's statement in their own SQLite Durable Object, and calls Workers AI through an `AI` binding. Local Node (`npm start`) skips Access, calls Ollama, and keeps one statement in process memory. The Workers Free plan cannot run this stack. This environment has no Cloudflare token, so nothing was deployed.
 
 ## What this server is
 
@@ -10,7 +10,7 @@
 | --- | --- | --- |
 | `POST /api/upload` | multipart field `file` | Parse a bank CSV and store every row |
 | `POST /api/query` | JSON `{ "question": "..." }` | Filter those rows in process. Some questions call the model |
-| `GET /api/health` | probe | Runtime, provider, model, ledger, and row count |
+| `GET /api/health` | probe | Runtime, provider, model, and ledger. No row count. On Workers it requires Access like the other `/api` routes. |
 
 The companion UI (`lausellduane/financial-agent-ui`, Expo 57 / React Native) posts to the upload and query routes and reads `count` from the upload response and `answer` or `error` from the query response. `App.tsx` hardcodes `http://localhost:4000` on web and iOS, and `http://10.0.2.2:4000` on the Android emulator. It sends no auth header and no session id. The web build needs CORS. Native builds do not.
 
@@ -74,24 +74,28 @@ Names only. No values belong in the repo.
 
 | Name | Kind | Required | Purpose |
 | --- | --- | --- | --- |
+| `ACCESS_TEAM_DOMAIN` | secret or var | yes on Workers | Team subdomain (`your-team`) or `https://your-team.cloudflareaccess.com`. The issuer is `https://<team>.cloudflareaccess.com`. JWKS is `https://<team>.cloudflareaccess.com/cdn-cgi/access/certs`. |
+| `ACCESS_AUD` | secret or var | yes on Workers | Application Audience (AUD) tag from the Access application. |
+| `CORS_ORIGIN` | var, set in `wrangler.jsonc` | yes for browsers | Comma-separated origins. `*` is ignored. The committed value is `http://localhost:8081` (Expo web). Add the deployed UI origin before a browser client calls the Worker. |
 | `LLM_PROVIDER` | var, already `workers-ai` | no | `workers-ai` or `ollama`. |
 | `WORKERS_AI_MODEL` | var, already set | no | `@cf/meta/llama-3.1-8b-instruct-fast`. |
 | `OLLAMA_MODEL` | var, already `llama3.1:latest` | only for the Ollama path | Node default, and the Worker if you force `LLM_PROVIDER=ollama`. |
 | `OLLAMA_HOST` | secret | only for the Ollama path | Base URL. The client adds `http://` and port `11434` when the value omits them. |
 | `OLLAMA_API_KEY` | secret | only if that Ollama host requires a bearer token | Sent as `Authorization: Bearer …`. |
-| `CORS_ORIGIN` | var | no | One browser origin. When unset, CORS stays open (`*`). |
-| `CLOUDFLARE_API_TOKEN` | shell or GitHub secret | yes to deploy | **Workers Scripts: Edit**. Add **Workers AI: Read** so `wrangler dev` can call the remote AI binding. |
+| `CLOUDFLARE_API_TOKEN` | shell or GitHub secret | yes to deploy | **Workers Scripts: Edit**. Add **Workers AI: Read** so `wrangler dev` can call the remote AI binding. This is not an app bearer token. |
 | `CLOUDFLARE_ACCOUNT_ID` | shell or GitHub secret | yes to deploy | Account that owns the Worker. |
 
-Workers AI does not take an API key inside the Worker. The `AI` binding authenticates as the Worker. There is nothing to put in `wrangler secret put` for the default path.
+There is no application bearer token. On Workers, a request without a valid Access JWT gets `401`. If `ACCESS_TEAM_DOMAIN` or `ACCESS_AUD` is missing, every `/api` route fails closed with `401`. `npm start` does not check Access.
 
-`.dev.vars` is gitignored and is only needed if you point the Worker at Ollama. `.dev.vars.example` lists those names.
+Workers AI does not take an API key inside the Worker. The `AI` binding authenticates as the Worker.
+
+`.dev.vars` is gitignored. `.dev.vars.example` lists the names.
 
 ### Ledger
 
-On the Worker, parsed rows go to one SQLite Durable Object, class `Ledger`, binding `LEDGER`, object name `statement`. Each CSV record is one SQLite row. Upload replaces the whole table. Query reads it back. A restart of `wrangler dev` kept the three test rows and still answered "highest charge" without a second upload.
+On the Worker, parsed rows go to a SQLite Durable Object, class `Ledger`, binding `LEDGER`. The object name is the Access email (lowercased), or `sub` when the token has no email. Each person gets their own statement. Upload replaces that person's rows. Inserts are batched. A CSV over 5 MB or 20,000 rows is rejected.
 
-Node keeps the same array in the process. The UI has no user id, so one object matches today's single statement. A later session id can replace the name `statement`.
+Node keeps one array in the process, because Access is not checked there.
 
 | Store | Role |
 | --- | --- |
@@ -111,14 +115,15 @@ Node keeps the same array in the process. The UI has no user id, so one object m
 - `ai.binding`: `AI`, with `remote: true` so `wrangler dev` calls the real model
 - `durable_objects.bindings`: `LEDGER` → `Ledger`
 - `exports.Ledger`: `{ "type": "durable-object", "storage": "sqlite" }`
-- vars: `LLM_PROVIDER`, `WORKERS_AI_MODEL`, `OLLAMA_MODEL`
+- vars: `LLM_PROVIDER`, `WORKERS_AI_MODEL`, `OLLAMA_MODEL`, `CORS_ORIGIN` (`http://localhost:8081`)
+- `ACCESS_TEAM_DOMAIN` and `ACCESS_AUD` are not in the file. DevOps sets them as secrets or vars.
 - `limits.cpu_ms`: `30000` (Paid default). Enforced on Cloudflare's network only.
 
 `npx wrangler dev` with `remote: true` opens a remote proxy at startup. Without `CLOUDFLARE_API_TOKEN` that startup fails before the server listens. `npx wrangler dev --local` disables remote bindings, serves the Durable Object, and rejects `env.AI.run` with `Binding AI needs to be run remotely`.
 
 ## GitHub Actions
 
-DevOps owns the workflow. This repo does not add one. The default branch is `master`. Wrangler bundles TypeScript. There is no separate compile step.
+DevOps owns the workflow. This repo does not add one. The default branch is `master`. Wrangler bundles TypeScript. There is no separate compile step. Outline for when they add it, including the Access secrets. Add `OLLAMA_HOST` and `OLLAMA_API_KEY` only if `LLM_PROVIDER` is `ollama`. Reference: [GitHub Actions](https://developers.cloudflare.com/workers/ci-cd/external-cicd/github-actions/).
 
 ```yaml
 name: Deploy Worker
@@ -133,13 +138,17 @@ jobs:
       - uses: actions/checkout@v6
       - name: Deploy
         uses: cloudflare/wrangler-action@v4
+        env:
+          ACCESS_TEAM_DOMAIN: ${{ secrets.ACCESS_TEAM_DOMAIN }}
+          ACCESS_AUD: ${{ secrets.ACCESS_AUD }}
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           command: deploy
+          secrets: |
+            ACCESS_TEAM_DOMAIN
+            ACCESS_AUD
 ```
-
-The default path has no Worker secrets, so the action's `secrets` input stays empty. Add `OLLAMA_HOST` and `OLLAMA_API_KEY` there only if `LLM_PROVIDER` is changed to `ollama`. Reference: [GitHub Actions](https://developers.cloudflare.com/workers/ci-cd/external-cicd/github-actions/).
 
 ## Blockers
 
@@ -151,8 +160,13 @@ The default path has no Worker secrets, so the action's `secrets` input stays em
 | Bundle size | 1.6 MiB uncompressed. Limit 64 MiB. |
 | Memory | 128 MB for the isolate. The Durable Object holds the statement outside that heap. |
 | Cold start | The statement survives isolate eviction. Startup itself must finish within 1 second. This bundle is small enough that the limit is not the risk. |
-| Privacy | The CSV transits Cloudflare, and merchant strings are sent to Workers AI on the same account. That is a different boundary than a loopback Llama. The UI still says the model is local and still hardcodes `localhost:4000`. |
+| Auth | Workers require a Cloudflare Access JWT (`Cf-Access-Jwt-Assertion`) checked against the team JWKS, with `iss`, `aud`, and `exp`. The ledger id is that identity. Node dev skips the check. DevOps still creates the Access application in front of the hostname so browsers receive the cookie and header. |
+| Privacy | The CSV transits Cloudflare, and merchant strings are sent to Workers AI on the same account. That is a different boundary than a loopback Llama. The UI still says the model is local and still hardcodes `localhost:4000`. It does not send the Access JWT yet. |
 | UI hosting | Expo web can later sit on Workers Static Assets. The iOS and Android apps cannot. This change does not touch the UI repo. |
+
+## Tests
+
+`npm test` runs the Node unit tests (`workersAiText`, `parseCsv`) and the Workers runtime tests in `test/api.spec.ts`. Those use `@cloudflare/vitest-plugin`, the current name of the Workers Vitest pool. The older `@cloudflare/vitest-pool-workers` package's workerd cannot start this Worker's compatibility date. The pool tests cover health, upload, a non-model query, a rejected JWT, a missing Access config, the 5 MB and 20,000-row caps, and two Access identities not sharing a ledger.
 
 ## Proof
 
@@ -191,32 +205,37 @@ env.WORKERS_AI_MODEL    @cf/meta/llama-3.1-8b-instruct-fast
 
 ## Deploy from another machine
 
-No Worker secret is required for this path. From a checkout of this branch:
+From a checkout of this branch:
 
 ```bash
 npm ci
 export CLOUDFLARE_API_TOKEN="..."   # Workers Scripts: Edit, plus Workers AI: Read
 export CLOUDFLARE_ACCOUNT_ID="..."
+npx wrangler secret put ACCESS_TEAM_DOMAIN   # team subdomain, or https://<team>.cloudflareaccess.com
+npx wrangler secret put ACCESS_AUD           # Access application AUD tag
 npx wrangler deploy
 ```
 
-Wrangler prints the `workers.dev` URL. Then:
+Create a Cloudflare Access application for the Worker hostname (self-hosted or workers.dev) before sending real statements. The AUD tag from that application is `ACCESS_AUD`. Access adds `Cf-Access-Jwt-Assertion`. The Worker checks the signature, `iss`, `aud`, and `exp`. A request without a valid token gets `401`, including when the two Access settings are missing.
+
+`CORS_ORIGIN` is already `http://localhost:8081`. To allow more browser origins, set it to a comma-separated list and deploy again. Do not use `*`.
+
+Wrangler prints the `workers.dev` URL. Health, upload, and query need the Access JWT header:
 
 ```bash
-curl https://financial-agent-server.<account-subdomain>.workers.dev/api/health
+curl -H "Cf-Access-Jwt-Assertion: $TOKEN" \
+  https://financial-agent-server.<account-subdomain>.workers.dev/api/health
 ```
 
-Expect `"llm":"workers-ai"` and `"ledger":"durable-object"`. Upload a CSV, then query it. The first model question calls `@cf/meta/llama-3.1-8b-instruct-fast` through the `AI` binding.
+Expect `"llm":"workers-ai"` and `"ledger":"durable-object"`, and no `rows` field.
 
-To exercise the model before deploy, with the same two variables exported:
+To exercise the model before deploy, with the API token and account id exported, and the two Access secrets in `.dev.vars`:
 
 ```bash
 npx wrangler dev
 ```
 
-`remote: true` on the `AI` binding sends those calls to the account. `wrangler dev --local` does not.
-
-Optional, only if a browser UI on another origin calls the Worker: set the var `CORS_ORIGIN` to that origin and deploy again.
+`remote: true` on the `AI` binding sends those calls to the account. `npx wrangler dev --local` does not.
 
 Optional, only to put the Worker back on Ollama: set `LLM_PROVIDER` to `ollama`, then:
 

@@ -36,7 +36,10 @@
   "vars": {
     "LLM_PROVIDER": "workers-ai",
     "WORKERS_AI_MODEL": "@cf/meta/llama-3.1-8b-instruct-fast",
-    "OLLAMA_MODEL": "llama3.1:latest"
+    "OLLAMA_MODEL": "llama3.1:latest",
+    // Comma-separated browser origins. "*" is ignored. DevOps adds the
+    // deployed UI origin here before a browser client calls this Worker.
+    "CORS_ORIGIN": "http://localhost:8081"
   },
   // Paid plan only. The default is 30s of CPU; Free is 10ms and cannot run
   // this app. Ignored by `wrangler dev`.
