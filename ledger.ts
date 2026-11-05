@@ -26,7 +26,13 @@ export class Ledger extends DurableObject {
     });
   }
 
-  async replace(rows: TxRow[]): Promise<number> {
+  async replace(
+    rows: TxRow[],
+    range: { startDate: string | null; endDate: string | null } = {
+      startDate: null,
+      endDate: null,
+    },
+  ): Promise<number> {
     const uploadedAt = new Date().toISOString();
     this.ctx.storage.transactionSync(() => {
       this.ctx.storage.sql.exec("DELETE FROM transactions");
@@ -38,22 +44,65 @@ export class Ledger extends DurableObject {
           ...chunk.map((row) => JSON.stringify(row)),
         );
       }
-      this.ctx.storage.sql.exec(
-        `INSERT INTO ledger_meta (key, value) VALUES ('uploaded_at', ?)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
-        uploadedAt,
-      );
+      this.putMeta("uploaded_at", uploadedAt);
+      this.putMeta("start_date", range.startDate ?? "");
+      this.putMeta("end_date", range.endDate ?? "");
     });
     return rows.length;
   }
 
-  async uploadedAt(): Promise<string | null> {
-    const stored = this.ctx.storage.sql
-      .exec<{ value: string }>(
-        "SELECT value FROM ledger_meta WHERE key = 'uploaded_at'",
-      )
-      .toArray();
-    return stored[0]?.value ?? null;
+  // One read: row count plus the dates and upload time saved with those rows.
+  async summary(): Promise<{
+    loaded: boolean;
+    count: number;
+    startDate: string | null;
+    endDate: string | null;
+    uploadedAt: string | null;
+  }> {
+    return this.ctx.storage.transactionSync(() => {
+      const count = Number(
+        this.ctx.storage.sql
+          .exec<{ n: number }>("SELECT COUNT(*) AS n FROM transactions")
+          .toArray()[0]?.n ?? 0,
+      );
+      if (!count) {
+        return {
+          loaded: false,
+          count: 0,
+          startDate: null,
+          endDate: null,
+          uploadedAt: null,
+        };
+      }
+      const meta = new Map(
+        this.ctx.storage.sql
+          .exec<{ key: string; value: string }>(
+            "SELECT key, value FROM ledger_meta",
+          )
+          .toArray()
+          .map((row) => [row.key, row.value]),
+      );
+      const text = (key: string) => {
+        const value = meta.get(key);
+        return value ? value : null;
+      };
+      return {
+        loaded: true,
+        count,
+        startDate: text("start_date"),
+        endDate: text("end_date"),
+        uploadedAt: text("uploaded_at"),
+      };
+    });
+  }
+
+  private putMeta(key: string, value: string): void {
+    this.ctx.storage.sql.exec(
+      `INSERT INTO ledger_meta (key, value) VALUES (?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      key,
+      value,
+    );
   }
 
   async load(): Promise<TxRow[]> {

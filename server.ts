@@ -76,6 +76,8 @@ const upload = multer({
 // identity in its own Ledger Durable Object.
 let transactionData: Record<string, string>[] = [];
 let transactionUploadedAt: string | null = null;
+let transactionStartDate: string | null = null;
+let transactionEndDate: string | null = null;
 
 async function ledgerStub(identity: AccessIdentity) {
   const { env } = await import("cloudflare:workers");
@@ -90,25 +92,22 @@ async function readLedger(
   return (await ledgerStub(identity)).load();
 }
 
-async function readUploadedAt(
-  identity: AccessIdentity | undefined,
-): Promise<string | null> {
-  if (!onWorkers()) return transactionUploadedAt;
-  if (!identity) throw new Error("Missing Access identity");
-  return (await ledgerStub(identity)).uploadedAt();
-}
-
 async function writeLedger(
   rows: Record<string, string>[],
   identity: AccessIdentity | undefined,
 ): Promise<void> {
+  const range = rows.length
+    ? dateRange(rows)
+    : { startDate: null, endDate: null };
   if (!onWorkers()) {
     transactionData = rows;
-    transactionUploadedAt = new Date().toISOString();
+    transactionUploadedAt = rows.length ? new Date().toISOString() : null;
+    transactionStartDate = range.startDate;
+    transactionEndDate = range.endDate;
     return;
   }
   if (!identity) throw new Error("Missing Access identity");
-  await (await ledgerStub(identity)).replace(rows);
+  await (await ledgerStub(identity)).replace(rows, range);
 }
 
 const GROCERY_TOKENS = [
@@ -693,25 +692,18 @@ export type ReportSummary = {
 async function reportFor(
   identity: AccessIdentity | undefined,
 ): Promise<ReportSummary> {
-  const rows = await readLedger(identity);
-  const uploadedAt = await readUploadedAt(identity);
-  if (!rows.length) {
+  if (!onWorkers()) {
+    const count = transactionData.length;
     return {
-      loaded: false,
-      count: 0,
-      startDate: null,
-      endDate: null,
-      uploadedAt,
+      loaded: count > 0,
+      count,
+      startDate: count > 0 ? transactionStartDate : null,
+      endDate: count > 0 ? transactionEndDate : null,
+      uploadedAt: count > 0 ? transactionUploadedAt : null,
     };
   }
-  const range = dateRange(rows);
-  return {
-    loaded: true,
-    count: rows.length,
-    startDate: range.startDate,
-    endDate: range.endDate,
-    uploadedAt,
-  };
+  if (!identity) throw new Error("Missing Access identity");
+  return (await ledgerStub(identity)).summary();
 }
 
 function pickDisplayFields(rows: Record<string, string>[]) {
@@ -1782,6 +1774,7 @@ app.post("/api/query", async (req: Request, res: Response): Promise<any> => {
 });
 
 app.get("/api/report", async (_req: Request, res: Response) => {
+  res.set("Cache-Control", "no-store");
   try {
     res.json(await reportFor(res.locals.access));
   } catch (error) {

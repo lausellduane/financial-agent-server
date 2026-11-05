@@ -108,7 +108,7 @@ The earlier proof of concept keyed the object by the raw email. Those objects ar
 { "loaded": true, "count": 3, "startDate": "2026-01-02", "endDate": "2026-01-04", "uploadedAt": "2026-11-05T00:46:12.000Z" }
 ```
 
-`startDate` and `endDate` are calendar dates (`YYYY-MM-DD`) from the statement's date column. `uploadedAt` is an ISO timestamp recorded when the rows were replaced, or `null` for a ledger saved before that timestamp existed. The response is only the caller's identity.
+`startDate` and `endDate` are calendar dates (`YYYY-MM-DD`) from the statement's date column. They are saved with the upload, and `GET /api/report` reads that summary in one Durable Object call instead of loading every row. `uploadedAt` is an ISO timestamp recorded when the rows were replaced, or `null` for a ledger saved before that timestamp existed. The response is only the caller's identity, and the route sends `Cache-Control: no-store`.
 
 The UI's suggested native Access path can send a service token (`type: "app"`). This Worker rejects those tokens. Whoever switches the UI to native Access has to use a user JWT, or this API has to grow an explicit service-token identity. Those two choices conflict until that is decided.
 
