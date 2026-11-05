@@ -32,6 +32,14 @@ test("reads choices when response is null", async () => {
   assert.deepEqual(JSON.parse(text), { indexes: [2] });
 });
 
+test("prefers choices when both choices and response are set", async () => {
+  const text = await workersAiText({
+    response: "from response",
+    choices: [{ message: { content: "from choices" } }],
+  });
+  assert.equal(text, "from choices");
+});
+
 test("reads choices when response is an empty string", async () => {
   const text = await workersAiText({
     response: "",

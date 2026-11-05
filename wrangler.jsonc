@@ -38,7 +38,6 @@
   // docs/cloudflare-workers-spike.md. Workers AI uses the binding, not a key.
   "vars": {
     "LLM_PROVIDER": "workers-ai",
-    "WORKERS_AI_MODEL": "@cf/meta/llama-3.1-8b-instruct-fast",
     "OLLAMA_MODEL": "llama3.1:latest",
     // Production calls are same-origin, so this stays empty. "*" is ignored.
     // Node dev uses localhost when this is empty. A comma-separated list is

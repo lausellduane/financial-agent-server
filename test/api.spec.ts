@@ -95,6 +95,16 @@ async function signed(
   return jwt.sign(privateKey);
 }
 
+async function tokenMissing(claim: "iat" | "exp"): Promise<string> {
+  let jwt = new SignJWT({ email: "ada@example.com", sub: "sub-ada" })
+    .setProtectedHeader({ alg: "RS256", kid: "test-key" })
+    .setIssuer(ISSUER)
+    .setAudience(AUD);
+  if (claim !== "iat") jwt = jwt.setIssuedAt();
+  if (claim !== "exp") jwt = jwt.setExpirationTime("10m");
+  return jwt.sign(privateKey);
+}
+
 function unsignedToken(): string {
   const encode = (value: object) =>
     btoa(JSON.stringify(value))
@@ -156,6 +166,13 @@ describe("/api auth", () => {
     }
   });
 
+  it("rejects a token missing iat or exp", async () => {
+    for (const claim of ["iat", "exp"] as const) {
+      const response = await authed("/api/health", await tokenMissing(claim));
+      expect(response.status).toBe(401);
+    }
+  });
+
   it("rejects a token with no email or sub and a service token", async () => {
     const noIdentity = await signed({});
     const serviceToken = await signed({ type: "app", common_name: "ci-client" });
@@ -192,6 +209,26 @@ describe("/api with a valid Access JWT", () => {
       "https://evil.example",
     );
     expect(response.headers.get("access-control-allow-origin")).not.toBe("*");
+  });
+
+  it("keeps the same text in two ledgers when it is an email and a subject", async () => {
+    const shared = "same-person@example.com";
+    const asEmail = await signed({ email: shared });
+    const asSub = await signed({ sub: shared });
+    const form = new FormData();
+    form.set("file", new File([csv], "statement.csv", { type: "text/csv" }));
+    const uploaded = await authed("/api/upload", asEmail, {
+      method: "POST",
+      body: form,
+    });
+    expect(uploaded.status).toBe(200);
+
+    const other = await authed("/api/query", asSub, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ question: "What was my highest charge?" }),
+    });
+    expect(other.status).toBe(400);
   });
 
   it("rejects an upload with no file", async () => {

@@ -5,3 +5,7 @@ export const PORT = 4000;
 export const MAX_UPLOAD_BYTES = 5_000_000;
 
 export const MAX_LEDGER_ROWS = 20_000;
+
+// Single source for the Workers AI model. wrangler.jsonc does not repeat it.
+// Set WORKERS_AI_MODEL only to override this default.
+export const DEFAULT_WORKERS_AI_MODEL = "@cf/meta/llama-3.1-8b-instruct-fast";

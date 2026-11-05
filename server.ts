@@ -5,7 +5,6 @@ import csv from "csv-parser";
 import fs from "fs";
 import path from "path"; // Crucial for Windows backslash normalization
 import { Readable } from "node:stream";
-import { Ollama } from "ollama/browser";
 import process from "node:process";
 import { fileURLToPath } from "url";
 import {
@@ -15,7 +14,12 @@ import {
   type AccessIdentity,
 } from "./access.js";
 import { MAX_LEDGER_ROWS, MAX_UPLOAD_BYTES, PORT } from "./constants.js";
-import { describeAiResult, workersAiText } from "./workers-ai-text.js";
+import {
+  completeChat,
+  llmProvider,
+  ollamaModel,
+  workersAiModel,
+} from "./llm.js";
 
 // 👇 RECREATE __dirname FOR ES MODULES
 // Workers bundles do not always set import.meta.url. Node (tsx) does.
@@ -67,62 +71,6 @@ const upload = multer({
     : { dest: path.join(__dirname, "uploads") }),
   limits: { fileSize: MAX_UPLOAD_BYTES },
 });
-
-function ollamaClient(): Ollama {
-  const host = process.env.OLLAMA_HOST;
-  const apiKey = process.env.OLLAMA_API_KEY;
-  return new Ollama({
-    ...(host ? { host } : {}),
-    ...(apiKey ? { headers: { Authorization: `Bearer ${apiKey}` } } : {}),
-  });
-}
-
-function ollamaModel(): string {
-  return process.env.OLLAMA_MODEL || "llama3.1:latest";
-}
-
-// Current Llama 3.1 8B instruct model on Workers AI. The older
-// llama-3.1-8b-instruct-fp8-fast id is no longer in the catalog.
-const DEFAULT_WORKERS_AI_MODEL = "@cf/meta/llama-3.1-8b-instruct-fast";
-
-function workersAiModel(): string {
-  return process.env.WORKERS_AI_MODEL || DEFAULT_WORKERS_AI_MODEL;
-}
-
-type LlmProvider = "workers-ai" | "ollama";
-
-function llmProvider(): LlmProvider {
-  const configured = process.env.LLM_PROVIDER?.trim().toLowerCase();
-  if (configured === "workers-ai" || configured === "ollama") return configured;
-  return onWorkers() ? "workers-ai" : "ollama";
-}
-
-type ChatTurn = { role: "system" | "user"; content: string };
-
-async function completeChat(messages: ChatTurn[]): Promise<string> {
-  if (llmProvider() === "workers-ai") {
-    const { env } = await import("cloudflare:workers");
-    const result = await env.AI.run(workersAiModel(), {
-      messages,
-      temperature: 0,
-      max_tokens: 2048,
-    });
-    const text = await workersAiText(result);
-    if (!text) {
-      throw new Error(
-        `Workers AI returned an empty response (${describeAiResult(result)})`,
-      );
-    }
-    return text;
-  }
-
-  const response = await ollamaClient().chat({
-    model: ollamaModel(),
-    messages,
-    options: { temperature: 0 },
-  });
-  return response.message.content;
-}
 
 // Node keeps one statement in this process. The Worker stores each Access
 // identity in its own Ledger Durable Object.
@@ -1205,6 +1153,17 @@ function extractJson(raw: string): unknown {
     : new Error("Model did not return JSON");
 }
 
+export function indexesInRange(indexes: unknown, length: number): number[] {
+  if (!Array.isArray(indexes) || length < 1) return [];
+  const picked: number[] = [];
+  for (const index of indexes) {
+    if (typeof index !== "number" || !Number.isInteger(index)) continue;
+    if (index < 1 || index > length) continue;
+    picked.push(index);
+  }
+  return picked;
+}
+
 async function classifyUnknownMerchants(
   merchants: string[],
   category: SpendCategory,
@@ -1240,9 +1199,7 @@ indexes are the 1-based catalog numbers that ARE ${category.name}.`,
       const parsed = extractJson(content) as {
         indexes?: unknown;
       };
-      const indexes = Array.isArray(parsed.indexes) ? parsed.indexes : [];
-      for (const index of indexes) {
-        const n = Number(index);
+      for (const n of indexesInRange(parsed.indexes, batch.length)) {
         const name = batch[n - 1];
         if (name) picked.push(name);
       }
@@ -1511,10 +1468,9 @@ If nothing matches, {"indexes":[]}`,
   const parsed = extractJson(content) as {
     indexes?: unknown;
   };
-  const indexes = Array.isArray(parsed.indexes) ? parsed.indexes : [];
   const picked: NormalizedTx[] = [];
-  for (const index of indexes) {
-    const tx = txs[Number(index) - 1];
+  for (const n of indexesInRange(parsed.indexes, txs.length)) {
+    const tx = txs[n - 1];
     if (tx) picked.push(tx);
   }
   return picked;

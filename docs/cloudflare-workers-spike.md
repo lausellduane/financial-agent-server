@@ -20,7 +20,7 @@ Simple questions such as "what was my highest charge?" never call the model. Cat
 
 Workers AI model: `@cf/meta/llama-3.1-8b-instruct-fast`.
 
-The cost note priced `@cf/meta/llama-3.1-8b-instruct-fp8-fast`. That id is no longer in the catalog. `@cf/meta/llama-3.1-8b-instruct` was deprecated on 2026-05-30. The `-fast` Llama 3.1 8B instruct model is still listed, with a 128,000 token window and the chat `messages` API. It matches this app's short JSON classification calls. Llama 4 Scout is also in the catalog; it is a larger model than this workload needs. Override the id with the `WORKERS_AI_MODEL` var.
+The cost note priced `@cf/meta/llama-3.1-8b-instruct-fp8-fast`. That id is no longer in the catalog. `@cf/meta/llama-3.1-8b-instruct` was deprecated on 2026-05-30. The `-fast` Llama 3.1 8B instruct model is still listed, with a 128,000 token window and the chat `messages` API. It matches this app's short JSON classification calls. Llama 4 Scout is also in the catalog; it is a larger model than this workload needs. The id lives only in `DEFAULT_WORKERS_AI_MODEL` in `constants.ts`. Set `WORKERS_AI_MODEL` in the environment to override it.
 
 `LLM_PROVIDER` chooses the backend:
 
@@ -78,7 +78,7 @@ Names only. No values belong in the repo.
 | `ACCESS_AUD` | secret or var | yes on Workers | AUD tag of the **UI** Access application. The browser session is that app, and the API checks the JWT it issued. |
 | `CORS_ORIGIN` | var, empty in `wrangler.jsonc` | no in production | Production calls are same-origin, so this stays empty. `*` is ignored. Node dev uses `http://localhost:8081` and `http://localhost:19006` when it is empty. Set a comma-separated list only for a cross-origin dev UI. |
 | `LLM_PROVIDER` | var, already `workers-ai` | no | `workers-ai` or `ollama`. |
-| `WORKERS_AI_MODEL` | var, already set | no | `@cf/meta/llama-3.1-8b-instruct-fast`. |
+| `WORKERS_AI_MODEL` | env override | no | Overrides `DEFAULT_WORKERS_AI_MODEL` in `constants.ts`. Not set in `wrangler.jsonc`. |
 | `OLLAMA_MODEL` | var, already `llama3.1:latest` | only for the Ollama path | Node default, and the Worker if you force `LLM_PROVIDER=ollama`. |
 | `OLLAMA_HOST` | secret | only for the Ollama path | Base URL. The client adds `http://` and port `11434` when the value omits them. |
 | `OLLAMA_API_KEY` | secret | only if that Ollama host requires a bearer token | Sent as `Authorization: Bearer …`. |
@@ -93,7 +93,11 @@ Workers AI does not take an API key inside the Worker. The `AI` binding authenti
 
 ### Ledger
 
-On the Worker, parsed rows go to a SQLite Durable Object, class `Ledger`, binding `LEDGER`. The object name is `sub:<subject>` when the token has a subject, otherwise `email:<address>`. Service tokens (`type: "app"`) and tokens with neither claim are rejected. Upload replaces that person's rows. Inserts are batched. A CSV over 5 MB or 20,000 rows is rejected.
+On the Worker, parsed rows go to a SQLite Durable Object, class `Ledger`, binding `LEDGER`. The object name is `sub:<subject>` when the token has a subject, otherwise `email:<address>`. The same text as an email and as a subject is two ledgers. Service tokens (`type: "app"`) and tokens with neither claim are rejected. Upload replaces that person's rows. Inserts are batched. A CSV over 5 MB or 20,000 rows is rejected.
+
+The earlier proof of concept keyed the object by the raw email. Those objects are orphaned. Anyone who uploaded on that deploy has to upload the statement again.
+
+The UI's suggested native Access path can send a service token (`type: "app"`). This Worker rejects those tokens. Whoever switches the UI to native Access has to use a user JWT, or this API has to grow an explicit service-token identity. Those two choices conflict until that is decided.
 
 Node keeps one array in the process, because Access is not checked there.
 
@@ -116,7 +120,7 @@ Node keeps one array in the process, because Access is not checked there.
 - `durable_objects.bindings`: `LEDGER` → `Ledger`
 - `exports.Ledger`: `{ "type": "durable-object", "storage": "sqlite" }`
 - `workers_dev`: false, and `preview_urls`: false. The UI reaches the API on the same origin.
-- vars: `LLM_PROVIDER`, `WORKERS_AI_MODEL`, `OLLAMA_MODEL`, `CORS_ORIGIN` (`""`)
+- vars: `LLM_PROVIDER`, `OLLAMA_MODEL`, `CORS_ORIGIN` (`""`). The Workers AI model id is `DEFAULT_WORKERS_AI_MODEL` in `constants.ts`.
 - `ACCESS_TEAM_DOMAIN` and `ACCESS_AUD` are not in the file. DevOps sets them as secrets or vars. `ACCESS_AUD` is the UI Access application's AUD tag.
 - `limits.cpu_ms`: `30000` (Paid default). Enforced on Cloudflare's network only.
 
