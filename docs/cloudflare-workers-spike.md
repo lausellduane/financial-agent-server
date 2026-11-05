@@ -94,7 +94,7 @@ Workers AI does not take an API key inside the Worker. The `AI` binding authenti
 
 ### Ledger
 
-On the Worker, parsed rows go to a SQLite Durable Object, class `Ledger`, binding `LEDGER`. The object name is `sub:<subject>` when the token has a subject, otherwise `email:<address>`. The same text as an email and as a subject is two ledgers. Service tokens (`type: "app"`) and tokens with neither claim are rejected. Upload replaces that person's rows. Inserts are batched. A CSV over 5 MB or 20,000 rows is rejected.
+On the Worker, parsed rows go to a SQLite Durable Object, class `Ledger`, binding `LEDGER`. The object name is `sub:<subject>` when the token has a subject, otherwise `email:<address>`. The same text as an email and as a subject is two ledgers. Accepted tokens must have `type: "app"` plus an email or a non-empty subject. Any non-empty `common_name` is a service-token client id and is rejected, even if a subject is also present. A missing email and subject, including a whitespace-only subject, is rejected too. Real user logins use `type: "app"` with an email and a UUID subject and do not carry `common_name`. Upload replaces that person's rows. Inserts are batched. A CSV over 5 MB or 20,000 rows is rejected.
 
 The earlier proof of concept keyed the object by the raw email. Those objects are orphaned. Anyone who uploaded on that deploy has to upload the statement again.
 
@@ -110,7 +110,7 @@ The earlier proof of concept keyed the object by the raw email. Those objects ar
 
 `startDate` and `endDate` are calendar dates (`YYYY-MM-DD`) from the statement's date column. They are saved with the upload, and `GET /api/report` reads that summary in one Durable Object call instead of loading every row. `uploadedAt` is an ISO timestamp recorded when the rows were replaced, or `null` for a ledger saved before that timestamp existed. The response is only the caller's identity, and the route sends `Cache-Control: no-store`.
 
-The UI's suggested native Access path can send a service token (`type: "app"`). This Worker rejects those tokens. Whoever switches the UI to native Access has to use a user JWT, or this API has to grow an explicit service-token identity. Those two choices conflict until that is decided.
+Cloudflare application tokens for real users use `type: "app"` with an email and a UUID subject, and this Worker accepts those. Service tokens also use `type: "app"`, but they carry `common_name` (a client id ending in `.access`) and an empty subject, and any non-empty `common_name` is rejected. Native Access in the UI can send either kind. A service token still has no ledger until someone chooses an identity for it. `type: "org"` session tokens are not accepted.
 
 Node keeps one array in the process, because Access is not checked there.
 
@@ -236,7 +236,7 @@ npx wrangler secret put ACCESS_AUD           # AUD tag of the UI Access applicat
 npx wrangler deploy
 ```
 
-Put Cloudflare Access on the UI, not on a separate API hostname. `ACCESS_AUD` is that UI application's AUD tag. The browser sends `Cf-Access-Jwt-Assertion` on the same origin. The Worker checks the signature, `iss`, `aud`, `exp`, and `iat`, with 30 seconds of clock skew. A request without a valid user token gets `401`, including when the two Access settings are missing. Service tokens are rejected.
+Put Cloudflare Access on the UI, not on a separate API hostname. `ACCESS_AUD` is that UI application's AUD tag. The browser sends `Cf-Access-Jwt-Assertion` on the same origin. The Worker checks the signature, `iss`, `aud`, `exp`, and `iat`, with 30 seconds of clock skew. A request without a valid user token gets `401`, including when the two Access settings are missing. Tokens must have `type: "app"` and an email or subject. Any `common_name` is rejected. `type: "app"` alone does not make a token a service token.
 
 `workers.dev` and preview URLs are off. `CORS_ORIGIN` is empty because those calls are same-origin. Node dev still allows localhost and sends `Access-Control-Allow-Credentials`. Do not set `CORS_ORIGIN` to `*`.
 

@@ -48,7 +48,7 @@ async function tokenFor(
   email: string,
   options?: { aud?: string; expired?: boolean },
 ): Promise<string> {
-  const jwt = new SignJWT({ email, sub: `sub-${email}` })
+  const jwt = new SignJWT({ type: "app", email, sub: `sub-${email}` })
     .setProtectedHeader({ alg: "RS256", kid: "test-key" })
     .setIssuer(ISSUER)
     .setAudience(options?.aud ?? AUD)
@@ -79,7 +79,7 @@ async function signed(
   payload: Record<string, unknown>,
   header: { alg: "RS256" | "HS256"; kid?: string } = { alg: "RS256", kid: "test-key" },
 ): Promise<string> {
-  const jwt = new SignJWT(payload)
+  const jwt = new SignJWT({ type: "app", ...payload })
     .setProtectedHeader(
       header.alg === "HS256"
         ? { alg: "HS256" }
@@ -96,7 +96,11 @@ async function signed(
 }
 
 async function tokenMissing(claim: "iat" | "exp"): Promise<string> {
-  let jwt = new SignJWT({ email: "ada@example.com", sub: "sub-ada" })
+  let jwt = new SignJWT({
+    type: "app",
+    email: "ada@example.com",
+    sub: "sub-ada",
+  })
     .setProtectedHeader({ alg: "RS256", kid: "test-key" })
     .setIssuer(ISSUER)
     .setAudience(AUD);
@@ -117,6 +121,7 @@ function unsignedToken(): string {
     aud: AUD,
     iat: Math.floor(Date.now() / 1000),
     exp: Math.floor(Date.now() / 1000) + 600,
+    type: "app",
     email: "ada@example.com",
     sub: "sub-ada",
   });
@@ -177,11 +182,34 @@ describe("/api auth", () => {
 
   it("rejects a token with no email or sub and a service token", async () => {
     const noIdentity = await signed({});
-    const serviceToken = await signed({ type: "app", common_name: "ci-client" });
-    for (const token of [noIdentity, serviceToken]) {
+    const serviceToken = await signed({
+      type: "app",
+      common_name: "e367826f93b8d71185e03fe518aff3b4.access",
+      sub: "",
+    });
+    const namedServiceToken = await signed({
+      type: "app",
+      common_name: "e367826f93b8d71185e03fe518aff3b4.access",
+      sub: "6a1b2c3d-1111-2222-3333-444455556666",
+      email: "ada@example.com",
+    });
+    const blankSub = await signed({ type: "app", sub: " " });
+    for (const token of [noIdentity, serviceToken, namedServiceToken, blankSub]) {
       const response = await authed("/api/health", token);
       expect(response.status).toBe(401);
     }
+  });
+
+  it("accepts a documented user application token", async () => {
+    const token = await signed({
+      type: "app",
+      sub: "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      email: "ada@example.com",
+      nbf: Math.floor(Date.now() / 1000) - 30,
+      identity_nonce: "nonce-1",
+    });
+    const response = await authed("/api/health", token);
+    expect(response.status).toBe(200);
   });
 });
 
