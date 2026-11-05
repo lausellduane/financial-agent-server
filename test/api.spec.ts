@@ -48,7 +48,7 @@ async function tokenFor(
   email: string,
   options?: { aud?: string; expired?: boolean },
 ): Promise<string> {
-  const jwt = new SignJWT({ email, sub: `sub-${email}` })
+  const jwt = new SignJWT({ type: "app", email, sub: `sub-${email}` })
     .setProtectedHeader({ alg: "RS256", kid: "test-key" })
     .setIssuer(ISSUER)
     .setAudience(options?.aud ?? AUD)
@@ -79,7 +79,7 @@ async function signed(
   payload: Record<string, unknown>,
   header: { alg: "RS256" | "HS256"; kid?: string } = { alg: "RS256", kid: "test-key" },
 ): Promise<string> {
-  const jwt = new SignJWT(payload)
+  const jwt = new SignJWT({ type: "app", ...payload })
     .setProtectedHeader(
       header.alg === "HS256"
         ? { alg: "HS256" }
@@ -96,7 +96,11 @@ async function signed(
 }
 
 async function tokenMissing(claim: "iat" | "exp"): Promise<string> {
-  let jwt = new SignJWT({ email: "ada@example.com", sub: "sub-ada" })
+  let jwt = new SignJWT({
+    type: "app",
+    email: "ada@example.com",
+    sub: "sub-ada",
+  })
     .setProtectedHeader({ alg: "RS256", kid: "test-key" })
     .setIssuer(ISSUER)
     .setAudience(AUD);
@@ -117,6 +121,7 @@ function unsignedToken(): string {
     aud: AUD,
     iat: Math.floor(Date.now() / 1000),
     exp: Math.floor(Date.now() / 1000) + 600,
+    type: "app",
     email: "ada@example.com",
     sub: "sub-ada",
   });
@@ -177,7 +182,11 @@ describe("/api auth", () => {
 
   it("rejects a token with no email or sub and a service token", async () => {
     const noIdentity = await signed({});
-    const serviceToken = await signed({ type: "app", common_name: "ci-client" });
+    const serviceToken = await signed({
+      type: "app",
+      common_name: "ci-client",
+      sub: "",
+    });
     for (const token of [noIdentity, serviceToken]) {
       const response = await authed("/api/health", token);
       expect(response.status).toBe(401);

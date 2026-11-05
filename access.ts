@@ -58,14 +58,16 @@ function jwksFor(teamDomain: string) {
 }
 
 function identityFromPayload(payload: JWTPayload): AccessIdentity {
-  // Access service tokens use type "app" and carry a client id, not a person.
-  if (payload.type === "app") {
-    throw new Error("Service tokens have no user identity");
-  }
   const email = typeof payload.email === "string" ? payload.email.trim() : "";
   const sub = typeof payload.sub === "string" ? payload.sub.trim() : "";
-  if (!email && !sub) {
-    throw new Error("Access token has no email or sub");
+  const commonName =
+    typeof payload.common_name === "string" ? payload.common_name.trim() : "";
+  // Real user application tokens also use type "app". A service token is
+  // only a token with no person: no email and no subject, including a
+  // client id in common_name with an empty sub.
+  const noUser = !email && !sub;
+  if (noUser || (commonName && !email && !sub)) {
+    throw new Error("Service tokens have no user identity");
   }
   if (email) return { email, sub };
   return { sub };
