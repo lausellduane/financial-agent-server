@@ -10,6 +10,7 @@
 | --- | --- | --- |
 | `POST /api/upload` | multipart field `file` | Parse a bank CSV and store every row |
 | `POST /api/query` | JSON `{ "question": "..." }` | Filter those rows in process. Some questions call the model |
+| `GET /api/report` | probe | Whether this caller's ledger has a statement, plus count, date range, and last upload time. Requires Access on Workers. |
 | `GET /api/health` | probe | Runtime, provider, model, and ledger. No row count. On Workers it requires Access like the other `/api` routes. |
 
 The companion UI (`lausellduane/financial-agent-ui`, Expo 57 / React Native) posts to the upload and query routes and reads `count` from the upload response and `answer` or `error` from the query response. `App.tsx` hardcodes `http://localhost:4000` on web and iOS, and `http://10.0.2.2:4000` on the Android emulator. It sends no auth header and no session id. The web build needs CORS. Native builds do not.
@@ -96,6 +97,18 @@ Workers AI does not take an API key inside the Worker. The `AI` binding authenti
 On the Worker, parsed rows go to a SQLite Durable Object, class `Ledger`, binding `LEDGER`. The object name is `sub:<subject>` when the token has a subject, otherwise `email:<address>`. The same text as an email and as a subject is two ledgers. Service tokens (`type: "app"`) and tokens with neither claim are rejected. Upload replaces that person's rows. Inserts are batched. A CSV over 5 MB or 20,000 rows is rejected.
 
 The earlier proof of concept keyed the object by the raw email. Those objects are orphaned. Anyone who uploaded on that deploy has to upload the statement again.
+
+`GET /api/report` is how the UI learns that a statement is already stored. The UI's "No report loaded" text is only its own memory, so a new session must call this before Ask.
+
+```json
+{ "loaded": false, "count": 0, "startDate": null, "endDate": null, "uploadedAt": null }
+```
+
+```json
+{ "loaded": true, "count": 3, "startDate": "2026-01-02", "endDate": "2026-01-04", "uploadedAt": "2026-11-05T00:46:12.000Z" }
+```
+
+`startDate` and `endDate` are calendar dates (`YYYY-MM-DD`) from the statement's date column. They are saved with the upload, and `GET /api/report` reads that summary in one Durable Object call instead of loading every row. `uploadedAt` is an ISO timestamp recorded when the rows were replaced, or `null` for a ledger saved before that timestamp existed. The response is only the caller's identity, and the route sends `Cache-Control: no-store`.
 
 The UI's suggested native Access path can send a service token (`type: "app"`). This Worker rejects those tokens. Whoever switches the UI to native Access has to use a user JWT, or this API has to grow an explicit service-token identity. Those two choices conflict until that is decided.
 

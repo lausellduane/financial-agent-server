@@ -128,6 +128,8 @@ describe("/api auth", () => {
     const health = await handler.fetch(new Request("https://example.com/api/health"));
     expect(health.status).toBe(401);
     expect(await health.json()).toEqual({ error: "Unauthorized" });
+    const report = await handler.fetch(new Request("https://example.com/api/report"));
+    expect(report.status).toBe(401);
     for (const path of ["/api/upload", "/api/query"]) {
       const response = await handler.fetch(
         new Request(`https://example.com${path}`, { method: "POST" }),
@@ -184,6 +186,128 @@ describe("/api auth", () => {
 });
 
 describe("/api with a valid Access JWT", () => {
+  it("reports an empty ledger before any upload", async () => {
+    const token = await tokenFor("empty-report@example.com");
+    const response = await authed("/api/report", token);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(await response.json()).toEqual({
+      loaded: false,
+      count: 0,
+      startDate: null,
+      endDate: null,
+      uploadedAt: null,
+    });
+  });
+
+  it("reports the caller's statement after upload", async () => {
+    const token = await tokenFor("report@example.com");
+    const before = await authed("/api/report", token);
+    expect(await before.json()).toMatchObject({ loaded: false, count: 0 });
+
+    const form = new FormData();
+    form.set("file", new File([csv], "statement.csv", { type: "text/csv" }));
+    const uploaded = await authed("/api/upload", token, {
+      method: "POST",
+      body: form,
+    });
+    expect(uploaded.status).toBe(200);
+
+    const response = await authed("/api/report", token);
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      loaded: boolean;
+      count: number;
+      startDate: string | null;
+      endDate: string | null;
+      uploadedAt: string | null;
+    };
+    expect(body.loaded).toBe(true);
+    expect(body.count).toBe(3);
+    expect(body.startDate).toBe("2026-01-02");
+    expect(body.endDate).toBe("2026-01-04");
+    expect(body.uploadedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+
+    const other = await tokenFor("other-report@example.com");
+    const hidden = await authed("/api/report", other);
+    expect(await hidden.json()).toEqual({
+      loaded: false,
+      count: 0,
+      startDate: null,
+      endDate: null,
+      uploadedAt: null,
+    });
+  });
+
+  it("reports a loaded statement with no parseable dates", async () => {
+    const token = await tokenFor("no-dates@example.com");
+    const form = new FormData();
+    form.set(
+      "file",
+      new File(
+        ["Date,Description,Amount\nnot-a-date,PLANET HOME,-1541.42\n"],
+        "nodate.csv",
+        { type: "text/csv" },
+      ),
+    );
+    expect(
+      (await authed("/api/upload", token, { method: "POST", body: form })).status,
+    ).toBe(200);
+    const body = await (await authed("/api/report", token)).json();
+    expect(body).toMatchObject({
+      loaded: true,
+      count: 1,
+      startDate: null,
+      endDate: null,
+    });
+  });
+
+  it("replaces the stored report when the same person uploads again", async () => {
+    const token = await tokenFor("replace-report@example.com");
+    const firstForm = new FormData();
+    firstForm.set("file", new File([csv], "statement.csv", { type: "text/csv" }));
+    expect(
+      (
+        await authed("/api/upload", token, { method: "POST", body: firstForm })
+      ).status,
+    ).toBe(200);
+    const first = (await (await authed("/api/report", token)).json()) as {
+      count: number;
+      uploadedAt: string;
+    };
+    expect(first.count).toBe(3);
+
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const nextForm = new FormData();
+    nextForm.set(
+      "file",
+      new File(
+        ["Date,Description,Amount\n2026-03-01,SHELL OIL,-20.00\n"],
+        "next.csv",
+        { type: "text/csv" },
+      ),
+    );
+    expect(
+      (await authed("/api/upload", token, { method: "POST", body: nextForm }))
+        .status,
+    ).toBe(200);
+    const next = (await (await authed("/api/report", token)).json()) as {
+      loaded: boolean;
+      count: number;
+      startDate: string | null;
+      endDate: string | null;
+      uploadedAt: string | null;
+    };
+    expect(next).toMatchObject({
+      loaded: true,
+      count: 1,
+      startDate: "2026-03-01",
+      endDate: "2026-03-01",
+    });
+    expect(next.uploadedAt && first.uploadedAt < next.uploadedAt).toBe(true);
+  });
+
   it("serves health without a row count", async () => {
     const token = await tokenFor("ada@example.com");
     const response = await authed("/api/health", token);

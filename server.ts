@@ -75,29 +75,39 @@ const upload = multer({
 // Node keeps one statement in this process. The Worker stores each Access
 // identity in its own Ledger Durable Object.
 let transactionData: Record<string, string>[] = [];
+let transactionUploadedAt: string | null = null;
+let transactionStartDate: string | null = null;
+let transactionEndDate: string | null = null;
+
+async function ledgerStub(identity: AccessIdentity) {
+  const { env } = await import("cloudflare:workers");
+  return env.LEDGER.get(env.LEDGER.idFromName(ledgerId(identity)));
+}
 
 async function readLedger(
   identity: AccessIdentity | undefined,
 ): Promise<Record<string, string>[]> {
   if (!onWorkers()) return transactionData;
   if (!identity) throw new Error("Missing Access identity");
-  const { env } = await import("cloudflare:workers");
-  const stub = env.LEDGER.get(env.LEDGER.idFromName(ledgerId(identity)));
-  return stub.load();
+  return (await ledgerStub(identity)).load();
 }
 
 async function writeLedger(
   rows: Record<string, string>[],
   identity: AccessIdentity | undefined,
 ): Promise<void> {
+  const range = rows.length
+    ? dateRange(rows)
+    : { startDate: null, endDate: null };
   if (!onWorkers()) {
     transactionData = rows;
+    transactionUploadedAt = rows.length ? new Date().toISOString() : null;
+    transactionStartDate = range.startDate;
+    transactionEndDate = range.endDate;
     return;
   }
   if (!identity) throw new Error("Missing Access identity");
-  const { env } = await import("cloudflare:workers");
-  const stub = env.LEDGER.get(env.LEDGER.idFromName(ledgerId(identity)));
-  await stub.replace(rows);
+  await (await ledgerStub(identity)).replace(rows, range);
 }
 
 const GROCERY_TOKENS = [
@@ -628,6 +638,72 @@ function pickMerchantField(rows: Record<string, string>[]): string {
   }
 
   return best;
+}
+
+function calendarDate(raw: string | undefined): string | undefined {
+  const text = String(raw ?? "").trim();
+  if (!text) return undefined;
+  const iso = /^(\d{4})-(\d{1,2})-(\d{1,2})/.exec(text);
+  const us = /^(\d{1,2})\/(\d{1,2})\/(\d{2,4})/.exec(text);
+  let year: number;
+  let month: number;
+  let day: number;
+  if (iso) {
+    year = Number(iso[1]);
+    month = Number(iso[2]);
+    day = Number(iso[3]);
+  } else if (us) {
+    month = Number(us[1]);
+    day = Number(us[2]);
+    year = Number(us[3]);
+    if (year < 100) year += 2000;
+  } else {
+    return undefined;
+  }
+  if (month < 1 || month > 12 || day < 1 || day > 31) return undefined;
+  return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
+function dateRange(rows: Record<string, string>[]): {
+  startDate: string | null;
+  endDate: string | null;
+} {
+  const field = pickDisplayFields(rows).date;
+  let startDate: string | null = null;
+  let endDate: string | null = null;
+  if (!field) return { startDate, endDate };
+  for (const row of rows) {
+    const key = calendarDate(row[field]);
+    if (!key) continue;
+    if (!startDate || key < startDate) startDate = key;
+    if (!endDate || key > endDate) endDate = key;
+  }
+  return { startDate, endDate };
+}
+
+export type ReportSummary = {
+  loaded: boolean;
+  count: number;
+  startDate: string | null;
+  endDate: string | null;
+  uploadedAt: string | null;
+};
+
+async function reportFor(
+  identity: AccessIdentity | undefined,
+): Promise<ReportSummary> {
+  if (!onWorkers()) {
+    const count = transactionData.length;
+    return {
+      loaded: count > 0,
+      count,
+      startDate: count > 0 ? transactionStartDate : null,
+      endDate: count > 0 ? transactionEndDate : null,
+      uploadedAt: count > 0 ? transactionUploadedAt : null,
+    };
+  }
+  if (!identity) throw new Error("Missing Access identity");
+  return (await ledgerStub(identity)).summary();
 }
 
 function pickDisplayFields(rows: Record<string, string>[]) {
@@ -1694,6 +1770,16 @@ app.post("/api/query", async (req: Request, res: Response): Promise<any> => {
     res
       .status(500)
       .json({ error: "Failed to process financial array accurately." });
+  }
+});
+
+app.get("/api/report", async (_req: Request, res: Response) => {
+  res.set("Cache-Control", "no-store");
+  try {
+    res.json(await reportFor(res.locals.access));
+  } catch (error) {
+    console.error("Report lookup failed:", error);
+    res.status(500).json({ error: "Internal server error." });
   }
 });
 
