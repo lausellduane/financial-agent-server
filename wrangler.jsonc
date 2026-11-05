@@ -7,7 +7,10 @@
   // node:http server APIs and the in-memory node:fs virtual filesystem.
   // On dates on or after 2026-08-04 that layer is already on. Leave the
   // nodejs_compat flag unset; it is redundant here and does not add APIs.
-  "workers_dev": true,
+  // The UI calls this Worker through a service binding on the same origin.
+  // A workers.dev hostname and preview URLs are not part of that path.
+  "workers_dev": false,
+  "preview_urls": false,
   "observability": {
     "enabled": true
   },
@@ -37,9 +40,10 @@
     "LLM_PROVIDER": "workers-ai",
     "WORKERS_AI_MODEL": "@cf/meta/llama-3.1-8b-instruct-fast",
     "OLLAMA_MODEL": "llama3.1:latest",
-    // Comma-separated browser origins. "*" is ignored. DevOps adds the
-    // deployed UI origin here before a browser client calls this Worker.
-    "CORS_ORIGIN": "http://localhost:8081"
+    // Production calls are same-origin, so this stays empty. "*" is ignored.
+    // Node dev uses localhost when this is empty. A comma-separated list is
+    // only for a cross-origin dev UI.
+    "CORS_ORIGIN": ""
   },
   // Paid plan only. The default is 30s of CPU; Free is 10ms and cannot run
   // this app. Ignored by `wrangler dev`.

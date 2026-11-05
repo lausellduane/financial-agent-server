@@ -75,8 +75,8 @@ Names only. No values belong in the repo.
 | Name | Kind | Required | Purpose |
 | --- | --- | --- | --- |
 | `ACCESS_TEAM_DOMAIN` | secret or var | yes on Workers | Team subdomain (`your-team`) or `https://your-team.cloudflareaccess.com`. The issuer is `https://<team>.cloudflareaccess.com`. JWKS is `https://<team>.cloudflareaccess.com/cdn-cgi/access/certs`. |
-| `ACCESS_AUD` | secret or var | yes on Workers | Application Audience (AUD) tag from the Access application. |
-| `CORS_ORIGIN` | var, set in `wrangler.jsonc` | yes for browsers | Comma-separated origins. `*` is ignored. The committed value is `http://localhost:8081` (Expo web). Add the deployed UI origin before a browser client calls the Worker. |
+| `ACCESS_AUD` | secret or var | yes on Workers | AUD tag of the **UI** Access application. The browser session is that app, and the API checks the JWT it issued. |
+| `CORS_ORIGIN` | var, empty in `wrangler.jsonc` | no in production | Production calls are same-origin, so this stays empty. `*` is ignored. Node dev uses `http://localhost:8081` and `http://localhost:19006` when it is empty. Set a comma-separated list only for a cross-origin dev UI. |
 | `LLM_PROVIDER` | var, already `workers-ai` | no | `workers-ai` or `ollama`. |
 | `WORKERS_AI_MODEL` | var, already set | no | `@cf/meta/llama-3.1-8b-instruct-fast`. |
 | `OLLAMA_MODEL` | var, already `llama3.1:latest` | only for the Ollama path | Node default, and the Worker if you force `LLM_PROVIDER=ollama`. |
@@ -93,7 +93,7 @@ Workers AI does not take an API key inside the Worker. The `AI` binding authenti
 
 ### Ledger
 
-On the Worker, parsed rows go to a SQLite Durable Object, class `Ledger`, binding `LEDGER`. The object name is the Access email (lowercased), or `sub` when the token has no email. Each person gets their own statement. Upload replaces that person's rows. Inserts are batched. A CSV over 5 MB or 20,000 rows is rejected.
+On the Worker, parsed rows go to a SQLite Durable Object, class `Ledger`, binding `LEDGER`. The object name is `sub:<subject>` when the token has a subject, otherwise `email:<address>`. Service tokens (`type: "app"`) and tokens with neither claim are rejected. Upload replaces that person's rows. Inserts are batched. A CSV over 5 MB or 20,000 rows is rejected.
 
 Node keeps one array in the process, because Access is not checked there.
 
@@ -115,8 +115,9 @@ Node keeps one array in the process, because Access is not checked there.
 - `ai.binding`: `AI`, with `remote: true` so `wrangler dev` calls the real model
 - `durable_objects.bindings`: `LEDGER` → `Ledger`
 - `exports.Ledger`: `{ "type": "durable-object", "storage": "sqlite" }`
-- vars: `LLM_PROVIDER`, `WORKERS_AI_MODEL`, `OLLAMA_MODEL`, `CORS_ORIGIN` (`http://localhost:8081`)
-- `ACCESS_TEAM_DOMAIN` and `ACCESS_AUD` are not in the file. DevOps sets them as secrets or vars.
+- `workers_dev`: false, and `preview_urls`: false. The UI reaches the API on the same origin.
+- vars: `LLM_PROVIDER`, `WORKERS_AI_MODEL`, `OLLAMA_MODEL`, `CORS_ORIGIN` (`""`)
+- `ACCESS_TEAM_DOMAIN` and `ACCESS_AUD` are not in the file. DevOps sets them as secrets or vars. `ACCESS_AUD` is the UI Access application's AUD tag.
 - `limits.cpu_ms`: `30000` (Paid default). Enforced on Cloudflare's network only.
 
 `npx wrangler dev` with `remote: true` opens a remote proxy at startup. Without `CLOUDFLARE_API_TOKEN` that startup fails before the server listens. `npx wrangler dev --local` disables remote bindings, serves the Durable Object, and rejects `env.AI.run` with `Binding AI needs to be run remotely`.
@@ -212,13 +213,13 @@ npm ci
 export CLOUDFLARE_API_TOKEN="..."   # Workers Scripts: Edit, plus Workers AI: Read
 export CLOUDFLARE_ACCOUNT_ID="..."
 npx wrangler secret put ACCESS_TEAM_DOMAIN   # team subdomain, or https://<team>.cloudflareaccess.com
-npx wrangler secret put ACCESS_AUD           # Access application AUD tag
+npx wrangler secret put ACCESS_AUD           # AUD tag of the UI Access application
 npx wrangler deploy
 ```
 
-Create a Cloudflare Access application for the Worker hostname (self-hosted or workers.dev) before sending real statements. The AUD tag from that application is `ACCESS_AUD`. Access adds `Cf-Access-Jwt-Assertion`. The Worker checks the signature, `iss`, `aud`, and `exp`. A request without a valid token gets `401`, including when the two Access settings are missing.
+Put Cloudflare Access on the UI, not on a separate API hostname. `ACCESS_AUD` is that UI application's AUD tag. The browser sends `Cf-Access-Jwt-Assertion` on the same origin. The Worker checks the signature, `iss`, `aud`, `exp`, and `iat`, with 30 seconds of clock skew. A request without a valid user token gets `401`, including when the two Access settings are missing. Service tokens are rejected.
 
-`CORS_ORIGIN` is already `http://localhost:8081`. To allow more browser origins, set it to a comma-separated list and deploy again. Do not use `*`.
+`workers.dev` and preview URLs are off. `CORS_ORIGIN` is empty because those calls are same-origin. Node dev still allows localhost and sends `Access-Control-Allow-Credentials`. Do not set `CORS_ORIGIN` to `*`.
 
 Wrangler prints the `workers.dev` URL. Health, upload, and query need the Access JWT header:
 

@@ -75,9 +75,50 @@ const csv = `Date,Description,Amount
 2026-01-04,COSTCO WHSE #123 RALEIGH NC,-86.20
 `;
 
+async function signed(
+  payload: Record<string, unknown>,
+  header: { alg: "RS256" | "HS256"; kid?: string } = { alg: "RS256", kid: "test-key" },
+): Promise<string> {
+  const jwt = new SignJWT(payload)
+    .setProtectedHeader(
+      header.alg === "HS256"
+        ? { alg: "HS256" }
+        : { alg: "RS256", kid: header.kid ?? "test-key" },
+    )
+    .setIssuer(typeof payload.iss === "string" ? payload.iss : ISSUER)
+    .setAudience(typeof payload.aud === "string" ? payload.aud : AUD)
+    .setIssuedAt()
+    .setExpirationTime("10m");
+  if (header.alg === "HS256") {
+    return jwt.sign(new TextEncoder().encode("not-the-access-key"));
+  }
+  return jwt.sign(privateKey);
+}
+
+function unsignedToken(): string {
+  const encode = (value: object) =>
+    btoa(JSON.stringify(value))
+      .replaceAll("=", "")
+      .replaceAll("+", "-")
+      .replaceAll("/", "_");
+  const header = encode({ alg: "none", typ: "JWT" });
+  const payload = encode({
+    iss: ISSUER,
+    aud: AUD,
+    iat: Math.floor(Date.now() / 1000),
+    exp: Math.floor(Date.now() / 1000) + 600,
+    email: "ada@example.com",
+    sub: "sub-ada",
+  });
+  return `${header}.${payload}.`;
+}
+
 describe("/api auth", () => {
   it("rejects health, upload, and query without a JWT", async () => {
-    for (const path of ["/api/health", "/api/upload", "/api/query"]) {
+    const health = await handler.fetch(new Request("https://example.com/api/health"));
+    expect(health.status).toBe(401);
+    expect(await health.json()).toEqual({ error: "Unauthorized" });
+    for (const path of ["/api/upload", "/api/query"]) {
       const response = await handler.fetch(
         new Request(`https://example.com${path}`, { method: "POST" }),
       );
@@ -90,6 +131,35 @@ describe("/api auth", () => {
     const expired = await tokenFor("ada@example.com", { expired: true });
     const wrongAud = await tokenFor("ada@example.com", { aud: "other-app" });
     for (const token of [expired, wrongAud]) {
+      const response = await authed("/api/health", token);
+      expect(response.status).toBe(401);
+    }
+  });
+
+  it("rejects a wrong issuer, alg none, HS256, and an unknown key id", async () => {
+    const wrongIssuer = await signed({
+      email: "ada@example.com",
+      sub: "sub-ada",
+      iss: "https://evil.cloudflareaccess.com",
+    });
+    const hs256 = await signed(
+      { email: "ada@example.com", sub: "sub-ada" },
+      { alg: "HS256" },
+    );
+    const unknownKid = await signed(
+      { email: "ada@example.com", sub: "sub-ada" },
+      { alg: "RS256", kid: "missing-key" },
+    );
+    for (const token of [wrongIssuer, unsignedToken(), hs256, unknownKid]) {
+      const response = await authed("/api/health", token);
+      expect(response.status).toBe(401);
+    }
+  });
+
+  it("rejects a token with no email or sub and a service token", async () => {
+    const noIdentity = await signed({});
+    const serviceToken = await signed({ type: "app", common_name: "ci-client" });
+    for (const token of [noIdentity, serviceToken]) {
       const response = await authed("/api/health", token);
       expect(response.status).toBe(401);
     }
@@ -109,7 +179,29 @@ describe("/api with a valid Access JWT", () => {
       ledger: "durable-object",
     });
     expect(body).not.toHaveProperty("rows");
+    expect(response.headers.get("access-control-allow-origin")).toBeNull();
+  });
+
+  it("does not allow a cross-origin browser", async () => {
+    const token = await tokenFor("ada@example.com");
+    const response = await authed("/api/health", token, {
+      headers: { Origin: "https://evil.example" },
+    });
+    expect(response.status).toBe(200);
+    expect(response.headers.get("access-control-allow-origin")).not.toBe(
+      "https://evil.example",
+    );
     expect(response.headers.get("access-control-allow-origin")).not.toBe("*");
+  });
+
+  it("rejects an upload with no file", async () => {
+    const token = await tokenFor("ada@example.com");
+    const response = await authed("/api/upload", token, {
+      method: "POST",
+      body: new FormData(),
+    });
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: "No file uploaded" });
   });
 
   it("uploads a statement and answers a non-model query", async () => {
@@ -178,7 +270,7 @@ describe("/api with a valid Access JWT", () => {
     expect(body.error).toContain("20000");
   });
 
-  it("fails closed when Access configuration is missing", async () => {
+  it("fails closed when Access configuration is missing", { concurrent: false }, async () => {
     const previousTeam = process.env.ACCESS_TEAM_DOMAIN;
     const previousAud = process.env.ACCESS_AUD;
     delete process.env.ACCESS_TEAM_DOMAIN;

@@ -42,10 +42,18 @@ function allowedOrigins(): string[] | false {
 }
 
 app.use((req, res, next) => {
-  cors({
-    origin: allowedOrigins(),
-    allowedHeaders: ["Content-Type", "Cf-Access-Jwt-Assertion"],
-  })(req, res, next);
+  const origin = allowedOrigins();
+  // Production traffic is same-origin, so origin is false and CORS stays off.
+  // Dev still allows localhost (or CORS_ORIGIN) and must echo credentials.
+  cors(
+    origin === false
+      ? { origin: false }
+      : {
+          origin,
+          credentials: true,
+          allowedHeaders: ["Content-Type"],
+        },
+  )(req, res, next);
 });
 app.use(express.json());
 app.use("/api", accessMiddleware);
@@ -1758,6 +1766,12 @@ app.use(
     next(error);
   },
 );
+
+app.use((error: unknown, _req: Request, res: Response, _next: (error?: unknown) => void) => {
+  console.error("Request failed:", error instanceof Error ? error.message : "unknown error");
+  if (res.headersSent) return;
+  res.status(500).json({ error: "Internal server error." });
+});
 
 export { app };
 
