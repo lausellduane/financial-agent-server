@@ -1,0 +1,16 @@
+# Copy to .dev.vars for local `wrangler dev`. .dev.vars is gitignored.
+# Names only. Do not commit real values.
+#
+# Required on Workers. Requests to /api are rejected until both are set.
+# ACCESS_TEAM_DOMAIN is the team subdomain (your-team) or
+# https://your-team.cloudflareaccess.com.
+# ACCESS_AUD is the UI Access application's AUD tag, not a separate API app.
+#
+# ACCESS_TEAM_DOMAIN=
+# ACCESS_AUD=
+#
+# Workers AI uses the AI binding. No model key goes here.
+# Set these only when LLM_PROVIDER=ollama.
+#
+# OLLAMA_HOST=
+# OLLAMA_API_KEY=

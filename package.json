@@ -4,7 +4,10 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "tsx server.ts",
+    "dev:worker": "wrangler dev",
+    "check:worker": "wrangler deploy --dry-run --outdir dist",
+    "test": "tsx --test workers-ai-text.test.ts parse-csv.test.ts llm.test.ts indexes.test.ts && vitest run"
   },
   "repository": {
     "type": "git",
@@ -23,15 +26,20 @@
     "csv-parser": "^3.2.1",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
+    "jose": "^6.2.15",
     "multer": "^2.2.0",
     "ollama": "^0.6.3"
   },
   "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.5.1",
+    "@cloudflare/workers-types": "^5.20261104.1",
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
     "@types/multer": "^2.2.0",
     "@types/node": "^26.2.0",
     "tsx": "^4.23.12",
-    "typescript": "^7.0.2"
+    "typescript": "^7.0.2",
+    "vitest": "^5.1.0",
+    "wrangler": "^4.157.0"
   }
 }

@@ -4,20 +4,101 @@ import multer from "multer";
 import csv from "csv-parser";
 import fs from "fs";
 import path from "path"; // Crucial for Windows backslash normalization
-import ollama from "ollama";
+import { Readable } from "node:stream";
+import process from "node:process";
 import { fileURLToPath } from "url";
+import {
+  accessMiddleware,
+  ledgerId,
+  onWorkers,
+  type AccessIdentity,
+} from "./access.js";
+import { MAX_LEDGER_ROWS, MAX_UPLOAD_BYTES, PORT } from "./constants.js";
+import {
+  completeChat,
+  llmProvider,
+  ollamaModel,
+  workersAiModel,
+} from "./llm.js";
 
 // 👇 RECREATE __dirname FOR ES MODULES
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+// Workers bundles do not always set import.meta.url. Node (tsx) does.
+const moduleUrl = import.meta.url;
+const __filename =
+  typeof moduleUrl === "string" && moduleUrl.length > 0
+    ? fileURLToPath(moduleUrl)
+    : "";
+const __dirname = __filename ? path.dirname(__filename) : "/tmp";
 
 const app: Express = express();
-app.use(cors());
-app.use(express.json());
 
-// Explicitly use path.join to ensure correct Windows backslash pathing
-const upload = multer({ dest: path.join(__dirname, "uploads") });
+// Workers populates process.env from wrangler vars and secrets
+// (compatibility date on or after 2025-04-01). dotenv is not used here.
+const LOCAL_DEV_ORIGINS = ["http://localhost:8081", "http://localhost:19006"];
+
+function allowedOrigins(): string[] | false {
+  const configured = (process.env.CORS_ORIGIN ?? "")
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter((origin) => origin.length > 0 && origin !== "*");
+  if (onWorkers()) return configured.length > 0 ? configured : false;
+  return configured.length > 0 ? configured : LOCAL_DEV_ORIGINS;
+}
+
+app.use((req, res, next) => {
+  const origin = allowedOrigins();
+  // Production traffic is same-origin, so origin is false and CORS stays off.
+  // Dev still allows localhost (or CORS_ORIGIN) and must echo credentials.
+  cors(
+    origin === false
+      ? { origin: false }
+      : {
+          origin,
+          credentials: true,
+          allowedHeaders: ["Content-Type"],
+        },
+  )(req, res, next);
+});
+app.use(express.json());
+app.use("/api", accessMiddleware);
+
+// Workers' /tmp is a per-request virtual disk. Multer's disk engine writes
+// the upload and then the file is gone, so Workers keeps the CSV in memory.
+// Node still uses a real directory next to this file (Windows path safe).
+const upload = multer({
+  ...(onWorkers()
+    ? { storage: multer.memoryStorage() }
+    : { dest: path.join(__dirname, "uploads") }),
+  limits: { fileSize: MAX_UPLOAD_BYTES },
+});
+
+// Node keeps one statement in this process. The Worker stores each Access
+// identity in its own Ledger Durable Object.
 let transactionData: Record<string, string>[] = [];
+
+async function readLedger(
+  identity: AccessIdentity | undefined,
+): Promise<Record<string, string>[]> {
+  if (!onWorkers()) return transactionData;
+  if (!identity) throw new Error("Missing Access identity");
+  const { env } = await import("cloudflare:workers");
+  const stub = env.LEDGER.get(env.LEDGER.idFromName(ledgerId(identity)));
+  return stub.load();
+}
+
+async function writeLedger(
+  rows: Record<string, string>[],
+  identity: AccessIdentity | undefined,
+): Promise<void> {
+  if (!onWorkers()) {
+    transactionData = rows;
+    return;
+  }
+  if (!identity) throw new Error("Missing Access identity");
+  const { env } = await import("cloudflare:workers");
+  const stub = env.LEDGER.get(env.LEDGER.idFromName(ledgerId(identity)));
+  await stub.replace(rows);
+}
 
 const GROCERY_TOKENS = [
   "COSTCO",
@@ -1072,6 +1153,17 @@ function extractJson(raw: string): unknown {
     : new Error("Model did not return JSON");
 }
 
+export function indexesInRange(indexes: unknown, length: number): number[] {
+  if (!Array.isArray(indexes) || length < 1) return [];
+  const picked: number[] = [];
+  for (const index of indexes) {
+    if (typeof index !== "number" || !Number.isInteger(index)) continue;
+    if (index < 1 || index > length) continue;
+    picked.push(index);
+  }
+  return picked;
+}
+
 async function classifyUnknownMerchants(
   merchants: string[],
   category: SpendCategory,
@@ -1087,39 +1179,33 @@ async function classifyUnknownMerchants(
       .map((name, index) => `${index + 1}. ${name}`)
       .join("\n");
 
-    const response = await ollama.chat({
-      model: "llama3.1:latest",
-      messages: [
-        {
-          role: "system",
-          content: `You classify bank merchant strings as ${category.name} or not.
+    const content = await completeChat([
+      {
+        role: "system",
+        content: `You classify bank merchant strings as ${category.name} or not.
 ${category.name} = ${category.llmInclude}.
 NOT ${category.name} = ${category.llmExclude}.
 If unsure, do NOT include it.
 Return ONLY JSON: {"indexes":[1,4]}
 indexes are the 1-based catalog numbers that ARE ${category.name}.`,
-        },
-        {
-          role: "user",
-          content: `Catalog:\n${catalog}`,
-        },
-      ],
-      options: { temperature: 0 },
-    });
+      },
+      {
+        role: "user",
+        content: `Catalog:\n${catalog}`,
+      },
+    ]);
 
     try {
-      const parsed = extractJson(response.message.content) as {
+      const parsed = extractJson(content) as {
         indexes?: unknown;
       };
-      const indexes = Array.isArray(parsed.indexes) ? parsed.indexes : [];
-      for (const index of indexes) {
-        const n = Number(index);
+      for (const n of indexesInRange(parsed.indexes, batch.length)) {
         const name = batch[n - 1];
         if (name) picked.push(name);
       }
     } catch (error) {
       console.error("Merchant classification parse failed:", error);
-      console.error("Raw model output:", response.message.content);
+      console.error("Raw model output:", content);
     }
   }
 
@@ -1361,12 +1447,10 @@ async function answerFromLedger(
     )
     .join("\n");
 
-  const response = await ollama.chat({
-    model: "llama3.1:latest",
-    messages: [
-      {
-        role: "system",
-        content: `You answer questions about a cash-management ledger.
+  const content = await completeChat([
+    {
+      role: "system",
+      content: `You answer questions about a cash-management ledger.
 Use ONLY the listed transactions. Spending/charges are usually negative; deposits are usually positive.
 Never write code. Never invent rows.
 Return ONLY JSON: {"indexes":[1,4]}
@@ -1374,22 +1458,19 @@ indexes are 1-based catalog numbers that answer the question.
 For a single transaction (highest, a named merchant, latest), return one index.
 For a set (all Chipotle, all last week), return every matching index.
 If nothing matches, {"indexes":[]}`,
-      },
-      {
-        role: "user",
-        content: `Question: ${question}\n\nLedger:\n${catalog}`,
-      },
-    ],
-    options: { temperature: 0 },
-  });
+    },
+    {
+      role: "user",
+      content: `Question: ${question}\n\nLedger:\n${catalog}`,
+    },
+  ]);
 
-  const parsed = extractJson(response.message.content) as {
+  const parsed = extractJson(content) as {
     indexes?: unknown;
   };
-  const indexes = Array.isArray(parsed.indexes) ? parsed.indexes : [];
   const picked: NormalizedTx[] = [];
-  for (const index of indexes) {
-    const tx = txs[Number(index) - 1];
+  for (const n of indexesInRange(parsed.indexes, txs.length)) {
+    const tx = txs[n - 1];
     if (tx) picked.push(tx);
   }
   return picked;
@@ -1422,19 +1503,11 @@ function formatMatches(
   return lines.join("\n");
 }
 
-app.post(
-  "/api/upload",
-  upload.single("file"),
-  (req: Request, res: Response): any => {
-    if (!req.file) return res.status(400).json({ error: "No file uploaded" });
-
-    const results: Record<string, string>[] = [];
-    // Windows file streams require clean absolute system string references
-    const targetPath = path.resolve(req.file.path);
-    const rawCsv = fs.readFileSync(targetPath, "utf8");
-    const skipLines = countCsvSkipLines(rawCsv);
-
-    fs.createReadStream(targetPath)
+export function parseCsv(rawCsv: string): Promise<Record<string, string>[]> {
+  const skipLines = countCsvSkipLines(rawCsv);
+  const results: Record<string, string>[] = [];
+  return new Promise((resolve, reject) => {
+    Readable.from([rawCsv])
       .pipe(
         csv({
           skipLines,
@@ -1442,38 +1515,71 @@ app.post(
         }),
       )
       .on("data", (data) => results.push(normalizeRow(data)))
-      .on("end", () => {
-        transactionData = results;
+      .on("end", () => resolve(results))
+      .on("error", reject);
+  });
+}
+
+app.post(
+  "/api/upload",
+  upload.single("file"),
+  async (req: Request, res: Response) => {
+    if (!req.file) {
+      res.status(400).json({ error: "No file uploaded" });
+      return;
+    }
+
+    try {
+      let rawCsv: string;
+      if (req.file.buffer) {
+        rawCsv = req.file.buffer.toString("utf8");
+      } else if (req.file.path) {
+        // Windows file streams require clean absolute system string references
+        const targetPath = path.resolve(req.file.path);
+        rawCsv = fs.readFileSync(targetPath, "utf8");
         try {
-          fs.unlinkSync(targetPath); // File system cleanup
+          fs.unlinkSync(targetPath);
         } catch (err) {
           console.error("File lock warning on Windows: ", err);
         }
-        const fields = transactionData[0] ? Object.keys(transactionData[0]) : [];
-        const displayFields = transactionData.length
-          ? pickDisplayFields(transactionData)
-          : null;
-        const columns = fields.map((field) =>
-          columnStats(transactionData, field),
-        );
-        console.log("Upload schema:", { fields, displayFields, columns });
-        res.json({
-          message: "Data ingested successfully!",
-          count: transactionData.length,
-          fields,
-          mappedFields: displayFields,
-          columns,
-          sampleRows: transactionData.slice(0, 3),
-          sampleMerchants: displayFields?.description
-            ? uniqueMerchants(transactionData, displayFields.description, 15)
-            : [],
+      } else {
+        res.status(400).json({ error: "No file uploaded" });
+        return;
+      }
+
+      const rows = await parseCsv(rawCsv);
+      if (rows.length > MAX_LEDGER_ROWS) {
+        res.status(413).json({
+          error: `Statement has ${rows.length} rows. The limit is ${MAX_LEDGER_ROWS}.`,
         });
+        return;
+      }
+      await writeLedger(rows, res.locals.access);
+      const fields = rows[0] ? Object.keys(rows[0]) : [];
+      const displayFields = rows.length ? pickDisplayFields(rows) : null;
+      const columns = fields.map((field) => columnStats(rows, field));
+      console.log("Upload schema:", { fields, displayFields, columns });
+      res.json({
+        message: "Data ingested successfully!",
+        count: rows.length,
+        fields,
+        mappedFields: displayFields,
+        columns,
+        sampleRows: rows.slice(0, 3),
+        sampleMerchants: displayFields?.description
+          ? uniqueMerchants(rows, displayFields.description, 15)
+          : [],
       });
+    } catch (error) {
+      console.error("Upload parse failed:", error);
+      res.status(500).json({ error: "Failed to read the uploaded report." });
+    }
   },
 );
 
 app.post("/api/query", async (req: Request, res: Response): Promise<any> => {
   const { question } = req.body;
+  const transactionData = await readLedger(res.locals.access);
   if (!transactionData.length) {
     return res
       .status(400)
@@ -1591,4 +1697,46 @@ app.post("/api/query", async (req: Request, res: Response): Promise<any> => {
   }
 });
 
-app.listen(4000, () => console.log("Backend active on http://localhost:4000"));
+app.get("/api/health", (_req: Request, res: Response) => {
+  const provider = llmProvider();
+  res.json({
+    ok: true,
+    runtime: onWorkers() ? "cloudflare-workers" : "node",
+    llm: provider,
+    model: provider === "workers-ai" ? workersAiModel() : ollamaModel(),
+    ledger: onWorkers() ? "durable-object" : "memory",
+  });
+});
+
+app.use(
+  (
+    error: unknown,
+    _req: Request,
+    res: Response,
+    next: (error?: unknown) => void,
+  ) => {
+    if (error instanceof multer.MulterError && error.code === "LIMIT_FILE_SIZE") {
+      res.status(413).json({ error: "File is larger than 5 MB." });
+      return;
+    }
+    next(error);
+  },
+);
+
+app.use((error: unknown, _req: Request, res: Response, _next: (error?: unknown) => void) => {
+  console.error("Request failed:", error instanceof Error ? error.message : "unknown error");
+  if (res.headersSent) return;
+  res.status(500).json({ error: "Internal server error." });
+});
+
+export { app };
+
+const entry = process.argv[1];
+const isNodeEntry = !!entry && !!__filename && path.resolve(entry) === __filename;
+
+if (isNodeEntry) {
+  const port = Number(process.env.PORT ?? PORT);
+  app.listen(port, () =>
+    console.log(`Backend active on http://localhost:${port}`),
+  );
+}
