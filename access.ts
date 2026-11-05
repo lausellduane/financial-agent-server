@@ -62,11 +62,16 @@ function identityFromPayload(payload: JWTPayload): AccessIdentity {
   const sub = typeof payload.sub === "string" ? payload.sub.trim() : "";
   const commonName =
     typeof payload.common_name === "string" ? payload.common_name.trim() : "";
-  // Real user application tokens also use type "app". A service token is
-  // only a token with no person: no email and no subject, including a
-  // client id in common_name with an empty sub.
-  const noUser = !email && !sub;
-  if (noUser || (commonName && !email && !sub)) {
+  // User logins and service tokens both use type "app". Global session
+  // tokens use type "org" and are not accepted here.
+  if (payload.type !== "app") {
+    throw new Error("Access token is not an application token");
+  }
+  // common_name is the service-token client id. Identity tokens do not carry it.
+  if (commonName) {
+    throw new Error("Service tokens have no user identity");
+  }
+  if (!email && !sub) {
     throw new Error("Service tokens have no user identity");
   }
   if (email) return { email, sub };
