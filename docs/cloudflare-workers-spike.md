@@ -193,6 +193,8 @@ env.LLM_PROVIDER        workers-ai
 env.WORKERS_AI_MODEL    @cf/meta/llama-3.1-8b-instruct-fast
 ```
 
+That dry-run still listed `WORKERS_AI_MODEL` as a var. The id now lives only in `constants.ts`.
+
 `wrangler dev` without a token stopped at: `In a non-interactive environment, it's necessary to set a CLOUDFLARE_API_TOKEN`.
 
 `wrangler dev --local` on `127.0.0.1:8787`:
