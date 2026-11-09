@@ -38,6 +38,7 @@ export type Interpreted = {
   confident: boolean;
   followUp: boolean;
   unrecognized: boolean;
+  invalidDateRange: boolean;
 };
 
 const OPS = new Set<QueryOp>(["sum", "list", "max", "count"]);
@@ -376,7 +377,7 @@ function mentionedMerchants(question: string, known: string[]): string[] {
   for (const name of known) {
     for (const token of distinctiveTokens(name)) {
       if (seen.has(token)) continue;
-      if (!tokenIn(question, token)) continue;
+      if (!tokenIn(question, token, true)) continue;
       seen.add(token);
       hits.push(token);
     }
@@ -433,18 +434,24 @@ function monthRange(question: string): { from: string; to: string } | null {
   };
 }
 
-function dateRange(question: string): { from: string | null; to: string | null } {
+function dateRange(question: string): {
+  from: string | null;
+  to: string | null;
+  invalid: boolean;
+} {
   const isos = [...question.matchAll(/\b(\d{4}-\d{2}-\d{2})\b/g)]
     .map((match) => match[1] ?? "")
-    .filter((value) => isIsoDate(value))
-    .sort();
+    .filter((value) => isIsoDate(value));
   if (isos.length >= 2) {
-    return { from: isos[0] ?? null, to: isos[isos.length - 1] ?? null };
+    const from = isos[0] ?? null;
+    const to = isos[isos.length - 1] ?? null;
+    if (from && to && from > to) return { from: null, to: null, invalid: true };
+    return { from, to, invalid: false };
   }
-  if (isos.length === 1) return { from: isos[0] ?? null, to: isos[0] ?? null };
+  if (isos.length === 1) return { from: isos[0] ?? null, to: isos[0] ?? null, invalid: false };
   const month = monthRange(question);
-  if (month) return { from: month.from, to: month.to };
-  return { from: null, to: null };
+  if (month) return { from: month.from, to: month.to, invalid: false };
+  return { from: null, to: null, invalid: false };
 }
 
 function detectOp(question: string, hasFilter: boolean): QueryOp | null {
@@ -497,6 +504,17 @@ export function interpretQuestion(
   const asked = question.trim();
   if (!asked) return null;
 
+  const dates = dateRange(asked);
+  if (dates.invalid) {
+    return {
+      intent: blankIntent("sum"),
+      confident: false,
+      followUp: false,
+      unrecognized: false,
+      invalidDateRange: true,
+    };
+  }
+
   if (isPureFollowUp(asked, previous) && previous) {
     const excludeMerchants = dedupe([
       ...previous.excludeMerchants,
@@ -507,7 +525,13 @@ export function interpretQuestion(
       asked,
       false,
     );
-    return { intent, confident: true, followUp: true, unrecognized: false };
+    return {
+      intent,
+      confident: true,
+      followUp: true,
+      unrecognized: false,
+      invalidDateRange: false,
+    };
   }
 
   const categories: Category[] = [];
@@ -531,7 +555,6 @@ export function interpretQuestion(
   }
 
   const exclusions = exclusionTerms(asked, knownMerchants);
-  const dates = dateRange(asked);
   const hasFilter = categories.length > 0 || merchants.length > 0;
   const op = detectOp(asked, hasFilter);
   if (!op && !hasFilter && !exclusions.length) return null;
@@ -560,7 +583,13 @@ export function interpretQuestion(
   );
   const unrecognized = unrecognizedTopic(asked, merchants);
   const confident = !unrecognized && (!!op || hasFilter);
-  return { intent, confident, followUp: false, unrecognized };
+  return {
+    intent,
+    confident,
+    followUp: false,
+    unrecognized,
+    invalidDateRange: false,
+  };
 }
 
 export function buildIntentMessages(

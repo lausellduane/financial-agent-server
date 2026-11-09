@@ -96,7 +96,7 @@ test("node mode retries a merchant that failed categorization", async () => {
   const missed = await ask("How much I spent eating out?");
   assert.match(missed, /CHIPOTLE: \$4\.00/);
   assert.doesNotMatch(missed, /ZOOPLEX/);
-  assert.match(missed, /still uncategorized/);
+  assert.match(missed, /1 uncategorized charge \(\$9\.50\)/);
   fail = false;
   const found = await ask("How much I spent eating out?");
   assert.match(found, /ZOOPLEX/);
@@ -132,5 +132,133 @@ test("node mode drops question context when the statement is replaced", async ()
   assert.match(follow, /SHELL/);
   assert.doesNotMatch(follow, /STARBUCKS/);
   assert.doesNotMatch(follow, /CHIPOTLE/);
+  setCompleteChatForTests(null);
+});
+
+test("node mode keeps a mobile deposit out of gas and highest charge", async () => {
+  assert.equal(
+    (
+      await upload(
+        csv([
+          "2026-01-02,SHELL OIL,-40.00",
+          "2026-01-03,MOBILE DEPOSIT,2500.00",
+          "2026-01-04,CHIPOTLE,-10.00",
+        ]),
+      )
+    ).status,
+    200,
+  );
+  const gas = await ask("gas");
+  assert.match(gas, /Total: \$40\.00/);
+  assert.doesNotMatch(gas, /2500|2460|CHIPOTLE/);
+
+  assert.equal(
+    (await upload(csv(["2026-01-02,COSTCO,30.00", "2026-01-03,MOBILE DEPOSIT,2500.00"])))
+      .status,
+    200,
+  );
+  const highest = await ask("What was my highest charge?");
+  assert.match(highest, /Costco/);
+  assert.match(highest, /30\.00/);
+  assert.doesNotMatch(highest, /2500/);
+});
+
+test("node mode keeps nonzero blank rows and names the zero-amount row", async () => {
+  const uploaded = await upload(
+    csv([
+      "2026-01-01,CHIPOTLE,-10.00",
+      "2026-01-02,pending,-50.00",
+      "2026-01-03,,-25.00",
+      "2026-01-04,CHIPOTLE,0",
+    ]),
+  );
+  assert.equal(uploaded.status, 200);
+  assert.equal(uploaded.body.uncategorized, 0);
+  assert.equal((uploaded.body as { count?: number }).count, 4);
+  const answer = await ask("How much did I spend?");
+  assert.match(answer, /10\.00/);
+  assert.match(answer, /50\.00/);
+  assert.match(answer, /25\.00/);
+  assert.match(answer, /Total: \$85\.00/);
+  assert.match(answer, /1 zero-amount row/);
+});
+
+test("node mode returns 409 when a held model call outlives a replacement", async () => {
+  assert.equal(
+    (await upload(csv(["2026-01-02,AMAZON.COM,-20.00"]))).status,
+    200,
+  );
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let markEntered!: () => void;
+  const entered = new Promise<void>((resolve) => {
+    markEntered = resolve;
+  });
+  setCompleteChatForTests(async () => {
+    markEntered();
+    await gate;
+    return JSON.stringify({
+      categories: ["shopping"],
+      merchants: [],
+      excludeMerchants: [],
+      dateFrom: null,
+      dateTo: null,
+      op: "sum",
+      combine: "or",
+    });
+  });
+  const pending = fetch(`${base}/api/query`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ question: "How much did I spend on hobbies?" }),
+  });
+  await entered;
+  assert.equal((await upload(csv(["2026-02-01,SHELL OIL,-40.00"]))).status, 200);
+  release();
+  const response = await pending;
+  const body = (await response.json()) as { answer?: string; error?: string };
+  assert.equal(response.status, 409);
+  assert.match(body.error ?? "", /Ask again/);
+  assert.doesNotMatch(JSON.stringify(body), /20\.00/);
+  setCompleteChatForTests(null);
+});
+
+test("node mode returns 409 when categorization finishes on a replaced statement", async () => {
+  setCompleteChatForTests(async () => {
+    throw new Error("rate limit");
+  });
+  assert.equal(
+    (await upload(csv(["2026-01-02,ZOOPLEX SNACKBAR,-9.50"]))).status,
+    200,
+  );
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let markEntered!: () => void;
+  const entered = new Promise<void>((resolve) => {
+    markEntered = resolve;
+  });
+  setCompleteChatForTests(async () => {
+    markEntered();
+    await gate;
+    return JSON.stringify({
+      items: [{ merchant: "ZOOPLEX SNACKBAR", category: "dining" }],
+    });
+  });
+  const pending = fetch(`${base}/api/query`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ question: "How much did I spend?" }),
+  });
+  await entered;
+  assert.equal((await upload(csv(["2026-02-01,SHELL OIL,-40.00"]))).status, 200);
+  release();
+  const response = await pending;
+  const body = (await response.json()) as { error?: string };
+  assert.equal(response.status, 409);
+  assert.doesNotMatch(JSON.stringify(body), /9\.50/);
   setCompleteChatForTests(null);
 });

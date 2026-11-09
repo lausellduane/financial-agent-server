@@ -181,6 +181,15 @@ describe("categorizeNarrative", () => {
       "utilities/telecom",
     );
     expect(categorizeNarrative("SHELL OIL 12", -4000, true)).toBe("gas/auto");
+    expect(categorizeNarrative("MOBILE DEPOSIT", 250000, true)).toBe("income");
+    expect(categorizeNarrative("MOBILE DEPOSIT", 250000, false)).toBe("income");
+    expect(categorizeNarrative("SHELLFISH SHACK", -3000, true)).toBe("unknown");
+    expect(categorizeNarrative("SONICARE TOOTHBRUSH", -8000, true)).toBe("unknown");
+    expect(categorizeNarrative("SONIC DRIVE IN", -500, true)).toBe("dining");
+    expect(categorizeNarrative("MOBIL OIL", -4000, true)).toBe("gas/auto");
+    expect(categorizeNarrative("COSTCO GAS", -4500, true)).toBe("gas/auto");
+    expect(categorizeNarrative("COSTCO WHSE", -8000, true)).toBe("groceries");
+    expect(categorizeNarrative("pending", -5000, true)).toBe("other");
   });
 
   it("keeps a merchant refund in its spending category and treats unmatched credits as income", () => {
@@ -408,6 +417,31 @@ describe("intent validation and aggregation", () => {
     expect(follow.answer).toContain("CHIPOTLE");
   });
 
+  it("does not treat shellfish as the shell station when excluding", () => {
+    const shell = view("SHELL OIL", "-15.00", true);
+    const fish = {
+      ...view("SHELLFISH SHACK", "-30.00", true),
+      category: "dining" as const,
+      narrative: "SHELLFISH SHACK",
+      merchant: "SHELLFISH SHACK",
+    };
+    const first = answerFor("How much did I spend?", [shell, fish]);
+    const follow = answerFor("exclude shellfish", [shell, fish], first.intent);
+    expect(follow.answer).toContain("SHELL");
+    expect(follow.answer).toContain("15.00");
+    expect(follow.answer).not.toContain("SHELLFISH");
+    expect(follow.answer).not.toContain("30.00");
+  });
+
+  it("rejects a reversed date range instead of sorting it", () => {
+    const parsed = interpretQuestion(
+      "eating out from 2026-02-01 to 2026-01-01",
+      null,
+      [],
+    );
+    expect(parsed?.invalidDateRange).toBe(true);
+  });
+
   it("asks the model for intent JSON and not for ledger rows", () => {
     const messages = buildIntentMessages("How much did I spend on hobbies?", null);
     const blob = messages.map((message) => message.content).join("\n");
@@ -479,14 +513,25 @@ async function upload(email: string, csv: string): Promise<Response> {
 }
 
 async function query(email: string, question: string): Promise<{ answer?: string }> {
+  const result = await queryRaw(email, question);
+  expect(result.status).toBe(200);
+  return result.body;
+}
+
+async function queryRaw(
+  email: string,
+  question: string,
+): Promise<{ status: number; body: { answer?: string; error?: string } }> {
   const token = await tokenFor(email);
   const response = await authed("/api/query", token, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ question }),
   });
-  expect(response.status).toBe(200);
-  return response.json() as Promise<{ answer?: string }>;
+  return {
+    status: response.status,
+    body: (await response.json()) as { answer?: string; error?: string },
+  };
 }
 
 describe("/api spending queries", () => {
@@ -689,7 +734,7 @@ describe("/api spending queries", () => {
     const missed = await query(email, "How much I spent eating out?");
     expect(missed.answer).toContain("CHIPOTLE: $4.00");
     expect(missed.answer).not.toContain("ZOOPLEX");
-    expect(missed.answer).toContain("still uncategorized");
+    expect(missed.answer).toContain("1 uncategorized charge ($9.50)");
     expect(
       (await stub.load()).records.find((row) => row.payload.Description === "ZOOPLEX SNACKBAR")
         ?.category,
@@ -781,5 +826,257 @@ describe("/api spending queries", () => {
     expect(highest.answer).toContain("30.00");
     expect(highest.answer).not.toContain("900.00");
     expect(highest.answer).not.toContain("20.00");
+  });
+
+  it("does not count a mobile deposit as gas or as the highest charge", async () => {
+    const email = "deposit@example.com";
+    const uploaded = await upload(
+      email,
+      csvOf([
+        ["2026-01-02", "SHELL OIL", "-40.00"],
+        ["2026-01-03", "MOBILE DEPOSIT", "2500.00"],
+        ["2026-01-04", "CHIPOTLE", "-10.00"],
+      ]),
+    );
+    expect(uploaded.status).toBe(200);
+    const gas = await query(email, "gas");
+    expect(gas.answer).toContain("Total: $40.00");
+    expect(gas.answer).not.toContain("2500");
+    expect(gas.answer).not.toContain("2460");
+    expect(gas.answer).not.toContain("CHIPOTLE");
+
+    const positive = await upload(
+      email,
+      csvOf([
+        ["2026-01-02", "COSTCO", "30.00"],
+        ["2026-01-03", "MOBILE DEPOSIT", "2500.00"],
+      ]),
+    );
+    expect(positive.status).toBe(200);
+    const highest = await query(email, "What was my highest charge?");
+    expect(highest.answer).toContain("Costco");
+    expect(highest.answer).toContain("30.00");
+    expect(highest.answer).not.toContain("2500");
+  });
+
+  it("names zero-amount rows and keeps nonzero blank or pending charges", async () => {
+    const email = "omitted@example.com";
+    const uploaded = await upload(
+      email,
+      csvOf([
+        ["2026-01-01", "CHIPOTLE", "-10.00"],
+        ["2026-01-02", "pending", "-50.00"],
+        ["2026-01-03", "", "-25.00"],
+        ["2026-01-04", "CHIPOTLE", "0"],
+      ]),
+    );
+    expect(uploaded.status).toBe(200);
+    expect((await uploaded.json()) as { count?: number }).toMatchObject({ count: 4 });
+    const body = await query(email, "How much did I spend?");
+    expect(body.answer).toContain("10.00");
+    expect(body.answer).toContain("50.00");
+    expect(body.answer).toContain("25.00");
+    expect(body.answer).toContain("Total: $85.00");
+    expect(body.answer).toContain("1 zero-amount row");
+  });
+
+  it("keeps Costco Gas out of groceries", async () => {
+    const email = "costco-gas@example.com";
+    expect(
+      (
+        await upload(
+          email,
+          csvOf([
+            ["2026-01-02", "COSTCO GAS", "-45.00"],
+            ["2026-01-03", "COSTCO WHSE", "-80.00"],
+          ]),
+        )
+      ).status,
+    ).toBe(200);
+    const gas = await query(email, "gas");
+    expect(gas.answer).toContain("45.00");
+    expect(gas.answer).not.toContain("80.00");
+    const groceries = await query(email, "groceries");
+    expect(groceries.answer).toContain("80.00");
+    expect(groceries.answer).not.toContain("45.00");
+  });
+
+  it("does not drop a shell charge when the question says shellfish", async () => {
+    const email = "shellfish@example.com";
+    vi.spyOn(env.AI, "run").mockImplementation(async () => ({
+      response: JSON.stringify({
+        items: [{ merchant: "SHELLFISH SHACK", category: "dining" }],
+      }),
+    }));
+    expect(
+      (
+        await upload(
+          email,
+          csvOf([
+            ["2026-01-02", "SHELL OIL", "-15.00"],
+            ["2026-01-03", "SHELLFISH SHACK", "-30.00"],
+          ]),
+        )
+      ).status,
+    ).toBe(200);
+    const spent = await query(email, "How much did I spend?");
+    expect(spent.answer).toContain("15.00");
+    expect(spent.answer).toContain("30.00");
+    const follow = await query(email, "exclude shellfish");
+    expect(follow.answer).toContain("15.00");
+    expect(follow.answer).not.toContain("30.00");
+    expect(follow.answer).not.toContain("SHELLFISH");
+  });
+
+  it("rejects a reversed date range on the worker", async () => {
+    const email = "dates@example.com";
+    expect(
+      (
+        await upload(
+          email,
+          csvOf([
+            ["2026-01-15", "CHIPOTLE", "-10.00"],
+            ["2026-02-15", "CHIPOTLE", "-30.00"],
+          ]),
+        )
+      ).status,
+    ).toBe(200);
+    const result = await queryRaw(email, "eating out from 2026-02-01 to 2026-01-01");
+    expect(result.status).toBe(400);
+    expect(result.body.error).toMatch(/start date is after the end date/);
+    expect(result.body.answer).toBeUndefined();
+  });
+
+  it("returns 409 instead of the replaced statement after a held model call", async () => {
+    const email = "race-intent@example.com";
+    expect(
+      (await upload(email, csvOf([["2026-01-02", "AMAZON.COM", "-20.00"]]))).status,
+    ).toBe(200);
+    let release!: (value?: unknown) => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let markEntered!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      markEntered = resolve;
+    });
+    vi.spyOn(env.AI, "run").mockImplementation(async () => {
+      markEntered();
+      await gate;
+      return {
+        response: JSON.stringify({
+          categories: ["shopping"],
+          merchants: [],
+          excludeMerchants: [],
+          dateFrom: null,
+          dateTo: null,
+          op: "sum",
+          combine: "or",
+        }),
+      };
+    });
+    const token = await tokenFor(email);
+    const pending = authed("/api/query", token, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ question: "How much did I spend on hobbies?" }),
+    });
+    await entered;
+    expect(
+      (await upload(email, csvOf([["2026-02-01", "SHELL OIL", "-40.00"]]))).status,
+    ).toBe(200);
+    release();
+    const response = await pending;
+    // The Workers runtime will not let this test read the first response body
+    // after the replacement request. 409 is only produced for a replaced
+    // statement, and that body has no amounts.
+    expect(response.status).toBe(409);
+    const current = await query(email, "How much did I spend?");
+    expect(current.answer).toContain("40.00");
+    expect(current.answer).not.toContain("20.00");
+  });
+
+  it("returns 409 when the held model call fails after replacement", async () => {
+    const email = "race-error@example.com";
+    expect(
+      (await upload(email, csvOf([["2026-01-02", "AMAZON.COM", "-20.00"]]))).status,
+    ).toBe(200);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let markEntered!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      markEntered = resolve;
+    });
+    vi.spyOn(env.AI, "run").mockImplementation(async () => {
+      markEntered();
+      await gate;
+      throw new Error("model down");
+    });
+    const token = await tokenFor(email);
+    const pending = authed("/api/query", token, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ question: "How much did I spend on hobbies?" }),
+    });
+    await entered;
+    expect(
+      (await upload(email, csvOf([["2026-02-01", "SHELL OIL", "-40.00"]]))).status,
+    ).toBe(200);
+    release();
+    const response = await pending;
+    expect(response.status).toBe(409);
+    const current = await query(email, "How much did I spend?");
+    expect(current.answer).toContain("40.00");
+    expect(current.answer).not.toContain("20.00");
+  });
+
+  it("returns 409 when categorization is released onto a replaced statement", async () => {
+    const email = "race-category@example.com";
+    vi.spyOn(env.AI, "run").mockImplementation(async () => {
+      throw new Error("rate limit");
+    });
+    expect(
+      (
+        await upload(
+          email,
+          csvOf([["2026-01-02", "ZOOPLEX SNACKBAR", "-9.50"]]),
+        )
+      ).status,
+    ).toBe(200);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let markEntered!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      markEntered = resolve;
+    });
+    vi.spyOn(env.AI, "run").mockImplementation(async () => {
+      markEntered();
+      await gate;
+      return {
+        response: JSON.stringify({
+          items: [{ merchant: "ZOOPLEX SNACKBAR", category: "dining" }],
+        }),
+      };
+    });
+    const token = await tokenFor(email);
+    const pending = authed("/api/query", token, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ question: "How much did I spend?" }),
+    });
+    await entered;
+    expect(
+      (await upload(email, csvOf([["2026-02-01", "SHELL OIL", "-40.00"]]))).status,
+    ).toBe(200);
+    release();
+    const response = await pending;
+    expect(response.status).toBe(409);
+    const current = await query(email, "How much did I spend?");
+    expect(current.answer).toContain("40.00");
+    expect(current.answer).not.toContain("9.50");
   });
 });

@@ -50,9 +50,11 @@ export function applyLedgerMigrations(sql: Sql): void {
   const columns = sql
     .exec<{ name: string }>("PRAGMA table_info(transactions)")
     .toArray();
-  if (!columns.some((column) => column.name === "category")) {
-    // Nullable on purpose. DEFAULT 'other' made old Chipotle rows look
-    // categorized and every category question total $0.
+    if (!columns.some((column) => column.name === "category")) {
+    // Nullable on purpose. A NOT NULL DEFAULT 'other' made old Chipotle rows
+    // look categorized. Rows already stored as other are left alone: that
+    // value can be a real classification, and this repo has no deploy of the
+    // earlier defaulted schema (see the spike doc).
     sql.exec("ALTER TABLE transactions ADD COLUMN category TEXT");
   }
   sql.exec(`
@@ -109,6 +111,10 @@ export class Ledger extends DurableObject {
       key,
       value,
     );
+  }
+
+  async currentVersion(): Promise<number> {
+    return this.ctx.storage.transactionSync(() => this.version());
   }
 
   private version(): number {

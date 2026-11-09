@@ -34,6 +34,7 @@ import {
 import {
   cleanMerchantName,
   columnStats,
+  formatSignedCents,
   normalizeDate,
   parseAmountCents,
   parseCsv,
@@ -295,7 +296,8 @@ async function hydrate(
   const updates = resolved
     .filter((record) => record.category !== null)
     .map((record) => ({ id: record.id, category: record.category ?? "unknown" }));
-  await updateCategories(updates, loaded.version, identity);
+  const wrote = await updateCategories(updates, loaded.version, identity);
+  if (!wrote) throw new StatementChanged();
   const byId = new Map(resolved.map((record) => [record.id, record.category]));
   const records = loaded.records.map((record) => {
     const category = byId.get(record.id);
@@ -308,44 +310,112 @@ async function hydrate(
   };
 }
 
-function toViews(records: LedgerRecord[]): TxView[] {
-  if (!records.length) return [];
+type OmittedRows = {
+  zeroCount: number;
+  unknownCount: number;
+  unknownCents: number;
+};
+
+function toViews(records: LedgerRecord[]): { views: TxView[]; omitted: OmittedRows } {
+  const omitted: OmittedRows = { zeroCount: 0, unknownCount: 0, unknownCents: 0 };
+  if (!records.length) return { views: [], omitted };
   const payloads = records.map((record) => record.payload);
   const fields = pickDisplayFields(payloads);
   const signed = usesSignedCents(payloads, fields.amount);
   const views: TxView[] = [];
-  let skipped = 0;
   for (const record of records) {
-    if (!isCategory(record.category ?? "")) continue;
+    const rawDescription = String(record.payload[fields.description] ?? "");
     const narrative = rowNarrative(record.payload, fields.description);
-    const merchant = cleanMerchantName(narrative);
     const amountCents = parseAmountCents(
       fields.amount ? record.payload[fields.amount] : undefined,
     );
-    if (!amountCents || merchant === "Unknown merchant") {
-      skipped += 1;
+    const spendCents = signed ? -amountCents : Math.abs(amountCents);
+    if (needsCategory(record.category)) {
+      if (amountCents !== 0) {
+        omitted.unknownCount += 1;
+        omitted.unknownCents += Math.abs(spendCents);
+      } else {
+        omitted.zeroCount += 1;
+      }
       continue;
     }
+    if (!amountCents) {
+      omitted.zeroCount += 1;
+      continue;
+    }
+    let merchant = cleanMerchantName(narrative);
+    if (/pend|process/i.test(rawDescription.trim())) merchant = "Pending";
+    else if (merchant === "Unknown merchant") merchant = "Unknown merchant";
     views.push({
       date: normalizeDate(fields.date ? String(record.payload[fields.date] ?? "") : ""),
       merchant,
-      narrative,
+      narrative: narrative || rawDescription.toUpperCase(),
       amountCents,
-      spendCents: signed ? -amountCents : Math.abs(amountCents),
+      spendCents,
       category: record.category as Category,
     });
   }
-  if (skipped) console.log("Skipped unusable rows:", skipped);
-  return views;
+  if (omitted.zeroCount || omitted.unknownCount) {
+    console.log("Rows left out of the total:", omitted);
+  }
+  return { views, omitted };
 }
+
+function omissionNote(omitted: OmittedRows): string {
+  const lines: string[] = [];
+  if (omitted.zeroCount) {
+    const noun = omitted.zeroCount === 1 ? "row" : "rows";
+    lines.push(
+      `Not included in this total: ${omitted.zeroCount} zero-amount ${noun}.`,
+    );
+  }
+  if (omitted.unknownCount) {
+    const noun = omitted.unknownCount === 1 ? "charge" : "charges";
+    lines.push(
+      `Not included in this total: ${omitted.unknownCount} uncategorized ${noun} (${formatSignedCents(omitted.unknownCents)}).`,
+    );
+  }
+  return lines.join("\n");
+}
+
+class StatementChanged extends Error {
+  constructor() {
+    super("statement-changed");
+  }
+}
+
+async function isCurrent(
+  identity: AccessIdentity | undefined,
+  version: number,
+): Promise<boolean> {
+  if (!onWorkers()) return memory.version === version;
+  if (!identity) throw new Error("Missing Access identity");
+  return (await (await ledgerStub(identity)).currentVersion()) === version;
+}
+
+function statementConflict(res: Response): void {
+  res.status(409).json({
+    error: "The statement changed while this question was running. Ask again.",
+  });
+}
+
+type IntentResolution = {
+  intent: QueryIntent | null;
+  invalidDateRange: boolean;
+};
 
 async function resolveIntent(
   question: string,
   previous: QueryIntent | null,
   known: string[],
-): Promise<QueryIntent | null> {
+): Promise<IntentResolution> {
   const interpreted = interpretQuestion(question, previous, known);
-  if (interpreted?.confident) return interpreted.intent;
+  if (interpreted?.invalidDateRange) {
+    return { intent: null, invalidDateRange: true };
+  }
+  if (interpreted?.confident) {
+    return { intent: interpreted.intent, invalidDateRange: false };
+  }
 
   let modelIntent: QueryIntent | null = null;
   try {
@@ -364,16 +434,16 @@ async function resolveIntent(
   ) {
     modelIntent = null;
   }
-  if (modelIntent) return modelIntent;
+  if (modelIntent) return { intent: modelIntent, invalidDateRange: false };
   if (
     interpreted &&
     (interpreted.intent.categories.length > 0 ||
       interpreted.intent.merchants.length > 0 ||
       interpreted.intent.excludeMerchants.length > 0)
   ) {
-    return interpreted.intent;
+    return { intent: interpreted.intent, invalidDateRange: false };
   }
-  return null;
+  return { intent: null, invalidDateRange: false };
 }
 
 async function reportFor(
@@ -498,26 +568,46 @@ app.post("/api/query", async (req: Request, res: Response): Promise<void> => {
       });
       return;
     }
-    const views = toViews(hydrated.records);
+    if (!(await isCurrent(res.locals.access, hydrated.version))) {
+      statementConflict(res);
+      return;
+    }
+    const { views, omitted } = toViews(hydrated.records);
     const known = views.flatMap((view) => [view.narrative, view.merchant]);
     const previous = await readIntent(res.locals.access, hydrated.version);
-    const intent = await resolveIntent(question, previous, known);
+    const resolved = await resolveIntent(question, previous, known);
+    if (!(await isCurrent(res.locals.access, hydrated.version))) {
+      statementConflict(res);
+      return;
+    }
+    if (resolved.invalidDateRange) {
+      res.status(400).json({ error: "The start date is after the end date." });
+      return;
+    }
+    const intent = resolved.intent;
     if (!intent) {
+      const note = omissionNote(omitted);
       res.json({
-        answer: hydrated.unknown
-          ? "I couldn't tell which category or merchant you meant.\nSome charges are still uncategorized."
+        answer: note
+          ? `I couldn't tell which category or merchant you meant.\n${note}`
           : "I couldn't tell which category or merchant you meant.",
       });
       return;
     }
-    await writeIntent(intent, hydrated.version, res.locals.access);
-    const matched = selectTransactions(views, intent);
-    let answer = formatAnswer(matched, intent);
-    if (hydrated.unknown) {
-      answer = `${answer}\nSome charges are still uncategorized.`;
+    const saved = await writeIntent(intent, hydrated.version, res.locals.access);
+    if (!saved || !(await isCurrent(res.locals.access, hydrated.version))) {
+      statementConflict(res);
+      return;
     }
+    const matched = selectTransactions(views, intent);
+    const note = omissionNote(omitted);
+    const answer = note ? `${formatAnswer(matched, intent)}\n${note}` : formatAnswer(matched, intent);
     res.json({ answer });
   } catch (error) {
+    if (error instanceof StatementChanged) {
+      statementConflict(res);
+      return;
+    }
     console.error("Agent Execution Bug: ", error);
     res.status(500).json({ error: "Failed to process financial array accurately." });
   }

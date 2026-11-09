@@ -67,7 +67,7 @@ Two gaps found while booting the app:
 | `ollama` 0.6.3 | Used only when `LLM_PROVIDER` is `ollama`. The import is `ollama/browser` (global `fetch`). The Node entry of the package reads image files with `node:fs` and is not used. |
 | `dotenv` | A dependency, and not imported. Vars and secrets arrive on `process.env`. |
 
-The dry-run bundle is **1744.67 KiB uncompressed** (gzip 399.91 KiB). The limit is **64 MiB uncompressed** ([Limits](https://developers.cloudflare.com/workers/platform/limits/)). Wrangler 4.157.0 produced that bundle with `npm run check:worker`.
+The dry-run bundle is **1748.97 KiB uncompressed** (gzip 400.94 KiB). The limit is **64 MiB uncompressed** ([Limits](https://developers.cloudflare.com/workers/platform/limits/)). Wrangler 4.157.0 produced that bundle with `npm run check:worker`.
 
 ## Secrets, variables, and storage
 
@@ -97,6 +97,10 @@ Workers AI does not take an API key inside the Worker. The `AI` binding authenti
 On the Worker, parsed rows go to a SQLite Durable Object, class `Ledger`, binding `LEDGER`. The object name is `sub:<subject>` when the token has a subject, otherwise `email:<address>`. The same text as an email and as a subject is two ledgers. Accepted tokens must have `type: "app"` plus an email or a non-empty subject. Any non-empty `common_name` is a service-token client id and is rejected, even if a subject is also present. A missing email and subject, including a whitespace-only subject, is rejected too. Real user logins use `type: "app"` with an email and a UUID subject and do not carry `common_name`. Upload replaces that person's rows. Inserts are batched. A CSV over 5 MB or 20,000 rows is rejected.
 
 The earlier proof of concept keyed the object by the raw email. Those objects are orphaned. Anyone who uploaded on that deploy has to upload the statement again.
+
+Categories are stored on each row. A ledger created from current `master` has no category column; the migration adds a nullable column and the next read fills it from merchant rules. An unmerged earlier commit on this branch used `NOT NULL DEFAULT 'other'`. GitHub Actions workflows, the Deployments API, and `master` history show no deploy of that commit: `master` is the spike, the report route, and the Access token check. Rows already saved as `other` are not rewritten, because that can be a real classification. If a private deploy of that defaulted schema exists outside this repository, those rows stay `other` until someone uploads again.
+
+A signed refund that matches a spending merchant reduces that category. A positive-only file does not say which of two identical merchant amounts is a refund, so those rows are not guessed. A credit that matches no spending rule, including an explicit mobile or direct deposit, is income. Uncategorized charges and zero-amount rows stay in the stored count and are named, with the missing amount, when a total leaves them out. A question that is still running when a new statement is uploaded returns 409 and does not answer with the old amounts.
 
 `GET /api/report` is how the UI learns that a statement is already stored. The UI's "No report loaded" text is only its own memory, so a new session must call this before Ask.
 
@@ -199,7 +203,7 @@ npm start              # Node, http://localhost:4000
 `npm run check:worker` with Wrangler 4.157.0:
 
 ```text
-Total Upload: 1744.67 KiB / gzip: 399.91 KiB
+Total Upload: 1748.97 KiB / gzip: 400.94 KiB
 env.LEDGER (Ledger)     Durable Object
 env.AI                  AI
 env.LLM_PROVIDER        workers-ai

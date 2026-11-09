@@ -231,7 +231,7 @@ const RULES: Rule[] = [
       "JIFFY LUBE",
       "VALVOLINE",
     ],
-    pattern: /(^|[^A-Z0-9])(BP|FUEL)([^A-Z0-9]|$)/,
+    pattern: /(^|[^A-Z0-9])(BP|FUEL|GAS)([^A-Z0-9]|$)/,
   },
   {
     category: "home",
@@ -288,9 +288,13 @@ function escapeReg(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-// `boundaryOnly` is for exclusions. Compact matching is for merchant rules,
-// where "LOWE'S" and "CHICK-FIL-A" lose punctuation. It must not turn
-// "exclude SHELL" into a match on SHELLFISH.
+function wordsOf(value: string): string[] {
+  return value.toUpperCase().split(/[^A-Z0-9]+/).filter((word) => word.length > 0);
+}
+
+// Whole tokens only. "MOBIL" must not match "MOBILE", and "SHELL" must not
+// match "SHELLFISH". Punctuation still splits tokens, so "CHICK-FIL" matches
+// "CHICK-FIL-A" and "LOWE'S" matches "LOWE'S".
 export function tokenIn(
   text: string,
   token: string,
@@ -304,12 +308,31 @@ export function tokenIn(
   );
   if (boundary.test(hay)) return true;
   if (boundaryOnly) return false;
-  const compactNeedle = needle.replace(/[^A-Z0-9]/g, "");
-  if (compactNeedle.length < 5) return false;
-  return hay.replace(/[^A-Z0-9]/g, "").includes(compactNeedle);
+  const needleWords = wordsOf(needle);
+  const hayWords = wordsOf(hay);
+  if (!needleWords.length || needleWords.length > hayWords.length) return false;
+  for (let start = 0; start <= hayWords.length - needleWords.length; start += 1) {
+    let same = true;
+    for (let offset = 0; offset < needleWords.length; offset += 1) {
+      if (hayWords[start + offset] !== needleWords[offset]) {
+        same = false;
+        break;
+      }
+    }
+    if (same) return true;
+  }
+  return false;
+}
+
+function explicitFuel(text: string): boolean {
+  if (text.includes("NATURAL GAS")) return false;
+  return /(^|[^A-Z0-9])(GAS|FUEL)([^A-Z0-9]|$)/.test(text);
 }
 
 function matchesRule(text: string, rule: Rule): boolean {
+  // "COSTCO GAS" is fuel, not a grocery trip. Natural gas is a utility and
+  // is classified before this rule runs.
+  if (rule.category === "groceries" && explicitFuel(text)) return false;
   // Apostrophes vary (LOWE'S / LOWE’S). Compact form still has to be groceries,
   // and this rule is checked before the Lowe's hardware rule.
   if (
@@ -322,8 +345,17 @@ function matchesRule(text: string, rule: Rule): boolean {
   return (rule.tokens ?? []).some((token) => tokenIn(text, token));
 }
 
+function isBlankNarrative(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return true;
+  return /^(NO DESCRIPTION|N\/A|NA|NONE|NULL|UNDEFINED|-|—|--|\.|PROCESSING|PENDING|SETTLED)$/.test(
+    trimmed,
+  );
+}
+
 function hasIncomeKeyword(text: string): boolean {
   return (
+    /\b(MOBILE|DIRECT|ATM|REMOTE|BRANCH|CHECK|CASH)\s+DEPOSITS?\b/.test(text) ||
     text.includes("DIRECT DEPOSIT") ||
     text.includes("PAYROLL") ||
     text.includes("PAYCHECK") ||
@@ -345,6 +377,7 @@ export function categorizeNarrative(
 ): Category | "unknown" {
   const text = narrative.toUpperCase();
   if (hasIncomeKeyword(text)) return "income";
+  if (isBlankNarrative(text)) return "other";
   const ruled = RULES.find((rule) => matchesRule(text, rule))?.category;
   if (ruled) return ruled;
   if (signedLedger && amountCents > 0) return "income";

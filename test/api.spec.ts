@@ -1,4 +1,4 @@
-import { exports } from "cloudflare:workers";
+import { env, exports } from "cloudflare:workers";
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -270,6 +270,11 @@ describe("/api with a valid Access JWT", () => {
 
   it("reports a loaded statement with no parseable dates", async () => {
     const token = await tokenFor("no-dates@example.com");
+    const run = vi.spyOn(env.AI, "run").mockImplementation(async () => ({
+      response: JSON.stringify({
+        items: [{ merchant: "PLANET HOME", category: "home" }],
+      }),
+    }));
     const form = new FormData();
     form.set(
       "file",
@@ -289,6 +294,11 @@ describe("/api with a valid Access JWT", () => {
       startDate: null,
       endDate: null,
     });
+    expect(run).toHaveBeenCalled();
+    const stored = await env.LEDGER.get(
+      env.LEDGER.idFromName("sub:sub-no-dates@example.com"),
+    ).load();
+    expect(stored.records[0]?.category).toBe("home");
   });
 
   it("replaces the stored report when the same person uploads again", async () => {
