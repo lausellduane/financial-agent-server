@@ -288,7 +288,14 @@ function escapeReg(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-export function tokenIn(text: string, token: string): boolean {
+// `boundaryOnly` is for exclusions. Compact matching is for merchant rules,
+// where "LOWE'S" and "CHICK-FIL-A" lose punctuation. It must not turn
+// "exclude SHELL" into a match on SHELLFISH.
+export function tokenIn(
+  text: string,
+  token: string,
+  boundaryOnly = false,
+): boolean {
   const hay = text.toUpperCase();
   const needle = token.toUpperCase().trim();
   if (!needle) return false;
@@ -296,6 +303,7 @@ export function tokenIn(text: string, token: string): boolean {
     `(^|[^A-Z0-9])${escapeReg(needle)}([^A-Z0-9]|$)`,
   );
   if (boundary.test(hay)) return true;
+  if (boundaryOnly) return false;
   const compactNeedle = needle.replace(/[^A-Z0-9]/g, "");
   if (compactNeedle.length < 5) return false;
   return hay.replace(/[^A-Z0-9]/g, "").includes(compactNeedle);
@@ -327,8 +335,9 @@ function hasIncomeKeyword(text: string): boolean {
 }
 
 // Deterministic category, or "unknown" when only the model should decide.
-// Credits on a signed statement (any negative amount in the file) are income,
-// except transfers such as PayPal. Keyword rules run before that fallback.
+// A refund keeps the merchant's spending category so it can reduce that
+// total. A credit that matches no spending rule is income. Transfers stay
+// transfers on either sign.
 export function categorizeNarrative(
   narrative: string,
   amountCents: number,
@@ -337,11 +346,8 @@ export function categorizeNarrative(
   const text = narrative.toUpperCase();
   if (hasIncomeKeyword(text)) return "income";
   const ruled = RULES.find((rule) => matchesRule(text, rule))?.category;
-  if (signedLedger && amountCents > 0) {
-    if (ruled === "transfers") return "transfers";
-    return "income";
-  }
   if (ruled) return ruled;
+  if (signedLedger && amountCents > 0) return "income";
   if (!text.trim()) return "other";
   return "unknown";
 }

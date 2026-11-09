@@ -59,8 +59,12 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+function ledgerName(email: string): string {
+  return `sub:sub-${email}`;
+}
+
 async function tokenFor(email: string): Promise<string> {
-  return new SignJWT({ email, sub: `sub-${email}` })
+  return new SignJWT({ type: "app", email, sub: `sub-${email}` })
     .setProtectedHeader({ alg: "RS256", kid: "test-key" })
     .setIssuer(ISSUER)
     .setAudience(AUD)
@@ -85,6 +89,7 @@ function view(description: string, amount: string, signed: boolean): TxView {
     merchant: cleanMerchantName(description),
     narrative: description.toUpperCase(),
     amountCents,
+    spendCents: signed ? -amountCents : Math.abs(amountCents),
     category: found === "unknown" ? "other" : found,
   };
 }
@@ -132,16 +137,17 @@ function answerFor(
   const intent = interpreted?.intent;
   if (!intent) throw new Error("missing intent");
   const matched = selectTransactions(txs, intent);
-  return { answer: formatAnswer(matched, intent.op), intent };
+  return { answer: formatAnswer(matched, intent), intent };
 }
 
 function lineTotal(answer: string): number {
   let cents = 0;
   for (const line of answer.split("\n")) {
     if (line.startsWith("Total")) continue;
-    const match = line.match(/: \$(\d+)\.(\d{2})$/);
-    if (!match?.[1] || !match[2]) continue;
-    cents += Number(match[1]) * 100 + Number(match[2]);
+    const match = line.match(/: (-?)\$(\d+)\.(\d{2})$/);
+    if (!match?.[2] || !match[3]) continue;
+    const sign = match[1] === "-" ? -1 : 1;
+    cents += sign * (Number(match[2]) * 100 + Number(match[3]));
   }
   return cents;
 }
@@ -177,9 +183,11 @@ describe("categorizeNarrative", () => {
     expect(categorizeNarrative("SHELL OIL 12", -4000, true)).toBe("gas/auto");
   });
 
-  it("treats credits on a signed ledger as income and keeps unsigned purchases", () => {
-    expect(categorizeNarrative("CHIPOTLE", 3304, true)).toBe("income");
+  it("keeps a merchant refund in its spending category and treats unmatched credits as income", () => {
+    expect(categorizeNarrative("CHIPOTLE", 3304, true)).toBe("dining");
+    expect(categorizeNarrative("AMAZON.COM", 500, true)).toBe("shopping");
     expect(categorizeNarrative("CHIPOTLE", 3304, false)).toBe("dining");
+    expect(categorizeNarrative("MYSTERY CREDIT 42", 500, true)).toBe("income");
     expect(categorizeNarrative("DIRECT DEPOSIT ACME PAYROLL", 100, false)).toBe(
       "income",
     );
@@ -212,6 +220,16 @@ describe("intent validation and aggregation", () => {
     expect(valid?.categories).toEqual(["dining"]);
     expect(valid?.op).toBe("sum");
     expect(validateIntent({ indexes: [1, 2, 3] })).toBeNull();
+    expect(
+      validateIntent({
+        categories: ["dining"],
+        merchants: [],
+        op: "sum",
+        dateFrom: "2026-02-01",
+        dateTo: "2026-01-01",
+      }),
+    ).toBeNull();
+    expect(interpretQuestion("   ", null, [])).toBeNull();
     expect(validateIntent({ categories: ["food"], op: "sum" })).toBeNull();
     expect(
       validateIntent({ categories: ["dining"], op: "average", merchants: [] }),
@@ -349,15 +367,45 @@ describe("intent validation and aggregation", () => {
     expect(january.answer).toContain("Total: $10.00");
   });
 
-  it("does not count a paycheck as the highest charge", () => {
+  it("does not count a paycheck or a refund as the highest charge", () => {
     const txs = [
       view("COSTCO WHSE #123 RALEIGH NC", "-86.20", true),
       view("DIRECT DEPOSIT ELSEVIER INCPAYROLL", "2785.11", true),
+      view("AMAZON.COM", "200.00", true),
     ];
     const { answer } = answerFor("What was my highest charge?", txs);
     expect(answer).toContain("Costco");
     expect(answer).toContain("86.20");
     expect(answer).not.toContain("2785.11");
+    expect(answer).not.toContain("200.00");
+  });
+
+  it("nets a refund against the same spending category", () => {
+    const txs = [
+      view("AMAZON.COM", "-20.00", true),
+      view("AMAZON.COM", "5.00", true),
+      view("CHIPOTLE", "-10.00", true),
+    ];
+    const { answer } = answerFor("shopping", txs);
+    expect(answer).toContain("AMAZON.COM: $20.00");
+    expect(answer).toContain("AMAZON.COM: -$5.00");
+    expect(answer).not.toContain("CHIPOTLE");
+    expect(answer).toContain("Total: $15.00");
+    expect(formatCents(lineTotal(answer))).toBe("$15.00");
+  });
+
+  it("does not let an exclusion of SHELL remove SHELLFISH", () => {
+    const shellfish: TxView = {
+      ...view("SHELLFISH SHACK", "-30.00", true),
+      category: "dining",
+      narrative: "SHELLFISH SHACK",
+      merchant: "SHELLFISH SHACK",
+    };
+    const txs = [shellfish, view("CHIPOTLE", "-4.00", true)];
+    const first = answerFor("How much I spent eating out?", txs);
+    const follow = answerFor("exclude: SHELL", txs, first.intent);
+    expect(follow.answer).toContain("SHELLFISH SHACK");
+    expect(follow.answer).toContain("CHIPOTLE");
   });
 
   it("asks the model for intent JSON and not for ledger rows", () => {
@@ -389,20 +437,33 @@ describe("ledger migration", () => {
       );
     });
     const migrated = await stub.migrate();
+    await stub.migrate();
     expect(migrated.columns).toContain("category");
     const loaded = await stub.load();
-    expect(loaded[0]?.category).toBe("other");
-    expect(loaded[0]?.payload.Description).toBe("CHIPOTLE");
+    expect(loaded.records[0]?.category).toBeNull();
+    expect(loaded.records[0]?.payload.Description).toBe("CHIPOTLE");
+    expect(loaded.version).toBe(0);
   });
 
-  it("stores intent per identity and clears it when the statement is replaced", async () => {
+  it("stores intent per identity and ignores a write for a replaced statement", async () => {
     const ada = env.LEDGER.get(env.LEDGER.idFromName("ada-intent@example.com"));
     const bob = env.LEDGER.get(env.LEDGER.idFromName("bob-intent@example.com"));
-    await ada.saveIntent('{"categories":["dining"],"op":"sum"}');
-    expect(await ada.loadIntent()).toContain("dining");
-    expect(await bob.loadIntent()).toBeNull();
-    await ada.replace([]);
-    expect(await ada.loadIntent()).toBeNull();
+    const range = { startDate: "2026-01-01", endDate: "2026-01-01" };
+    const first = await ada.replace(
+      [{ payload: { Description: "CHIPOTLE", Amount: "-1.00", Date: "2026-01-01" }, category: "dining" }],
+      range,
+    );
+    expect(await ada.saveIntent('{"categories":["dining"],"op":"sum"}', first.version)).toBe(true);
+    expect((await ada.loadIntent()).intent).toContain("dining");
+    expect((await bob.loadIntent()).intent).toBeNull();
+    const next = await ada.replace(
+      [{ payload: { Description: "SHELL", Amount: "-2.00", Date: "2026-02-01" }, category: "gas/auto" }],
+      { startDate: "2026-02-01", endDate: "2026-02-01" },
+    );
+    expect(next.version).toBeGreaterThan(first.version);
+    expect((await ada.loadIntent()).intent).toBeNull();
+    expect(await ada.saveIntent('{"categories":["dining"],"op":"sum"}', first.version)).toBe(false);
+    expect((await ada.loadIntent()).intent).toBeNull();
   });
 });
 
@@ -431,7 +492,9 @@ async function query(email: string, question: string): Promise<{ answer?: string
 describe("/api spending queries", () => {
   it("stores categories and answers the screenshot question without a model total", async () => {
     // Cub House matches no rule. A down model must not fail the upload or the total.
-    vi.spyOn(env.AI, "run").mockRejectedValue(new Error("model down"));
+    vi.spyOn(env.AI, "run").mockImplementation(async () => {
+      throw new Error("model down");
+    });
     const email = "shot@example.com";
     const uploaded = await upload(
       email,
@@ -439,8 +502,8 @@ describe("/api spending queries", () => {
     );
     expect(uploaded.status).toBe(200);
 
-    const stub = env.LEDGER.get(env.LEDGER.idFromName(email));
-    const stored = await stub.load();
+    const stub = env.LEDGER.get(env.LEDGER.idFromName(ledgerName(email)));
+    const stored = (await stub.load()).records;
     expect(stored.some((row) => row.category === "dining")).toBe(true);
     expect(stored.some((row) => row.category === "income")).toBe(true);
     expect(stored.some((row) => row.category === "groceries")).toBe(true);
@@ -449,7 +512,7 @@ describe("/api spending queries", () => {
     );
     expect(
       stored.find((row) => String(row.payload.Description).includes("CUB HOUSE"))?.category,
-    ).toBe("other");
+    ).toBe("unknown");
 
     const first = await query(email, "How much I spent eating out?");
     expect(first.answer).toContain("Total: $377.25");
@@ -464,8 +527,8 @@ describe("/api spending queries", () => {
     expect(follow.answer).toContain("Total: $377.25");
     expect(follow.answer).not.toContain("No matching charges located.");
     const saved = await stub.loadIntent();
-    expect(saved).toContain("dining");
-    expect(saved).toContain("DIRECT DEPOSIT");
+    expect(saved.intent).toContain("dining");
+    expect(saved.intent).toContain("DIRECT DEPOSIT");
 
     const excluded = await query(email, "exclude chipotle");
     expect(excluded.answer).toContain("Total: $287.42");
@@ -560,7 +623,8 @@ describe("/api spending queries", () => {
     );
     expect(uploaded.status).toBe(200);
     expect(run).toHaveBeenCalledTimes(1);
-    const stored = await env.LEDGER.get(env.LEDGER.idFromName(email)).load();
+    const stored = (await env.LEDGER.get(env.LEDGER.idFromName(ledgerName(email))).load())
+      .records;
     expect(stored.find((row) => row.payload.Description === "ZOOPLEX SNACKBAR 12")?.category).toBe(
       "dining",
     );
@@ -571,5 +635,151 @@ describe("/api spending queries", () => {
     expect(body.answer).toContain("CHIPOTLE");
     expect(body.answer).toContain("Total: $13.50");
     expect(formatCents(lineTotal(body.answer ?? ""))).toBe("$13.50");
+  });
+
+  it("backfills a legacy row that has no category instead of totaling zero", async () => {
+    const email = "legacy@example.com";
+    const stub = env.LEDGER.get(env.LEDGER.idFromName(ledgerName(email)));
+    await runInDurableObject(stub, async (_instance, state) => {
+      state.storage.sql.exec("DROP TABLE IF EXISTS transactions");
+      state.storage.sql.exec(
+        "CREATE TABLE transactions (id INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT NOT NULL)",
+      );
+      state.storage.sql.exec(
+        "INSERT INTO transactions (payload) VALUES (?)",
+        JSON.stringify({
+          Date: "2026-01-02",
+          Description: "CHIPOTLE",
+          Amount: "-33.04",
+        }),
+      );
+    });
+    await stub.migrate();
+    await stub.migrate();
+    expect((await stub.load()).records[0]?.category).toBeNull();
+
+    const body = await query(email, "How much I spent eating out?");
+    expect(body.answer).toContain("CHIPOTLE: $33.04");
+    expect(body.answer).toContain("Total: $33.04");
+    expect(body.answer).not.toContain("No matching charges located.");
+    expect((await stub.load()).records[0]?.category).toBe("dining");
+  });
+
+  it("retries an unknown merchant after the model failed", async () => {
+    const email = "retry@example.com";
+    const run = vi.spyOn(env.AI, "run").mockImplementation(async () => {
+      throw new Error("rate limit");
+    });
+    const uploaded = await upload(
+      email,
+      csvOf([
+        ["2026-01-02", "ZOOPLEX SNACKBAR", "-9.50"],
+        ["2026-01-03", "CHIPOTLE", "-4.00"],
+      ]),
+    );
+    expect(uploaded.status).toBe(200);
+    const uploadedBody = (await uploaded.json()) as { uncategorized?: number };
+    expect(uploadedBody.uncategorized).toBe(1);
+    const stub = env.LEDGER.get(env.LEDGER.idFromName(ledgerName(email)));
+    expect(
+      (await stub.load()).records.find((row) => row.payload.Description === "ZOOPLEX SNACKBAR")
+        ?.category,
+    ).toBe("unknown");
+
+    const missed = await query(email, "How much I spent eating out?");
+    expect(missed.answer).toContain("CHIPOTLE: $4.00");
+    expect(missed.answer).not.toContain("ZOOPLEX");
+    expect(missed.answer).toContain("still uncategorized");
+    expect(
+      (await stub.load()).records.find((row) => row.payload.Description === "ZOOPLEX SNACKBAR")
+        ?.category,
+    ).toBe("unknown");
+
+    run.mockImplementation(async () => ({
+      response: JSON.stringify({
+        items: [{ merchant: "ZOOPLEX SNACKBAR", category: "dining" }],
+      }),
+    }));
+    const found = await query(email, "How much I spent eating out?");
+    expect(found.answer).toContain("ZOOPLEX");
+    expect(found.answer).toContain("Total: $13.50");
+    expect(
+      (await stub.load()).records.find((row) => row.payload.Description === "ZOOPLEX SNACKBAR")
+        ?.category,
+    ).toBe("dining");
+  });
+
+  it("drops the previous question when a new statement is uploaded", async () => {
+    const email = "reset@example.com";
+    const run = vi.spyOn(env.AI, "run").mockImplementation(async (_model, input) => {
+      const messages =
+        (input as { messages?: { content?: string }[] }).messages ?? [];
+      const blob = messages.map((message) => message.content ?? "").join("\n");
+      if (!blob.includes("exclude chipotle")) {
+        throw new Error(`unexpected model call: ${blob.slice(0, 120)}`);
+      }
+      return {
+        response: JSON.stringify({
+          categories: ["gas/auto"],
+          merchants: [],
+          excludeMerchants: [],
+          dateFrom: null,
+          dateTo: null,
+          op: "sum",
+          combine: "or",
+        }),
+      };
+    });
+    const first = await upload(
+      email,
+      csvOf([
+        ["2026-01-02", "CHIPOTLE", "-10.00"],
+        ["2026-01-03", "STARBUCKS", "-4.00"],
+      ]),
+    );
+    expect(first.status).toBe(200);
+    const eating = await query(email, "How much I spent eating out?");
+    expect(eating.answer).toContain("CHIPOTLE");
+    const stub = env.LEDGER.get(env.LEDGER.idFromName(ledgerName(email)));
+    expect((await stub.loadIntent()).intent).toContain("dining");
+
+    const replaced = await upload(
+      email,
+      csvOf([
+        ["2026-02-01", "SHELL OIL", "-40.00"],
+        ["2026-02-02", "STARBUCKS", "-4.00"],
+      ]),
+    );
+    expect(replaced.status).toBe(200);
+    expect((await stub.loadIntent()).intent).toBeNull();
+
+    const follow = await query(email, "exclude chipotle");
+    expect(run).toHaveBeenCalled();
+    expect(follow.answer).toContain("SHELL");
+    expect(follow.answer).not.toContain("STARBUCKS");
+    expect(follow.answer).not.toContain("CHIPOTLE");
+  });
+
+  it("nets a refund on the worker and keeps a deposit out of the highest charge", async () => {
+    const email = "refund@example.com";
+    const uploaded = await upload(
+      email,
+      csvOf([
+        ["2026-01-02", "AMAZON.COM", "-20.00"],
+        ["2026-01-03", "AMAZON.COM", "5.00"],
+        ["2026-01-04", "DIRECT DEPOSIT ACME PAYROLL", "900.00"],
+        ["2026-01-05", "COSTCO", "-30.00"],
+      ]),
+    );
+    expect(uploaded.status).toBe(200);
+    const shopping = await query(email, "shopping");
+    expect(shopping.answer).toContain("-$5.00");
+    expect(shopping.answer).toContain("Total: $15.00");
+    expect(shopping.answer).not.toContain("900.00");
+    const highest = await query(email, "What was my highest charge?");
+    expect(highest.answer).toContain("Costco");
+    expect(highest.answer).toContain("30.00");
+    expect(highest.answer).not.toContain("900.00");
+    expect(highest.answer).not.toContain("20.00");
   });
 });

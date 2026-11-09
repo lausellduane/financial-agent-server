@@ -6,7 +6,7 @@ import {
 } from "./categories.js";
 import { extractJson } from "./json-text.js";
 import type { ChatTurn } from "./llm.js";
-import { formatCents, isIsoDate } from "./statement.js";
+import { formatSignedCents, isIsoDate } from "./statement.js";
 
 export type QueryOp = "sum" | "list" | "max" | "count";
 export type QueryScope = "all-spending" | "filtered";
@@ -28,6 +28,8 @@ export type TxView = {
   merchant: string;
   narrative: string;
   amountCents: number;
+  // Positive means money left the account. A refund on a signed statement is negative.
+  spendCents: number;
   category: Category;
 };
 
@@ -254,7 +256,21 @@ export function textHasMerchant(text: string, needle: string): boolean {
 
 function isExcluded(tx: TxView, needles: string[]): boolean {
   const hay = `${tx.narrative} ${tx.merchant}`;
-  return needles.some((needle) => textHasMerchant(hay, needle));
+  return needles.some((needle) => tokenIn(hay, needle, true));
+}
+
+function nonSpendingOnly(intent: QueryIntent): boolean {
+  return (
+    intent.categories.length > 0 &&
+    intent.categories.every(
+      (category) => category === "income" || category === "transfers",
+    )
+  );
+}
+
+function lineCents(tx: TxView, intent: QueryIntent): number {
+  if (nonSpendingOnly(intent)) return Math.abs(tx.amountCents);
+  return tx.spendCents;
 }
 
 export function transactionMatches(tx: TxView, intent: QueryIntent): boolean {
@@ -286,24 +302,33 @@ export function transactionMatches(tx: TxView, intent: QueryIntent): boolean {
 export function selectTransactions(txs: TxView[], intent: QueryIntent): TxView[] {
   const matched = txs.filter((tx) => transactionMatches(tx, intent));
   if (intent.op !== "max") return matched;
-  let peak = -1;
-  for (const tx of matched) peak = Math.max(peak, Math.abs(tx.amountCents));
-  if (peak < 0) return [];
-  return matched.filter((tx) => Math.abs(tx.amountCents) === peak);
+  // Highest charge is the largest money-out. A deposit or refund must not win
+  // unless the question is about income or transfers.
+  const pool = nonSpendingOnly(intent)
+    ? matched
+    : matched.filter((tx) => tx.spendCents > 0);
+  if (!pool.length) return [];
+  const rank = (tx: TxView) =>
+    nonSpendingOnly(intent) ? Math.abs(tx.amountCents) : tx.spendCents;
+  const peak = Math.max(...pool.map(rank));
+  return pool.filter((tx) => rank(tx) === peak);
 }
 
-export function totalCents(rows: TxView[]): number {
-  return rows.reduce((sum, row) => sum + Math.abs(row.amountCents), 0);
+export function totalCents(rows: TxView[], intent?: QueryIntent): number {
+  return rows.reduce(
+    (sum, row) => sum + (intent ? lineCents(row, intent) : row.spendCents),
+    0,
+  );
 }
 
-export function formatAnswer(rows: TxView[], op: QueryOp): string {
+export function formatAnswer(rows: TxView[], intent: QueryIntent): string {
   if (!rows.length) return "No matching charges located.";
   const lines = rows.map(
-    (row) => `${row.merchant}: ${formatCents(Math.abs(row.amountCents))}`,
+    (row) => `${row.merchant}: ${formatSignedCents(lineCents(row, intent))}`,
   );
   lines.push("");
-  lines.push(`Total: ${formatCents(totalCents(rows))}`);
-  if (op === "count") lines.push(`Count: ${rows.length}`);
+  lines.push(`Total: ${formatSignedCents(totalCents(rows, intent))}`);
+  if (intent.op === "count") lines.push(`Count: ${rows.length}`);
   return lines.join("\n");
 }
 

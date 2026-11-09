@@ -8,21 +8,20 @@
 
 | Route | Caller | Behavior |
 | --- | --- | --- |
-| `POST /api/upload` | multipart field `file` | Parse a bank CSV, categorize each row, and store it |
+| `POST /api/upload` | multipart field `file` | Parse a bank CSV and store every row |
 | `POST /api/query` | JSON `{ "question": "..." }` | Parse the question into categories, merchants, a date range, and an operation. Totals are computed in code |
+| `GET /api/report` | probe | Whether this caller's ledger has a statement, plus count, date range, and last upload time. Requires Access on Workers. |
 | `GET /api/health` | probe | Runtime, provider, model, and ledger. No row count. On Workers it requires Access like the other `/api` routes. |
 
 The companion UI (`lausellduane/financial-agent-ui`, Expo 57 / React Native) posts to the upload and query routes and reads `count` from the upload response and `answer` or `error` from the query response. `App.tsx` hardcodes `http://localhost:4000` on web and iOS, and `http://10.0.2.2:4000` on the Android emulator. It sends no auth header and no session id. The web build needs CORS. Native builds do not.
 
-Each row is categorized on upload. Merchant rules run first (Chipotle is dining, Lowe's Foods is groceries, a paycheck is income, Netflix is a subscription, and so on). Only merchant strings that match no rule are sent to the model, in batches of 40, and the category is stored on the row. A credit on a signed statement is income.
-
-"What was my highest charge?" and questions that name a known category ("eating out", "gas and coffee") are parsed in code and do not call the model. Any other question asks the model for JSON only: `categories`, `merchants`, `excludeMerchants`, `dateFrom`, `dateTo`, and `op` (`sum`, `list`, `max`, or `count`). The model does not see the ledger and does not pick rows. The reply is validated, then the Worker filters and sums. Spending totals omit income and transfers unless the question asks for them. The last valid intent is stored per Access identity so "that's not a food charge: …" or "exclude Chipotle" refines it. The answer lists each match with its amount and the exact total. Responses are one JSON body. The server does not stream.
+Each row is categorized on upload. Merchant rules run first. Only unknown merchant names go to the model, in batches of 40. A model failure stores `unknown` and the next query tries again. Rows saved before categories existed are backfilled from the rules on the next read, so they are not treated as `other`. A refund stays in its spending category and reduces the net total. "What was my highest charge?" is the largest money-out, so a deposit does not win. Named questions are parsed in code. Anything else asks the model for intent JSON only. The model does not see the ledger. The last intent is kept until the next upload replaces the statement. Responses are one JSON body. The server does not stream.
 
 ## Model
 
 Workers AI model: `@cf/meta/llama-3.1-8b-instruct-fast`.
 
-The cost note priced `@cf/meta/llama-3.1-8b-instruct-fp8-fast`. That id is no longer in the catalog. `@cf/meta/llama-3.1-8b-instruct` was deprecated on 2026-05-30. The `-fast` Llama 3.1 8B instruct model is still listed, with a 128,000 token window and the chat `messages` API. It matches this app's short JSON classification calls. Llama 4 Scout is also in the catalog; it is a larger model than this workload needs. Override the id with the `WORKERS_AI_MODEL` var.
+The cost note priced `@cf/meta/llama-3.1-8b-instruct-fp8-fast`. That id is no longer in the catalog. `@cf/meta/llama-3.1-8b-instruct` was deprecated on 2026-05-30. The `-fast` Llama 3.1 8B instruct model is still listed, with a 128,000 token window and the chat `messages` API. It matches this app's short JSON classification calls. Llama 4 Scout is also in the catalog; it is a larger model than this workload needs. The id lives only in `DEFAULT_WORKERS_AI_MODEL` in `constants.ts`. Set `WORKERS_AI_MODEL` in the environment to override it.
 
 `LLM_PROVIDER` chooses the backend:
 
@@ -68,7 +67,7 @@ Two gaps found while booting the app:
 | `ollama` 0.6.3 | Used only when `LLM_PROVIDER` is `ollama`. The import is `ollama/browser` (global `fetch`). The Node entry of the package reads image files with `node:fs` and is not used. |
 | `dotenv` | A dependency, and not imported. Vars and secrets arrive on `process.env`. |
 
-The dry-run bundle is **1733.76 KiB uncompressed** (gzip 397.47 KiB). The limit is **64 MiB uncompressed** ([Limits](https://developers.cloudflare.com/workers/platform/limits/)). Wrangler 4.157.0 produced that bundle with `npm run check:worker`.
+The dry-run bundle is **1744.67 KiB uncompressed** (gzip 399.91 KiB). The limit is **64 MiB uncompressed** ([Limits](https://developers.cloudflare.com/workers/platform/limits/)). Wrangler 4.157.0 produced that bundle with `npm run check:worker`.
 
 ## Secrets, variables, and storage
 
@@ -77,10 +76,10 @@ Names only. No values belong in the repo.
 | Name | Kind | Required | Purpose |
 | --- | --- | --- | --- |
 | `ACCESS_TEAM_DOMAIN` | secret or var | yes on Workers | Team subdomain (`your-team`) or `https://your-team.cloudflareaccess.com`. The issuer is `https://<team>.cloudflareaccess.com`. JWKS is `https://<team>.cloudflareaccess.com/cdn-cgi/access/certs`. |
-| `ACCESS_AUD` | secret or var | yes on Workers | Application Audience (AUD) tag from the Access application. |
-| `CORS_ORIGIN` | var, set in `wrangler.jsonc` | yes for browsers | Comma-separated origins. `*` is ignored. The committed value is `http://localhost:8081` (Expo web). Add the deployed UI origin before a browser client calls the Worker. |
+| `ACCESS_AUD` | secret or var | yes on Workers | AUD tag of the **UI** Access application. The browser session is that app, and the API checks the JWT it issued. |
+| `CORS_ORIGIN` | var, empty in `wrangler.jsonc` | no in production | Production calls are same-origin, so this stays empty. `*` is ignored. Node dev uses `http://localhost:8081` and `http://localhost:19006` when it is empty. Set a comma-separated list only for a cross-origin dev UI. |
 | `LLM_PROVIDER` | var, already `workers-ai` | no | `workers-ai` or `ollama`. |
-| `WORKERS_AI_MODEL` | var, already set | no | `@cf/meta/llama-3.1-8b-instruct-fast`. |
+| `WORKERS_AI_MODEL` | env override | no | Overrides `DEFAULT_WORKERS_AI_MODEL` in `constants.ts`. Not set in `wrangler.jsonc`. |
 | `OLLAMA_MODEL` | var, already `llama3.1:latest` | only for the Ollama path | Node default, and the Worker if you force `LLM_PROVIDER=ollama`. |
 | `OLLAMA_HOST` | secret | only for the Ollama path | Base URL. The client adds `http://` and port `11434` when the value omits them. |
 | `OLLAMA_API_KEY` | secret | only if that Ollama host requires a bearer token | Sent as `Authorization: Bearer …`. |
@@ -95,9 +94,23 @@ Workers AI does not take an API key inside the Worker. The `AI` binding authenti
 
 ### Ledger
 
-On the Worker, parsed rows go to a SQLite Durable Object, class `Ledger`, binding `LEDGER`. The object name is the Access email (lowercased), or `sub` when the token has no email. Each person gets their own statement. Upload replaces that person's rows and clears the saved query intent. Inserts are batched. A CSV over 5 MB or 20,000 rows is rejected.
+On the Worker, parsed rows go to a SQLite Durable Object, class `Ledger`, binding `LEDGER`. The object name is `sub:<subject>` when the token has a subject, otherwise `email:<address>`. The same text as an email and as a subject is two ledgers. Accepted tokens must have `type: "app"` plus an email or a non-empty subject. Any non-empty `common_name` is a service-token client id and is rejected, even if a subject is also present. A missing email and subject, including a whitespace-only subject, is rejected too. Real user logins use `type: "app"` with an email and a UUID subject and do not carry `common_name`. Upload replaces that person's rows. Inserts are batched. A CSV over 5 MB or 20,000 rows is rejected.
 
-Migration `001_category_and_query_intent` runs in the constructor. It adds `transactions.category` when an object was created before categories existed, creates `query_intent` (one JSON intent per identity), and records the name in `schema_migrations`. New objects create the category column directly. Node keeps the same fields in memory.
+The earlier proof of concept keyed the object by the raw email. Those objects are orphaned. Anyone who uploaded on that deploy has to upload the statement again.
+
+`GET /api/report` is how the UI learns that a statement is already stored. The UI's "No report loaded" text is only its own memory, so a new session must call this before Ask.
+
+```json
+{ "loaded": false, "count": 0, "startDate": null, "endDate": null, "uploadedAt": null }
+```
+
+```json
+{ "loaded": true, "count": 3, "startDate": "2026-01-02", "endDate": "2026-01-04", "uploadedAt": "2026-11-05T00:46:12.000Z" }
+```
+
+`startDate` and `endDate` are calendar dates (`YYYY-MM-DD`) from the statement's date column. They are saved with the upload, and `GET /api/report` reads that summary in one Durable Object call instead of loading every row. `uploadedAt` is an ISO timestamp recorded when the rows were replaced, or `null` for a ledger saved before that timestamp existed. The response is only the caller's identity, and the route sends `Cache-Control: no-store`.
+
+Cloudflare application tokens for real users use `type: "app"` with an email and a UUID subject, and this Worker accepts those. Service tokens also use `type: "app"`, but they carry `common_name` (a client id ending in `.access`) and an empty subject, and any non-empty `common_name` is rejected. Native Access in the UI can send either kind. A service token still has no ledger until someone chooses an identity for it. `type: "org"` session tokens are not accepted.
 
 Node keeps one array in the process, because Access is not checked there.
 
@@ -119,8 +132,9 @@ Node keeps one array in the process, because Access is not checked there.
 - `ai.binding`: `AI`, with `remote: true` so `wrangler dev` calls the real model
 - `durable_objects.bindings`: `LEDGER` → `Ledger`
 - `exports.Ledger`: `{ "type": "durable-object", "storage": "sqlite" }`
-- vars: `LLM_PROVIDER`, `WORKERS_AI_MODEL`, `OLLAMA_MODEL`, `CORS_ORIGIN` (`http://localhost:8081`)
-- `ACCESS_TEAM_DOMAIN` and `ACCESS_AUD` are not in the file. DevOps sets them as secrets or vars.
+- `workers_dev`: false, and `preview_urls`: false. The UI reaches the API on the same origin.
+- vars: `LLM_PROVIDER`, `OLLAMA_MODEL`, `CORS_ORIGIN` (`""`). The Workers AI model id is `DEFAULT_WORKERS_AI_MODEL` in `constants.ts`.
+- `ACCESS_TEAM_DOMAIN` and `ACCESS_AUD` are not in the file. DevOps sets them as secrets or vars. `ACCESS_AUD` is the UI Access application's AUD tag.
 - `limits.cpu_ms`: `30000` (Paid default). Enforced on Cloudflare's network only.
 
 `npx wrangler dev` with `remote: true` opens a remote proxy at startup. Without `CLOUDFLARE_API_TOKEN` that startup fails before the server listens. `npx wrangler dev --local` disables remote bindings, serves the Durable Object, and rejects `env.AI.run` with `Binding AI needs to be run remotely`.
@@ -170,7 +184,7 @@ jobs:
 
 ## Tests
 
-`npm test` runs the Node unit tests (`workersAiText`, `parseCsv`) and the Workers runtime tests in `test/`. Those use `@cloudflare/vitest-plugin`, the current name of the Workers Vitest pool. The older `@cloudflare/vitest-pool-workers` package's workerd cannot start this Worker's compatibility date. The pool tests cover health, upload, a non-model query, a rejected JWT, a missing Access config, the 5 MB and 20,000-row caps, two Access identities not sharing a ledger, category rules, intent validation, exact totals (including the eating-out screenshot), multi-category questions, follow-up exclusions, the ledger migration, and Workers AI mocked to return intent JSON rather than row indexes.
+`npm test` runs the Node unit tests and the Workers runtime tests in `test/`. Those use `@cloudflare/vitest-plugin`, the current name of the Workers Vitest pool. The older `@cloudflare/vitest-pool-workers` package's workerd cannot start this Worker's compatibility date. The pool tests cover Access (including service-token rejection), report metadata, health, upload limits, category rules, exact totals, refunds, legacy backfill, categorization retry, and follow-up context reset on a new upload.
 
 ## Proof
 
@@ -185,12 +199,14 @@ npm start              # Node, http://localhost:4000
 `npm run check:worker` with Wrangler 4.157.0:
 
 ```text
-Total Upload: 1733.76 KiB / gzip: 397.47 KiB
+Total Upload: 1744.67 KiB / gzip: 399.91 KiB
 env.LEDGER (Ledger)     Durable Object
 env.AI                  AI
 env.LLM_PROVIDER        workers-ai
 env.WORKERS_AI_MODEL    @cf/meta/llama-3.1-8b-instruct-fast
 ```
+
+That dry-run still listed `WORKERS_AI_MODEL` as a var. The id now lives only in `constants.ts`.
 
 `wrangler dev` without a token stopped at: `In a non-interactive environment, it's necessary to set a CLOUDFLARE_API_TOKEN`.
 
@@ -200,7 +216,7 @@ env.WORKERS_AI_MODEL    @cf/meta/llama-3.1-8b-instruct-fast
 - `POST /api/upload` of a 3-row CSV → `200`, `count: 3`
 - `POST /api/query` `{"question":"What was my highest charge?"}` → `Costco: $86.20`
 - After stopping and starting `wrangler dev --local` again, health reported `rows: 3` and the same query returned Costco without another upload
-- A free-form question that needs the model, with `wrangler dev --local`, gets a normal answer that the question could not be matched. The log is `Intent model failed: Binding AI needs to be run remotely`. Known categories such as eating out do not call the model.
+- A free-form question that needs the model, with `wrangler dev --local`, is answered as unmatched. The log is `Intent model failed: Binding AI needs to be run remotely`. Named questions such as eating out and highest charge do not call the model.
 
 `npm start`:
 
@@ -216,13 +232,13 @@ npm ci
 export CLOUDFLARE_API_TOKEN="..."   # Workers Scripts: Edit, plus Workers AI: Read
 export CLOUDFLARE_ACCOUNT_ID="..."
 npx wrangler secret put ACCESS_TEAM_DOMAIN   # team subdomain, or https://<team>.cloudflareaccess.com
-npx wrangler secret put ACCESS_AUD           # Access application AUD tag
+npx wrangler secret put ACCESS_AUD           # AUD tag of the UI Access application
 npx wrangler deploy
 ```
 
-Create a Cloudflare Access application for the Worker hostname (self-hosted or workers.dev) before sending real statements. The AUD tag from that application is `ACCESS_AUD`. Access adds `Cf-Access-Jwt-Assertion`. The Worker checks the signature, `iss`, `aud`, and `exp`. A request without a valid token gets `401`, including when the two Access settings are missing.
+Put Cloudflare Access on the UI, not on a separate API hostname. `ACCESS_AUD` is that UI application's AUD tag. The browser sends `Cf-Access-Jwt-Assertion` on the same origin. The Worker checks the signature, `iss`, `aud`, `exp`, and `iat`, with 30 seconds of clock skew. A request without a valid user token gets `401`, including when the two Access settings are missing. Tokens must have `type: "app"` and an email or subject. Any `common_name` is rejected. `type: "app"` alone does not make a token a service token.
 
-`CORS_ORIGIN` is already `http://localhost:8081`. To allow more browser origins, set it to a comma-separated list and deploy again. Do not use `*`.
+`workers.dev` and preview URLs are off. `CORS_ORIGIN` is empty because those calls are same-origin. Node dev still allows localhost and sends `Access-Control-Allow-Credentials`. Do not set `CORS_ORIGIN` to `*`.
 
 Wrangler prints the `workers.dev` URL. Health, upload, and query need the Access JWT header:
 

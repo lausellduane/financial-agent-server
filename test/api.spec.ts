@@ -48,7 +48,7 @@ async function tokenFor(
   email: string,
   options?: { aud?: string; expired?: boolean },
 ): Promise<string> {
-  const jwt = new SignJWT({ email, sub: `sub-${email}` })
+  const jwt = new SignJWT({ type: "app", email, sub: `sub-${email}` })
     .setProtectedHeader({ alg: "RS256", kid: "test-key" })
     .setIssuer(ISSUER)
     .setAudience(options?.aud ?? AUD)
@@ -75,9 +75,67 @@ const csv = `Date,Description,Amount
 2026-01-04,COSTCO WHSE #123 RALEIGH NC,-86.20
 `;
 
+async function signed(
+  payload: Record<string, unknown>,
+  header: { alg: "RS256" | "HS256"; kid?: string } = { alg: "RS256", kid: "test-key" },
+): Promise<string> {
+  const jwt = new SignJWT({ type: "app", ...payload })
+    .setProtectedHeader(
+      header.alg === "HS256"
+        ? { alg: "HS256" }
+        : { alg: "RS256", kid: header.kid ?? "test-key" },
+    )
+    .setIssuer(typeof payload.iss === "string" ? payload.iss : ISSUER)
+    .setAudience(typeof payload.aud === "string" ? payload.aud : AUD)
+    .setIssuedAt()
+    .setExpirationTime("10m");
+  if (header.alg === "HS256") {
+    return jwt.sign(new TextEncoder().encode("not-the-access-key"));
+  }
+  return jwt.sign(privateKey);
+}
+
+async function tokenMissing(claim: "iat" | "exp"): Promise<string> {
+  let jwt = new SignJWT({
+    type: "app",
+    email: "ada@example.com",
+    sub: "sub-ada",
+  })
+    .setProtectedHeader({ alg: "RS256", kid: "test-key" })
+    .setIssuer(ISSUER)
+    .setAudience(AUD);
+  if (claim !== "iat") jwt = jwt.setIssuedAt();
+  if (claim !== "exp") jwt = jwt.setExpirationTime("10m");
+  return jwt.sign(privateKey);
+}
+
+function unsignedToken(): string {
+  const encode = (value: object) =>
+    btoa(JSON.stringify(value))
+      .replaceAll("=", "")
+      .replaceAll("+", "-")
+      .replaceAll("/", "_");
+  const header = encode({ alg: "none", typ: "JWT" });
+  const payload = encode({
+    iss: ISSUER,
+    aud: AUD,
+    iat: Math.floor(Date.now() / 1000),
+    exp: Math.floor(Date.now() / 1000) + 600,
+    type: "app",
+    email: "ada@example.com",
+    sub: "sub-ada",
+  });
+  return `${header}.${payload}.`;
+}
+
 describe("/api auth", () => {
   it("rejects health, upload, and query without a JWT", async () => {
-    for (const path of ["/api/health", "/api/upload", "/api/query"]) {
+    const health = await handler.fetch(new Request("https://example.com/api/health"));
+    expect(health.status).toBe(401);
+    expect(await health.json()).toEqual({ error: "Unauthorized" });
+    const report = await handler.fetch(new Request("https://example.com/api/report"));
+    expect(report.status).toBe(401);
+    for (const path of ["/api/upload", "/api/query"]) {
       const response = await handler.fetch(
         new Request(`https://example.com${path}`, { method: "POST" }),
       );
@@ -94,9 +152,190 @@ describe("/api auth", () => {
       expect(response.status).toBe(401);
     }
   });
+
+  it("rejects a wrong issuer, alg none, HS256, and an unknown key id", async () => {
+    const wrongIssuer = await signed({
+      email: "ada@example.com",
+      sub: "sub-ada",
+      iss: "https://evil.cloudflareaccess.com",
+    });
+    const hs256 = await signed(
+      { email: "ada@example.com", sub: "sub-ada" },
+      { alg: "HS256" },
+    );
+    const unknownKid = await signed(
+      { email: "ada@example.com", sub: "sub-ada" },
+      { alg: "RS256", kid: "missing-key" },
+    );
+    for (const token of [wrongIssuer, unsignedToken(), hs256, unknownKid]) {
+      const response = await authed("/api/health", token);
+      expect(response.status).toBe(401);
+    }
+  });
+
+  it("rejects a token missing iat or exp", async () => {
+    for (const claim of ["iat", "exp"] as const) {
+      const response = await authed("/api/health", await tokenMissing(claim));
+      expect(response.status).toBe(401);
+    }
+  });
+
+  it("rejects a token with no email or sub and a service token", async () => {
+    const noIdentity = await signed({});
+    const serviceToken = await signed({
+      type: "app",
+      common_name: "e367826f93b8d71185e03fe518aff3b4.access",
+      sub: "",
+    });
+    const namedServiceToken = await signed({
+      type: "app",
+      common_name: "e367826f93b8d71185e03fe518aff3b4.access",
+      sub: "6a1b2c3d-1111-2222-3333-444455556666",
+      email: "ada@example.com",
+    });
+    const blankSub = await signed({ type: "app", sub: " " });
+    for (const token of [noIdentity, serviceToken, namedServiceToken, blankSub]) {
+      const response = await authed("/api/health", token);
+      expect(response.status).toBe(401);
+    }
+  });
+
+  it("accepts a documented user application token", async () => {
+    const token = await signed({
+      type: "app",
+      sub: "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      email: "ada@example.com",
+      nbf: Math.floor(Date.now() / 1000) - 30,
+      identity_nonce: "nonce-1",
+    });
+    const response = await authed("/api/health", token);
+    expect(response.status).toBe(200);
+  });
 });
 
 describe("/api with a valid Access JWT", () => {
+  it("reports an empty ledger before any upload", async () => {
+    const token = await tokenFor("empty-report@example.com");
+    const response = await authed("/api/report", token);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(await response.json()).toEqual({
+      loaded: false,
+      count: 0,
+      startDate: null,
+      endDate: null,
+      uploadedAt: null,
+    });
+  });
+
+  it("reports the caller's statement after upload", async () => {
+    const token = await tokenFor("report@example.com");
+    const before = await authed("/api/report", token);
+    expect(await before.json()).toMatchObject({ loaded: false, count: 0 });
+
+    const form = new FormData();
+    form.set("file", new File([csv], "statement.csv", { type: "text/csv" }));
+    const uploaded = await authed("/api/upload", token, {
+      method: "POST",
+      body: form,
+    });
+    expect(uploaded.status).toBe(200);
+
+    const response = await authed("/api/report", token);
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      loaded: boolean;
+      count: number;
+      startDate: string | null;
+      endDate: string | null;
+      uploadedAt: string | null;
+    };
+    expect(body.loaded).toBe(true);
+    expect(body.count).toBe(3);
+    expect(body.startDate).toBe("2026-01-02");
+    expect(body.endDate).toBe("2026-01-04");
+    expect(body.uploadedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+
+    const other = await tokenFor("other-report@example.com");
+    const hidden = await authed("/api/report", other);
+    expect(await hidden.json()).toEqual({
+      loaded: false,
+      count: 0,
+      startDate: null,
+      endDate: null,
+      uploadedAt: null,
+    });
+  });
+
+  it("reports a loaded statement with no parseable dates", async () => {
+    const token = await tokenFor("no-dates@example.com");
+    const form = new FormData();
+    form.set(
+      "file",
+      new File(
+        ["Date,Description,Amount\nnot-a-date,PLANET HOME,-1541.42\n"],
+        "nodate.csv",
+        { type: "text/csv" },
+      ),
+    );
+    expect(
+      (await authed("/api/upload", token, { method: "POST", body: form })).status,
+    ).toBe(200);
+    const body = await (await authed("/api/report", token)).json();
+    expect(body).toMatchObject({
+      loaded: true,
+      count: 1,
+      startDate: null,
+      endDate: null,
+    });
+  });
+
+  it("replaces the stored report when the same person uploads again", async () => {
+    const token = await tokenFor("replace-report@example.com");
+    const firstForm = new FormData();
+    firstForm.set("file", new File([csv], "statement.csv", { type: "text/csv" }));
+    expect(
+      (
+        await authed("/api/upload", token, { method: "POST", body: firstForm })
+      ).status,
+    ).toBe(200);
+    const first = (await (await authed("/api/report", token)).json()) as {
+      count: number;
+      uploadedAt: string;
+    };
+    expect(first.count).toBe(3);
+
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const nextForm = new FormData();
+    nextForm.set(
+      "file",
+      new File(
+        ["Date,Description,Amount\n2026-03-01,SHELL OIL,-20.00\n"],
+        "next.csv",
+        { type: "text/csv" },
+      ),
+    );
+    expect(
+      (await authed("/api/upload", token, { method: "POST", body: nextForm }))
+        .status,
+    ).toBe(200);
+    const next = (await (await authed("/api/report", token)).json()) as {
+      loaded: boolean;
+      count: number;
+      startDate: string | null;
+      endDate: string | null;
+      uploadedAt: string | null;
+    };
+    expect(next).toMatchObject({
+      loaded: true,
+      count: 1,
+      startDate: "2026-03-01",
+      endDate: "2026-03-01",
+    });
+    expect(next.uploadedAt && first.uploadedAt < next.uploadedAt).toBe(true);
+  });
+
   it("serves health without a row count", async () => {
     const token = await tokenFor("ada@example.com");
     const response = await authed("/api/health", token);
@@ -109,7 +348,49 @@ describe("/api with a valid Access JWT", () => {
       ledger: "durable-object",
     });
     expect(body).not.toHaveProperty("rows");
+    expect(response.headers.get("access-control-allow-origin")).toBeNull();
+  });
+
+  it("does not allow a cross-origin browser", async () => {
+    const token = await tokenFor("ada@example.com");
+    const response = await authed("/api/health", token, {
+      headers: { Origin: "https://evil.example" },
+    });
+    expect(response.status).toBe(200);
+    expect(response.headers.get("access-control-allow-origin")).not.toBe(
+      "https://evil.example",
+    );
     expect(response.headers.get("access-control-allow-origin")).not.toBe("*");
+  });
+
+  it("keeps the same text in two ledgers when it is an email and a subject", async () => {
+    const shared = "same-person@example.com";
+    const asEmail = await signed({ email: shared });
+    const asSub = await signed({ sub: shared });
+    const form = new FormData();
+    form.set("file", new File([csv], "statement.csv", { type: "text/csv" }));
+    const uploaded = await authed("/api/upload", asEmail, {
+      method: "POST",
+      body: form,
+    });
+    expect(uploaded.status).toBe(200);
+
+    const other = await authed("/api/query", asSub, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ question: "What was my highest charge?" }),
+    });
+    expect(other.status).toBe(400);
+  });
+
+  it("rejects an upload with no file", async () => {
+    const token = await tokenFor("ada@example.com");
+    const response = await authed("/api/upload", token, {
+      method: "POST",
+      body: new FormData(),
+    });
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: "No file uploaded" });
   });
 
   it("uploads a statement and answers a non-model query", async () => {
@@ -178,7 +459,7 @@ describe("/api with a valid Access JWT", () => {
     expect(body.error).toContain("20000");
   });
 
-  it("fails closed when Access configuration is missing", async () => {
+  it("fails closed when Access configuration is missing", { concurrent: false }, async () => {
     const previousTeam = process.env.ACCESS_TEAM_DOMAIN;
     const previousAud = process.env.ACCESS_AUD;
     delete process.env.ACCESS_TEAM_DOMAIN;

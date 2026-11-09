@@ -37,10 +37,14 @@ export function accessCertsUrl(teamDomain: string): string {
   return `${accessIssuer(teamDomain)}/cdn-cgi/access/certs`;
 }
 
+// Prefix the kind of id so an email and a subject never land in one namespace.
+// Prefer sub: the same email from two identity providers must not share a ledger.
 export function ledgerId(identity: AccessIdentity): string {
-  const email = identity.email?.trim().toLowerCase();
-  if (email) return email;
-  return identity.sub;
+  const sub = identity.sub.trim();
+  const email = identity.email?.trim().toLowerCase() ?? "";
+  if (sub) return `sub:${sub}`;
+  if (email) return `email:${email}`;
+  throw new Error("Access token has no email or sub");
 }
 
 function jwksFor(teamDomain: string) {
@@ -55,11 +59,22 @@ function jwksFor(teamDomain: string) {
 
 function identityFromPayload(payload: JWTPayload): AccessIdentity {
   const email = typeof payload.email === "string" ? payload.email.trim() : "";
-  const sub = typeof payload.sub === "string" ? payload.sub : "";
-  if (!email && !sub) {
-    throw new Error("Access token has no email or sub");
+  const sub = typeof payload.sub === "string" ? payload.sub.trim() : "";
+  const commonName =
+    typeof payload.common_name === "string" ? payload.common_name.trim() : "";
+  // User logins and service tokens both use type "app". Global session
+  // tokens use type "org" and are not accepted here.
+  if (payload.type !== "app") {
+    throw new Error("Access token is not an application token");
   }
-  if (email) return { email, sub: sub || email };
+  // common_name is the service-token client id. Identity tokens do not carry it.
+  if (commonName) {
+    throw new Error("Service tokens have no user identity");
+  }
+  if (!email && !sub) {
+    throw new Error("Service tokens have no user identity");
+  }
+  if (email) return { email, sub };
   return { sub };
 }
 
@@ -73,6 +88,8 @@ export async function verifyAccessJwt(
     issuer,
     audience,
     algorithms: ["RS256"],
+    requiredClaims: ["exp", "iat"],
+    clockTolerance: "30s",
   });
   return identityFromPayload(payload);
 }

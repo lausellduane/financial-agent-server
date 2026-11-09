@@ -3,7 +3,8 @@
 #
 # Required on Workers. Requests to /api are rejected until both are set.
 # ACCESS_TEAM_DOMAIN is the team subdomain (your-team) or
-# https://your-team.cloudflareaccess.com. ACCESS_AUD is the application AUD tag.
+# https://your-team.cloudflareaccess.com.
+# ACCESS_AUD is the UI Access application's AUD tag, not a separate API app.
 #
 # ACCESS_TEAM_DOMAIN=
 # ACCESS_AUD=

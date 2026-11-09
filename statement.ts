@@ -32,6 +32,53 @@ export function formatCents(cents: number): string {
   return `$${dollars}.${String(rem).padStart(2, "0")}`;
 }
 
+export function formatSignedCents(cents: number): string {
+  if (cents < 0) return `-${formatCents(cents)}`;
+  return formatCents(cents);
+}
+
+// Calendar date for the report summary. Invalid calendar dates are dropped.
+export function calendarDate(raw: string | undefined): string | undefined {
+  const text = String(raw ?? "").trim();
+  if (!text) return undefined;
+  const iso = /^(\d{4})-(\d{1,2})-(\d{1,2})/.exec(text);
+  const us = /^(\d{1,2})\/(\d{1,2})\/(\d{2,4})/.exec(text);
+  let year: number;
+  let month: number;
+  let day: number;
+  if (iso?.[1] && iso[2] && iso[3]) {
+    year = Number(iso[1]);
+    month = Number(iso[2]);
+    day = Number(iso[3]);
+  } else if (us?.[1] && us[2] && us[3]) {
+    month = Number(us[1]);
+    day = Number(us[2]);
+    year = Number(us[3]);
+    if (year < 100) year += 2000;
+  } else {
+    return undefined;
+  }
+  if (month < 1 || month > 12 || day < 1 || day > 31) return undefined;
+  return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
+export function statementDateRange(rows: Record<string, string>[]): {
+  startDate: string | null;
+  endDate: string | null;
+} {
+  const field = pickDisplayFields(rows).date;
+  let startDate: string | null = null;
+  let endDate: string | null = null;
+  if (!field) return { startDate, endDate };
+  for (const row of rows) {
+    const key = calendarDate(row[field]);
+    if (!key) continue;
+    if (!startDate || key < startDate) startDate = key;
+    if (!endDate || key > endDate) endDate = key;
+  }
+  return { startDate, endDate };
+}
+
 export function isIsoDate(value: string): boolean {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
   const parts = value.split("-").map((part) => Number(part));

@@ -17,5 +17,7 @@ export default defineConfig({
   ],
   test: {
     include: ["test/**/*.spec.ts"],
+    fileParallelism: false,
+    sequence: { concurrent: false },
   },
 });

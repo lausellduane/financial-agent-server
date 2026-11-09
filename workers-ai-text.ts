@@ -49,6 +49,8 @@ function readAiText(result: unknown, depth: number): string {
   if (depth > 3) return "";
 
   const record = result as Record<string, unknown>;
+  // choices wins when both fields are set. Newer models put the text there
+  // and may also leave a stale response string.
   const fromChoices = readChoices(record.choices);
   if (fromChoices.trim()) return fromChoices;
 
@@ -70,7 +72,6 @@ function readAiText(result: unknown, depth: number): string {
   }
 
   if ("result" in record) return readAiText(record.result, depth + 1);
-  if (typeof record.response === "string") return record.response;
   return "";
 }
 
