@@ -262,3 +262,99 @@ test("node mode returns 409 when categorization finishes on a replaced statement
   assert.doesNotMatch(JSON.stringify(body), /9\.50/);
   setCompleteChatForTests(null);
 });
+
+test("node mode does not treat a credit-union credit as fuel", async () => {
+  for (const description of [
+    "SHELL FEDERAL CREDIT UNION DEPOSIT",
+    "SHELL FEDERAL CREDIT UNION",
+  ]) {
+    assert.equal(
+      (
+        await upload(
+          csv([
+            "2026-01-02,SHELL OIL,-40.00",
+            `2026-01-03,${description},2500.00`,
+            "2026-01-04,CHIPOTLE,-10.00",
+          ]),
+        )
+      ).status,
+      200,
+    );
+    const gas = await ask("gas");
+    assert.match(gas, /Total: \$40\.00/);
+    assert.doesNotMatch(gas, /2460|2500|CHIPOTLE/);
+    const spent = await ask("How much did I spend?");
+    assert.match(spent, /Total: \$50\.00/);
+    assert.doesNotMatch(spent, /2450|2500/);
+    const highest = await ask("What was my highest charge?");
+    assert.match(highest, /40\.00/);
+    assert.doesNotMatch(highest, /2500/);
+  }
+});
+
+test("node mode keeps utility gas and gasoline distinct from groceries", async () => {
+  assert.equal(
+    (
+      await upload(
+        csv([
+          "2026-01-02,CITY GAS BILL,-80.00",
+          "2026-01-03,SHELL OIL,-40.00",
+          "2026-01-04,CHIPOTLE,-10.00",
+        ]),
+      )
+    ).status,
+    200,
+  );
+  const narrowGas = await ask("gas");
+  assert.match(narrowGas, /Total: \$40\.00/);
+  assert.doesNotMatch(narrowGas, /80\.00/);
+  assert.match(await ask("How much did I spend?"), /Total: \$130\.00/);
+  assert.match(await ask("What was my highest charge?"), /80\.00/);
+
+  assert.equal(
+    (
+      await upload(
+        csv([
+          "2026-01-02,CITY GAS BILL,-80.00",
+          "2026-01-03,SHELL OIL,-40.00",
+          "2026-01-04,CHIPOTLE,-10.00",
+          "2026-01-05,COSTCO GASOLINE,-25.00",
+          "2026-01-06,COSTCO WHSE,-15.00",
+        ]),
+      )
+    ).status,
+    200,
+  );
+  const gas = await ask("gas");
+  assert.match(gas, /40\.00/);
+  assert.match(gas, /25\.00/);
+  assert.match(gas, /Total: \$65\.00/);
+  assert.doesNotMatch(gas, /80\.00|15\.00/);
+  const groceries = await ask("groceries");
+  assert.match(groceries, /15\.00/);
+  assert.doesNotMatch(groceries, /25\.00|80\.00/);
+  const spent = await ask("How much did I spend?");
+  assert.match(spent, /Total: \$170\.00/);
+  const highest = await ask("What was my highest charge?");
+  assert.match(highest, /80\.00/);
+});
+
+test("node mode keeps Chipotle in a pending merchant name", async () => {
+  assert.equal(
+    (
+      await upload(
+        csv([
+          "2026-01-01,CHIPOTLE PENDING,-12.00",
+          "2026-01-02,pending,-50.00",
+          "2026-01-03,CHIPOTLE,0",
+        ]),
+      )
+    ).status,
+    200,
+  );
+  const spent = await ask("How much did I spend?");
+  assert.match(spent, /CHIPOTLE PENDING/);
+  assert.match(spent, /Pending/);
+  assert.match(spent, /Total: \$62\.00/);
+  assert.match(spent, /1 zero-amount row/);
+});

@@ -188,7 +188,17 @@ describe("categorizeNarrative", () => {
     expect(categorizeNarrative("SONIC DRIVE IN", -500, true)).toBe("dining");
     expect(categorizeNarrative("MOBIL OIL", -4000, true)).toBe("gas/auto");
     expect(categorizeNarrative("COSTCO GAS", -4500, true)).toBe("gas/auto");
+    expect(categorizeNarrative("COSTCO GASOLINE", -2500, true)).toBe("gas/auto");
     expect(categorizeNarrative("COSTCO WHSE", -8000, true)).toBe("groceries");
+    expect(categorizeNarrative("SHELL FEDERAL CREDIT UNION DEPOSIT", 250000, true)).toBe(
+      "income",
+    );
+    expect(categorizeNarrative("SHELL FEDERAL CREDIT UNION", 250000, true)).toBe("income");
+    expect(categorizeNarrative("SHELL OIL", 500, true)).toBe("gas/auto");
+    expect(categorizeNarrative("CITY GAS BILL", -8000, true)).toBe("utilities/telecom");
+    expect(categorizeNarrative("PIEDMONT NATURAL GAS", -4000, true)).toBe(
+      "utilities/telecom",
+    );
     expect(categorizeNarrative("pending", -5000, true)).toBe("other");
   });
 
@@ -1078,5 +1088,111 @@ describe("/api spending queries", () => {
     const current = await query(email, "How much did I spend?");
     expect(current.answer).toContain("40.00");
     expect(current.answer).not.toContain("9.50");
+  });
+
+  it("does not treat a credit-union credit as fuel", async () => {
+    const email = "credit-union@example.com";
+    for (const description of [
+      "SHELL FEDERAL CREDIT UNION DEPOSIT",
+      "SHELL FEDERAL CREDIT UNION",
+    ]) {
+      expect(
+        (
+          await upload(
+            email,
+            csvOf([
+              ["2026-01-02", "SHELL OIL", "-40.00"],
+              ["2026-01-03", description, "2500.00"],
+              ["2026-01-04", "CHIPOTLE", "-10.00"],
+            ]),
+          )
+        ).status,
+      ).toBe(200);
+      const gas = await query(email, "gas");
+      expect(gas.answer).toContain("Total: $40.00");
+      expect(gas.answer).not.toContain("2460");
+      expect(gas.answer).not.toContain("2500");
+      const spent = await query(email, "How much did I spend?");
+      expect(spent.answer).toContain("Total: $50.00");
+      expect(spent.answer).not.toContain("2450");
+      expect(spent.answer).not.toContain("2500");
+      const highest = await query(email, "What was my highest charge?");
+      expect(highest.answer).toContain("40.00");
+      expect(highest.answer).not.toContain("2500");
+    }
+  });
+
+  it("keeps a city gas bill out of vehicle fuel and in the overall total", async () => {
+    const email = "city-gas@example.com";
+    expect(
+      (
+        await upload(
+          email,
+          csvOf([
+            ["2026-01-02", "CITY GAS BILL", "-80.00"],
+            ["2026-01-03", "SHELL OIL", "-40.00"],
+            ["2026-01-04", "CHIPOTLE", "-10.00"],
+          ]),
+        )
+      ).status,
+    ).toBe(200);
+    const narrowGas = await query(email, "gas");
+    expect(narrowGas.answer).toContain("Total: $40.00");
+    expect(narrowGas.answer).not.toContain("80.00");
+    const narrowSpent = await query(email, "How much did I spend?");
+    expect(narrowSpent.answer).toContain("Total: $130.00");
+    const narrowHighest = await query(email, "What was my highest charge?");
+    expect(narrowHighest.answer).toContain("80.00");
+
+    expect(
+      (
+        await upload(
+          email,
+          csvOf([
+            ["2026-01-02", "CITY GAS BILL", "-80.00"],
+            ["2026-01-03", "SHELL OIL", "-40.00"],
+            ["2026-01-04", "CHIPOTLE", "-10.00"],
+            ["2026-01-05", "COSTCO GASOLINE", "-25.00"],
+            ["2026-01-06", "COSTCO WHSE", "-15.00"],
+          ]),
+        )
+      ).status,
+    ).toBe(200);
+    const gas = await query(email, "gas");
+    expect(gas.answer).toContain("40.00");
+    expect(gas.answer).toContain("25.00");
+    expect(gas.answer).not.toContain("80.00");
+    expect(gas.answer).not.toContain("15.00");
+    expect(gas.answer).toContain("Total: $65.00");
+    const groceries = await query(email, "groceries");
+    expect(groceries.answer).toContain("15.00");
+    expect(groceries.answer).not.toContain("25.00");
+    const spent = await query(email, "How much did I spend?");
+    expect(spent.answer).toContain("Total: $170.00");
+    const highest = await query(email, "What was my highest charge?");
+    expect(highest.answer).toContain("80.00");
+  });
+
+  it("keeps the merchant name on a pending charge", async () => {
+    const email = "chipotle-pending@example.com";
+    expect(
+      (
+        await upload(
+          email,
+          csvOf([
+            ["2026-01-01", "CHIPOTLE PENDING", "-12.00"],
+            ["2026-01-02", "pending", "-50.00"],
+            ["2026-01-03", "CHIPOTLE", "0"],
+          ]),
+        )
+      ).status,
+    ).toBe(200);
+    const spent = await query(email, "How much did I spend?");
+    expect(spent.answer).toContain("CHIPOTLE PENDING");
+    expect(spent.answer).toContain("12.00");
+    expect(spent.answer).toContain("Pending");
+    expect(spent.answer).toContain("50.00");
+    expect(spent.answer).toContain("Total: $62.00");
+    expect(spent.answer).toContain("1 zero-amount row");
   });
 });

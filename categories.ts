@@ -231,7 +231,7 @@ const RULES: Rule[] = [
       "JIFFY LUBE",
       "VALVOLINE",
     ],
-    pattern: /(^|[^A-Z0-9])(BP|FUEL|GAS)([^A-Z0-9]|$)/,
+    pattern: /(^|[^A-Z0-9])(BP|FUEL|GASOLINE|PETROL|GAS)([^A-Z0-9]|$)/,
   },
   {
     category: "home",
@@ -324,9 +324,38 @@ export function tokenIn(
   return false;
 }
 
+function isUtilityGas(text: string): boolean {
+  if (/\b(GASOLINE|PETROL)\b/.test(text)) return false;
+  if (text.includes("NATURAL GAS")) return true;
+  if (/\b(CITY|MUNICIPAL|COUNTY|UTILITY|UTILITIES)\s+GAS\b/.test(text)) return true;
+  if (/\bGAS\s+(BILL|UTILITY|COMPANY|CO|DEPT|DEPARTMENT|SERVICE)\b/.test(text)) {
+    return true;
+  }
+  if (/\b(BILL|UTILITY|UTILITIES)\b/.test(text) && /\bGAS\b/.test(text)) {
+    return !/\b(STATION|COSTCO|SHELL|EXXON|CHEVRON|MOBIL|CIRCLE|WAWA|SHEETZ)\b/.test(
+      text,
+    );
+  }
+  return false;
+}
+
 function explicitFuel(text: string): boolean {
-  if (text.includes("NATURAL GAS")) return false;
-  return /(^|[^A-Z0-9])(GAS|FUEL)([^A-Z0-9]|$)/.test(text);
+  if (isUtilityGas(text)) return false;
+  return /(^|[^A-Z0-9])(GASOLINE|PETROL|FUEL|GAS)([^A-Z0-9]|$)/.test(text);
+}
+
+function isFinancialInstitution(text: string): boolean {
+  if (
+    /\bCREDIT UNIONS?\b|\bFEDERAL CREDIT\b|\bBANCORP\b|\bSAVINGS BANK\b|\bNATIONAL BANK\b/.test(
+      text,
+    ) ||
+    /(^|[^A-Z0-9])FCU([^A-Z0-9]|$)/.test(text)
+  ) {
+    return true;
+  }
+  // A bare BANK word is an institution unless the line is a station purchase.
+  if (!/(^|[^A-Z0-9])BANK([^A-Z0-9]|$)/.test(text)) return false;
+  return !explicitFuel(text) && !/\b(OIL|STATION|MART)\b/.test(text);
 }
 
 function matchesRule(text: string, rule: Rule): boolean {
@@ -377,6 +406,14 @@ export function categorizeNarrative(
 ): Category | "unknown" {
   const text = narrative.toUpperCase();
   if (hasIncomeKeyword(text)) return "income";
+  // A credit-union or bank line is not a Shell/Mobil station, even when the
+  // institution's name contains that brand. Credits are income. Money sent
+  // to the institution is a transfer, not fuel.
+  if (isFinancialInstitution(text)) {
+    if (amountCents < 0) return "transfers";
+    return "income";
+  }
+  if (isUtilityGas(text)) return "utilities/telecom";
   if (isBlankNarrative(text)) return "other";
   const ruled = RULES.find((rule) => matchesRule(text, rule))?.category;
   if (ruled) return ruled;

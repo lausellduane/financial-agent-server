@@ -344,8 +344,12 @@ function toViews(records: LedgerRecord[]): { views: TxView[]; omitted: OmittedRo
       continue;
     }
     let merchant = cleanMerchantName(narrative);
-    if (/pend|process/i.test(rawDescription.trim())) merchant = "Pending";
-    else if (merchant === "Unknown merchant") merchant = "Unknown merchant";
+    // Only a placeholder description is renamed. "CHIPOTLE PENDING" keeps Chipotle.
+    if (/^(pending|processing|process)$/i.test(rawDescription.trim())) {
+      merchant = "Pending";
+    } else if (merchant === "Unknown merchant") {
+      merchant = "Unknown merchant";
+    }
     views.push({
       date: normalizeDate(fields.date ? String(record.payload[fields.date] ?? "") : ""),
       merchant,
