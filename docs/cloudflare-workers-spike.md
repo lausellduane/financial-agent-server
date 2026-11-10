@@ -9,13 +9,13 @@
 | Route | Caller | Behavior |
 | --- | --- | --- |
 | `POST /api/upload` | multipart field `file` | Parse a bank CSV and store every row |
-| `POST /api/query` | JSON `{ "question": "..." }` | Filter those rows in process. Some questions call the model |
+| `POST /api/query` | JSON `{ "question": "..." }` | Parse the question into categories, merchants, a date range, and an operation. Totals are computed in code |
 | `GET /api/report` | probe | Whether this caller's ledger has a statement, plus count, date range, and last upload time. Requires Access on Workers. |
 | `GET /api/health` | probe | Runtime, provider, model, and ledger. No row count. On Workers it requires Access like the other `/api` routes. |
 
 The companion UI (`lausellduane/financial-agent-ui`, Expo 57 / React Native) posts to the upload and query routes and reads `count` from the upload response and `answer` or `error` from the query response. `App.tsx` hardcodes `http://localhost:4000` on web and iOS, and `http://10.0.2.2:4000` on the Android emulator. It sends no auth header and no session id. The web build needs CORS. Native builds do not.
 
-Simple questions such as "what was my highest charge?" never call the model. Category questions such as "how much did I spend on groceries?" classify unknown merchants in batches of 70. A question that matches neither path asks the model to pick ledger rows. Responses are one JSON body. The server does not stream.
+Each row is categorized on upload. Merchant rules run first. Only unknown merchant names go to the model, in batches of 40. A model failure stores `unknown` and the next query tries again. Rows saved before categories existed are backfilled from the rules on the next read, so they are not treated as `other`. A refund stays in its spending category and reduces the net total. "What was my highest charge?" is the largest money-out, so a deposit does not win. Named questions are parsed in code. An explicit `YYYY-MM-DD` that is not a real calendar day, or a range whose start is after its end, is HTTP 400 before categorization, intent, or any stored-category change. Anything else asks the model for intent JSON only. The model does not see the ledger. The last intent is kept until the next upload replaces the statement. Responses are one JSON body. The server does not stream.
 
 ## Model
 
@@ -67,7 +67,7 @@ Two gaps found while booting the app:
 | `ollama` 0.6.3 | Used only when `LLM_PROVIDER` is `ollama`. The import is `ollama/browser` (global `fetch`). The Node entry of the package reads image files with `node:fs` and is not used. |
 | `dotenv` | A dependency, and not imported. Vars and secrets arrive on `process.env`. |
 
-The dry-run bundle is **1685.08 KiB uncompressed** (gzip 384.73 KiB). The limit is **64 MiB uncompressed** ([Limits](https://developers.cloudflare.com/workers/platform/limits/)). Wrangler 4.157.0 produced that bundle with `npm run check:worker`.
+The dry-run bundle is **1751.29 KiB uncompressed** (gzip 401.45 KiB). The limit is **64 MiB uncompressed** ([Limits](https://developers.cloudflare.com/workers/platform/limits/)). Wrangler 4.157.0 produced that bundle with `npm run check:worker`.
 
 ## Secrets, variables, and storage
 
@@ -97,6 +97,10 @@ Workers AI does not take an API key inside the Worker. The `AI` binding authenti
 On the Worker, parsed rows go to a SQLite Durable Object, class `Ledger`, binding `LEDGER`. The object name is `sub:<subject>` when the token has a subject, otherwise `email:<address>`. The same text as an email and as a subject is two ledgers. Accepted tokens must have `type: "app"` plus an email or a non-empty subject. Any non-empty `common_name` is a service-token client id and is rejected, even if a subject is also present. A missing email and subject, including a whitespace-only subject, is rejected too. Real user logins use `type: "app"` with an email and a UUID subject and do not carry `common_name`. Upload replaces that person's rows. Inserts are batched. A CSV over 5 MB or 20,000 rows is rejected.
 
 The earlier proof of concept keyed the object by the raw email. Those objects are orphaned. Anyone who uploaded on that deploy has to upload the statement again.
+
+Categories are stored on each row. A ledger created from current `master` has no category column; the migration adds a nullable column and the next read fills it from merchant rules. An unmerged earlier commit on this branch used `NOT NULL DEFAULT 'other'`. GitHub Actions workflows, the Deployments API, and `master` history show no deploy of that commit: `master` is the spike, the report route, and the Access token check. Rows already saved as `other` are not rewritten, because that can be a real classification. If a private deploy of that defaulted schema exists outside this repository, those rows stay `other` until someone uploads again.
+
+A signed refund that matches a spending merchant reduces that category. A positive-only file does not say which of two identical merchant amounts is a refund, so those rows are not guessed. A credit that matches no spending rule, including an explicit mobile or direct deposit, is income. A credit union or bank line is not a fuel purchase when its name contains Shell or Mobil. A city gas bill is a utility. Gasoline at Costco is fuel. `CHIPOTLE PENDING` keeps the merchant name; a description that is only `pending` is still labeled Pending. Uncategorized charges and zero-amount rows stay in the stored count and are named, with the missing amount, when a total leaves them out. A question that is still running when a new statement is uploaded returns 409 and does not answer with the old amounts.
 
 `GET /api/report` is how the UI learns that a statement is already stored. The UI's "No report loaded" text is only its own memory, so a new session must call this before Ask.
 
@@ -175,7 +179,7 @@ jobs:
 | CPU time | **Free plan is a blocker.** Free allows 10 ms of CPU per request. Paid allows 30 seconds by default and up to 5 minutes. Parsing and the keyword tables are CPU. Waiting on Workers AI is not. This config keeps 30 seconds. |
 | Wall clock | No hard cap on an HTTP request while the client stays connected. A category question can call the model several times, and the UI waits for one JSON body. A slow reply can outlast a phone even though Workers keeps the connection open. |
 | Workers AI locally | `wrangler dev` refuses to start the remote AI proxy without `CLOUDFLARE_API_TOKEN`. `wrangler dev --local` reaches `env.AI.run` and returns `Binding AI needs to be run remotely`. The first live deploy did call the model; questions failed until `workersAiText` accepted a parsed JSON `response` and a `choices` message. |
-| Bundle size | 1.6 MiB uncompressed. Limit 64 MiB. |
+| Bundle size | 1.7 MiB uncompressed. Limit 64 MiB. |
 | Memory | 128 MB for the isolate. The Durable Object holds the statement outside that heap. |
 | Cold start | The statement survives isolate eviction. Startup itself must finish within 1 second. This bundle is small enough that the limit is not the risk. |
 | Auth | Workers require a Cloudflare Access JWT (`Cf-Access-Jwt-Assertion`) checked against the team JWKS, with `iss`, `aud`, and `exp`. The ledger id is that identity. Node dev skips the check. DevOps still creates the Access application in front of the hostname so browsers receive the cookie and header. |
@@ -184,7 +188,7 @@ jobs:
 
 ## Tests
 
-`npm test` runs the Node unit tests (`workersAiText`, `parseCsv`) and the Workers runtime tests in `test/api.spec.ts`. Those use `@cloudflare/vitest-plugin`, the current name of the Workers Vitest pool. The older `@cloudflare/vitest-pool-workers` package's workerd cannot start this Worker's compatibility date. The pool tests cover health, upload, a non-model query, a rejected JWT, a missing Access config, the 5 MB and 20,000-row caps, and two Access identities not sharing a ledger.
+`npm test` runs the Node unit tests and the Workers runtime tests in `test/`. Those use `@cloudflare/vitest-plugin`, the current name of the Workers Vitest pool. The older `@cloudflare/vitest-pool-workers` package's workerd cannot start this Worker's compatibility date. The pool tests cover Access (including service-token rejection), report metadata, health, upload limits, category rules, exact totals, refunds, legacy backfill, categorization retry, and follow-up context reset on a new upload.
 
 ## Proof
 
@@ -199,7 +203,7 @@ npm start              # Node, http://localhost:4000
 `npm run check:worker` with Wrangler 4.157.0:
 
 ```text
-Total Upload: 1685.08 KiB / gzip: 384.73 KiB
+Total Upload: 1751.29 KiB / gzip: 401.45 KiB
 env.LEDGER (Ledger)     Durable Object
 env.AI                  AI
 env.LLM_PROVIDER        workers-ai
@@ -216,7 +220,7 @@ That dry-run still listed `WORKERS_AI_MODEL` as a var. The id now lives only in 
 - `POST /api/upload` of a 3-row CSV → `200`, `count: 3`
 - `POST /api/query` `{"question":"What was my highest charge?"}` → `Costco: $86.20`
 - After stopping and starting `wrangler dev --local` again, health reported `rows: 3` and the same query returned Costco without another upload
-- A free-form question that calls the model → `500`, log: `Binding AI needs to be run remotely` at `env.AI.run`
+- A free-form question that needs the model, with `wrangler dev --local`, is answered as unmatched. The log is `Intent model failed: Binding AI needs to be run remotely`. Named questions such as eating out and highest charge do not call the model.
 
 `npm start`:
 

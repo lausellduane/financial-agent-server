@@ -7,7 +7,7 @@
     "start": "tsx server.ts",
     "dev:worker": "wrangler dev",
     "check:worker": "wrangler deploy --dry-run --outdir dist",
-    "test": "tsx --test workers-ai-text.test.ts parse-csv.test.ts llm.test.ts indexes.test.ts && vitest run"
+    "test": "tsx --test workers-ai-text.test.ts parse-csv.test.ts llm.test.ts indexes.test.ts node-spend.test.ts && vitest run"
   },
   "repository": {
     "type": "git",

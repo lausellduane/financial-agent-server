@@ -10,6 +10,7 @@ export type LlmProvider = "workers-ai" | "ollama";
 
 export const WORKERS_AI_TEMPERATURE = 0;
 export const WORKERS_AI_MAX_TOKENS = 2048;
+export const LLM_TIMEOUT_MS = 20_000;
 
 export function llmProvider(): LlmProvider {
   const configured = process.env.LLM_PROVIDER?.trim().toLowerCase();
@@ -50,12 +51,42 @@ type OllamaChat = (args: {
   options: { temperature: number };
 }) => Promise<{ message: { content: string } }>;
 
-// Optional deps exist so tests can pass the model parameters without a network call.
-// Production callers use completeChat(messages) only.
+// Node tests set this so a categorization retry does not need a live Ollama.
+let testComplete: ((messages: ChatTurn[]) => Promise<string>) | null = null;
+
+export function setCompleteChatForTests(
+  fn: ((messages: ChatTurn[]) => Promise<string>) | null,
+): void {
+  testComplete = fn;
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error("LLM request timed out"));
+    }, ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+// One chat completion. Workers AI on the Worker, Ollama under Node.
+// Callers must not send ledger rows. Categorization gets unknown merchant
+// names. Queries get the question and the previous intent only.
 export async function completeChat(
   messages: ChatTurn[],
   deps?: { workersAi?: WorkersAiRun; ollamaChat?: OllamaChat },
 ): Promise<string> {
+  if (testComplete) return testComplete(messages);
+
   if (llmProvider() === "workers-ai") {
     const run =
       deps?.workersAi ??
@@ -63,11 +94,14 @@ export async function completeChat(
         const { env } = await import("cloudflare:workers");
         return env.AI.run(model, input);
       });
-    const result = await run(workersAiModel(), {
-      messages,
-      temperature: WORKERS_AI_TEMPERATURE,
-      max_tokens: WORKERS_AI_MAX_TOKENS,
-    });
+    const result = await withTimeout(
+      run(workersAiModel(), {
+        messages,
+        temperature: WORKERS_AI_TEMPERATURE,
+        max_tokens: WORKERS_AI_MAX_TOKENS,
+      }),
+      LLM_TIMEOUT_MS,
+    );
     const text = await workersAiText(result);
     if (!text) {
       throw new Error(
@@ -77,13 +111,14 @@ export async function completeChat(
     return text;
   }
 
-  const chat =
-    deps?.ollamaChat ??
-    ((args) => ollamaClient().chat(args));
-  const response = await chat({
-    model: ollamaModel(),
-    messages,
-    options: { temperature: WORKERS_AI_TEMPERATURE },
-  });
+  const chat = deps?.ollamaChat ?? ((args) => ollamaClient().chat(args));
+  const response = await withTimeout(
+    chat({
+      model: ollamaModel(),
+      messages,
+      options: { temperature: WORKERS_AI_TEMPERATURE },
+    }),
+    LLM_TIMEOUT_MS,
+  );
   return response.message.content;
 }
