@@ -421,3 +421,44 @@ test("node mode rejects an explicit ISO date that is not a real day", async () =
   assert.match(open, /100\.00/);
   assert.match(open, /5\.35/);
 });
+
+test("node mode rejects an invalid date before categorizing an unknown merchant", async () => {
+  let calls = 0;
+  setCompleteChatForTests(async () => {
+    calls += 1;
+    throw new Error("upload categorization fails");
+  });
+  const uploaded = await upload(
+    csv(["2026-01-15,CHIPOTLE,-10.00", "2026-03-04,ZOOPLEX SNACKBAR,-5.35"]),
+  );
+  assert.equal(uploaded.status, 200);
+  assert.ok(calls > 0);
+  calls = 0;
+  setCompleteChatForTests(async () => {
+    calls += 1;
+    return JSON.stringify({
+      items: [{ merchant: "ZOOPLEX SNACKBAR", category: "dining" }],
+    });
+  });
+  for (const question of [
+    "eating out on 2026-02-31",
+    "eating out from 2026-02-31 to 2026-03-04",
+    "eating out on 2025-02-29",
+  ]) {
+    const result = await askRaw(question);
+    assert.equal(result.status, 400, question);
+    assert.match(result.body.error ?? "", /not a valid calendar date/);
+    assert.equal(result.body.answer, undefined);
+  }
+  const reversed = await askRaw("eating out from 2026-03-04 to 2026-03-01");
+  assert.equal(reversed.status, 400);
+  assert.match(reversed.body.error ?? "", /start date is after the end date/);
+  assert.equal(calls, 0);
+
+  const exact = await ask("eating out on 2026-03-04");
+  assert.equal(calls, 1);
+  assert.match(exact, /ZOOPLEX/);
+  assert.match(exact, /Total: \$5\.35/);
+  assert.doesNotMatch(exact, /10\.00/);
+  setCompleteChatForTests(null);
+});

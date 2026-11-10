@@ -547,6 +547,36 @@ async function query(email: string, question: string): Promise<{ answer?: string
   return result.body;
 }
 
+async function expectConflict(response: Response, absent: string): Promise<void> {
+  expect(response.status).toBe(409);
+  try {
+    const body = (await response.json()) as { error?: string; answer?: string };
+    expect(body.error).toMatch(/statement changed/i);
+    expect(body.answer).toBeUndefined();
+    expect(JSON.stringify(body)).not.toContain(absent);
+  } catch (error) {
+    // workerd will not read this body after the replacement I/O. Status and
+    // the follow-up query still prove the conflict.
+    if (!(error instanceof Error) || !/different request/.test(error.message)) throw error;
+  }
+}
+
+async function replaceDuringQuery(email: string): Promise<void> {
+  // A second HTTP call while this response is open makes workerd refuse the
+  // body, and the unread stream then stalls the rest of the isolate. The
+  // ledger write is the same version bump the upload route persists.
+  const stub = env.LEDGER.get(env.LEDGER.idFromName(ledgerName(email)));
+  await stub.replace(
+    [
+      {
+        payload: { Date: "2026-02-01", Description: "SHELL OIL", Amount: "-40.00" },
+        category: "gas/auto",
+      },
+    ],
+    { startDate: "2026-02-01", endDate: "2026-02-01" },
+  );
+}
+
 async function queryRaw(
   email: string,
   question: string,
@@ -1011,15 +1041,10 @@ describe("/api spending queries", () => {
       body: JSON.stringify({ question: "How much did I spend on hobbies?" }),
     });
     await entered;
-    expect(
-      (await upload(email, csvOf([["2026-02-01", "SHELL OIL", "-40.00"]]))).status,
-    ).toBe(200);
+    await replaceDuringQuery(email);
     release();
     const response = await pending;
-    // The Workers runtime will not let this test read the first response body
-    // after the replacement request. 409 is only produced for a replaced
-    // statement, and that body has no amounts.
-    expect(response.status).toBe(409);
+    await expectConflict(response, "20.00");
     const current = await query(email, "How much did I spend?");
     expect(current.answer).toContain("40.00");
     expect(current.answer).not.toContain("20.00");
@@ -1050,12 +1075,10 @@ describe("/api spending queries", () => {
       body: JSON.stringify({ question: "How much did I spend on hobbies?" }),
     });
     await entered;
-    expect(
-      (await upload(email, csvOf([["2026-02-01", "SHELL OIL", "-40.00"]]))).status,
-    ).toBe(200);
+    await replaceDuringQuery(email);
     release();
     const response = await pending;
-    expect(response.status).toBe(409);
+    await expectConflict(response, "20.00");
     const current = await query(email, "How much did I spend?");
     expect(current.answer).toContain("40.00");
     expect(current.answer).not.toContain("20.00");
@@ -1066,14 +1089,12 @@ describe("/api spending queries", () => {
     vi.spyOn(env.AI, "run").mockImplementation(async () => {
       throw new Error("rate limit");
     });
-    expect(
-      (
-        await upload(
-          email,
-          csvOf([["2026-01-02", "ZOOPLEX SNACKBAR", "-9.50"]]),
-        )
-      ).status,
-    ).toBe(200);
+    const initial = await upload(
+      email,
+      csvOf([["2026-01-02", "ZOOPLEX SNACKBAR", "-9.50"]]),
+    );
+    expect(initial.status).toBe(200);
+    await initial.arrayBuffer();
     let release!: () => void;
     const gate = new Promise<void>((resolve) => {
       release = resolve;
@@ -1098,12 +1119,10 @@ describe("/api spending queries", () => {
       body: JSON.stringify({ question: "How much did I spend?" }),
     });
     await entered;
-    expect(
-      (await upload(email, csvOf([["2026-02-01", "SHELL OIL", "-40.00"]]))).status,
-    ).toBe(200);
+    await replaceDuringQuery(email);
     release();
     const response = await pending;
-    expect(response.status).toBe(409);
+    await expectConflict(response, "9.50");
     const current = await query(email, "How much did I spend?");
     expect(current.answer).toContain("40.00");
     expect(current.answer).not.toContain("9.50");
@@ -1264,5 +1283,100 @@ describe("/api spending queries", () => {
     const open = await query(email, "eating out");
     expect(open.answer).toContain("100.00");
     expect(open.answer).toContain("5.35");
+  });
+
+  it("rejects an invalid date before categorizing an unknown merchant", async () => {
+    const email = "bad-date-unknown@example.com";
+    const run = vi.spyOn(env.AI, "run").mockImplementation(async () => {
+      throw new Error("upload categorization fails");
+    });
+    const uploaded = await upload(
+      email,
+      csvOf([
+        ["2026-01-15", "CHIPOTLE", "-10.00"],
+        ["2026-03-04", "ZOOPLEX SNACKBAR", "-5.35"],
+      ]),
+    );
+    expect(uploaded.status).toBe(200);
+    expect(run).toHaveBeenCalled();
+    const stub = env.LEDGER.get(env.LEDGER.idFromName(ledgerName(email)));
+    const categoryOf = async (description: string) =>
+      (await stub.load()).records.find((row) => row.payload.Description === description)?.category;
+    expect(await categoryOf("ZOOPLEX SNACKBAR")).toBe("unknown");
+    expect(await categoryOf("CHIPOTLE")).toBe("dining");
+    run.mockClear();
+    run.mockImplementation(async () => ({
+      response: JSON.stringify({
+        items: [{ merchant: "ZOOPLEX SNACKBAR", category: "dining" }],
+      }),
+    }));
+    for (const question of [
+      "eating out on 2026-02-31",
+      "eating out from 2026-02-31 to 2026-03-04",
+      "eating out on 2025-02-29",
+    ]) {
+      const result = await queryRaw(email, question);
+      expect(result.status, question).toBe(400);
+      expect(result.body.error).toMatch(/not a valid calendar date/);
+      expect(result.body.answer).toBeUndefined();
+    }
+    const reversed = await queryRaw(email, "eating out from 2026-03-04 to 2026-03-01");
+    expect(reversed.status).toBe(400);
+    expect(reversed.body.error).toMatch(/start date is after the end date/);
+    expect(run).not.toHaveBeenCalled();
+    expect(await categoryOf("ZOOPLEX SNACKBAR")).toBe("unknown");
+    expect(await categoryOf("CHIPOTLE")).toBe("dining");
+
+    const exact = await query(email, "eating out on 2026-03-04");
+    expect(run).toHaveBeenCalled();
+    expect(exact.answer).toContain("ZOOPLEX");
+    expect(exact.answer).toContain("5.35");
+    expect(exact.answer).not.toContain("10.00");
+    expect(await categoryOf("ZOOPLEX SNACKBAR")).toBe("dining");
+  });
+
+  it("rejects an invalid date before backfilling a legacy null category", async () => {
+    const email = "bad-date-legacy@example.com";
+    const stub = env.LEDGER.get(env.LEDGER.idFromName(ledgerName(email)));
+    await runInDurableObject(stub, async (_instance, state) => {
+      state.storage.sql.exec("DROP TABLE IF EXISTS transactions");
+      state.storage.sql.exec(
+        "CREATE TABLE transactions (id INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT NOT NULL)",
+      );
+      for (const row of [
+        { Date: "2026-03-04", Description: "ZOOPLEX SNACKBAR", Amount: "-5.35" },
+        { Date: "2026-01-15", Description: "CHIPOTLE", Amount: "-10.00" },
+      ]) {
+        state.storage.sql.exec("INSERT INTO transactions (payload) VALUES (?)", JSON.stringify(row));
+      }
+    });
+    await stub.migrate();
+    expect((await stub.load()).records.every((row) => row.category === null)).toBe(true);
+    const run = vi.spyOn(env.AI, "run").mockImplementation(async () => ({
+      response: JSON.stringify({
+        items: [{ merchant: "ZOOPLEX SNACKBAR", category: "dining" }],
+      }),
+    }));
+    const result = await queryRaw(email, "eating out on 2026-02-31");
+    expect(result.status).toBe(400);
+    expect(result.body.error).toMatch(/not a valid calendar date/);
+    expect(run).not.toHaveBeenCalled();
+    const held = await stub.load();
+    expect(held.records.find((row) => row.payload.Description === "ZOOPLEX SNACKBAR")?.category).toBe(
+      null,
+    );
+    expect(held.records.find((row) => row.payload.Description === "CHIPOTLE")?.category).toBe(null);
+
+    const exact = await query(email, "eating out on 2026-03-04");
+    expect(run).toHaveBeenCalled();
+    expect(exact.answer).toContain("5.35");
+    expect(exact.answer).not.toContain("10.00");
+    const filled = await stub.load();
+    expect(filled.records.find((row) => row.payload.Description === "ZOOPLEX SNACKBAR")?.category).toBe(
+      "dining",
+    );
+    expect(filled.records.find((row) => row.payload.Description === "CHIPOTLE")?.category).toBe(
+      "dining",
+    );
   });
 });

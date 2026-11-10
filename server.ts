@@ -575,6 +575,19 @@ app.post(
 app.post("/api/query", async (req: Request, res: Response): Promise<void> => {
   try {
     const question = String(req.body?.question ?? "").trim();
+    // Reject a bad calendar token before hydrate. Hydrate classifies unknown
+    // merchants and would call the model even though the question cannot run.
+    if (question) {
+      const preview = interpretQuestion(question, null, []);
+      if (preview?.invalidCalendarDate) {
+        res.status(400).json({ error: "That is not a valid calendar date." });
+        return;
+      }
+      if (preview?.invalidDateRange) {
+        res.status(400).json({ error: "The start date is after the end date." });
+        return;
+      }
+    }
     const hydrated = await hydrate(res.locals.access);
     if (!hydrated.records.length) {
       res.status(400).json({ error: "Please upload a transaction report first." });
