@@ -35,14 +35,24 @@ async function upload(csv: string): Promise<{ status: number; body: { uncategori
 }
 
 async function ask(question: string): Promise<string> {
+  const result = await askRaw(question);
+  assert.equal(result.status, 200);
+  return result.body.answer ?? "";
+}
+
+async function askRaw(question: string): Promise<{
+  status: number;
+  body: { answer?: string; error?: string };
+}> {
   const response = await fetch(`${base}/api/query`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ question }),
   });
-  assert.equal(response.status, 200);
-  const body = (await response.json()) as { answer?: string };
-  return body.answer ?? "";
+  return {
+    status: response.status,
+    body: (await response.json()) as { answer?: string; error?: string },
+  };
 }
 
 function csv(rows: string[]): string {
@@ -357,4 +367,57 @@ test("node mode keeps Chipotle in a pending merchant name", async () => {
   assert.match(spent, /Pending/);
   assert.match(spent, /Total: \$62\.00/);
   assert.match(spent, /1 zero-amount row/);
+});
+
+test("node mode rejects an explicit ISO date that is not a real day", async () => {
+  assert.equal(
+    (
+      await upload(
+        csv([
+          "2026-01-15,CHIPOTLE,-100.00",
+          "2026-02-10,CHIPOTLE,-7.11",
+          "2026-03-01,CHIPOTLE,-1.00",
+          "2026-03-04,CHIPOTLE,-5.35",
+          "2024-02-29,CHIPOTLE,-3.00",
+        ]),
+      )
+    ).status,
+    200,
+  );
+  let modelCalls = 0;
+  setCompleteChatForTests(async () => {
+    modelCalls += 1;
+    throw new Error("model must not repair an invalid date");
+  });
+  for (const question of [
+    "eating out on 2026-02-31",
+    "eating out from 2026-02-31 to 2026-03-04",
+    "eating out from 2026-03-01 to 2026-02-31",
+    "eating out from 2026-02-31 to 2026-13-01",
+    "eating out on 2025-02-29",
+    "eating out on 2026-13-01",
+  ]) {
+    const result = await askRaw(question);
+    assert.equal(result.status, 400, question);
+    assert.match(result.body.error ?? "", /not a valid calendar date/);
+    assert.equal(result.body.answer, undefined);
+  }
+  const reversed = await askRaw("eating out from 2026-03-04 to 2026-03-01");
+  assert.equal(reversed.status, 400);
+  assert.match(reversed.body.error ?? "", /start date is after the end date/);
+  assert.equal(modelCalls, 0);
+  setCompleteChatForTests(null);
+
+  const exact = await ask("eating out on 2026-03-04");
+  assert.match(exact, /Total: \$5\.35/);
+  assert.doesNotMatch(exact, /100\.00/);
+  const range = await ask("eating out from 2026-03-01 to 2026-03-04");
+  assert.match(range, /Total: \$6\.35/);
+  assert.doesNotMatch(range, /100\.00/);
+  const leap = await ask("eating out on 2024-02-29");
+  assert.match(leap, /Total: \$3\.00/);
+  assert.doesNotMatch(leap, /100\.00/);
+  const open = await ask("eating out");
+  assert.match(open, /100\.00/);
+  assert.match(open, /5\.35/);
 });

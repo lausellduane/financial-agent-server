@@ -406,6 +406,7 @@ function statementConflict(res: Response): void {
 type IntentResolution = {
   intent: QueryIntent | null;
   invalidDateRange: boolean;
+  invalidCalendarDate: boolean;
 };
 
 async function resolveIntent(
@@ -414,11 +415,18 @@ async function resolveIntent(
   known: string[],
 ): Promise<IntentResolution> {
   const interpreted = interpretQuestion(question, previous, known);
+  if (interpreted?.invalidCalendarDate) {
+    return { intent: null, invalidDateRange: false, invalidCalendarDate: true };
+  }
   if (interpreted?.invalidDateRange) {
-    return { intent: null, invalidDateRange: true };
+    return { intent: null, invalidDateRange: true, invalidCalendarDate: false };
   }
   if (interpreted?.confident) {
-    return { intent: interpreted.intent, invalidDateRange: false };
+    return {
+      intent: interpreted.intent,
+      invalidDateRange: false,
+      invalidCalendarDate: false,
+    };
   }
 
   let modelIntent: QueryIntent | null = null;
@@ -438,16 +446,22 @@ async function resolveIntent(
   ) {
     modelIntent = null;
   }
-  if (modelIntent) return { intent: modelIntent, invalidDateRange: false };
+  if (modelIntent) {
+    return { intent: modelIntent, invalidDateRange: false, invalidCalendarDate: false };
+  }
   if (
     interpreted &&
     (interpreted.intent.categories.length > 0 ||
       interpreted.intent.merchants.length > 0 ||
       interpreted.intent.excludeMerchants.length > 0)
   ) {
-    return { intent: interpreted.intent, invalidDateRange: false };
+    return {
+      intent: interpreted.intent,
+      invalidDateRange: false,
+      invalidCalendarDate: false,
+    };
   }
-  return { intent: null, invalidDateRange: false };
+  return { intent: null, invalidDateRange: false, invalidCalendarDate: false };
 }
 
 async function reportFor(
@@ -582,6 +596,10 @@ app.post("/api/query", async (req: Request, res: Response): Promise<void> => {
     const resolved = await resolveIntent(question, previous, known);
     if (!(await isCurrent(res.locals.access, hydrated.version))) {
       statementConflict(res);
+      return;
+    }
+    if (resolved.invalidCalendarDate) {
+      res.status(400).json({ error: "That is not a valid calendar date." });
       return;
     }
     if (resolved.invalidDateRange) {

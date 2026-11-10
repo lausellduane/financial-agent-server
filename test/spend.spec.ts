@@ -450,6 +450,25 @@ describe("intent validation and aggregation", () => {
       [],
     );
     expect(parsed?.invalidDateRange).toBe(true);
+    expect(parsed?.invalidCalendarDate).toBe(false);
+  });
+
+  it("rejects an ISO token that is not a real calendar day", () => {
+    for (const question of [
+      "eating out on 2026-02-31",
+      "eating out from 2026-02-31 to 2026-03-04",
+      "eating out from 2026-03-01 to 2026-02-31",
+      "eating out on 2025-02-29",
+      "eating out on 2026-13-01",
+    ]) {
+      const parsed = interpretQuestion(question, null, []);
+      expect(parsed?.invalidCalendarDate).toBe(true);
+      expect(parsed?.intent.dateFrom).toBeNull();
+    }
+    const leap = interpretQuestion("eating out on 2024-02-29", null, []);
+    expect(leap?.invalidCalendarDate).toBe(false);
+    expect(leap?.intent.dateFrom).toBe("2024-02-29");
+    expect(leap?.intent.dateTo).toBe("2024-02-29");
   });
 
   it("asks the model for intent JSON and not for ledger rows", () => {
@@ -1194,5 +1213,56 @@ describe("/api spending queries", () => {
     expect(spent.answer).toContain("50.00");
     expect(spent.answer).toContain("Total: $62.00");
     expect(spent.answer).toContain("1 zero-amount row");
+  });
+
+  it("rejects an explicit ISO date that is not a real day", async () => {
+    const email = "bad-date@example.com";
+    expect(
+      (
+        await upload(
+          email,
+          csvOf([
+            ["2026-01-15", "CHIPOTLE", "-100.00"],
+            ["2026-02-10", "CHIPOTLE", "-7.11"],
+            ["2026-03-01", "CHIPOTLE", "-1.00"],
+            ["2026-03-04", "CHIPOTLE", "-5.35"],
+            ["2024-02-29", "CHIPOTLE", "-3.00"],
+          ]),
+        )
+      ).status,
+    ).toBe(200);
+    const run = vi.spyOn(env.AI, "run").mockImplementation(async () => {
+      throw new Error("model must not repair an invalid date");
+    });
+    for (const question of [
+      "eating out on 2026-02-31",
+      "eating out from 2026-02-31 to 2026-03-04",
+      "eating out from 2026-03-01 to 2026-02-31",
+      "eating out from 2026-02-31 to 2026-13-01",
+      "eating out on 2025-02-29",
+      "eating out on 2026-13-01",
+    ]) {
+      const result = await queryRaw(email, question);
+      expect(result.status, question).toBe(400);
+      expect(result.body.error).toMatch(/not a valid calendar date/);
+      expect(result.body.answer).toBeUndefined();
+    }
+    const reversed = await queryRaw(email, "eating out from 2026-03-04 to 2026-03-01");
+    expect(reversed.status).toBe(400);
+    expect(reversed.body.error).toMatch(/start date is after the end date/);
+    expect(run).not.toHaveBeenCalled();
+
+    const exact = await query(email, "eating out on 2026-03-04");
+    expect(exact.answer).toContain("Total: $5.35");
+    expect(exact.answer).not.toContain("100.00");
+    const range = await query(email, "eating out from 2026-03-01 to 2026-03-04");
+    expect(range.answer).toContain("Total: $6.35");
+    expect(range.answer).not.toContain("100.00");
+    const leap = await query(email, "eating out on 2024-02-29");
+    expect(leap.answer).toContain("Total: $3.00");
+    expect(leap.answer).not.toContain("100.00");
+    const open = await query(email, "eating out");
+    expect(open.answer).toContain("100.00");
+    expect(open.answer).toContain("5.35");
   });
 });

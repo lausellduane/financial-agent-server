@@ -15,7 +15,7 @@
 
 The companion UI (`lausellduane/financial-agent-ui`, Expo 57 / React Native) posts to the upload and query routes and reads `count` from the upload response and `answer` or `error` from the query response. `App.tsx` hardcodes `http://localhost:4000` on web and iOS, and `http://10.0.2.2:4000` on the Android emulator. It sends no auth header and no session id. The web build needs CORS. Native builds do not.
 
-Each row is categorized on upload. Merchant rules run first. Only unknown merchant names go to the model, in batches of 40. A model failure stores `unknown` and the next query tries again. Rows saved before categories existed are backfilled from the rules on the next read, so they are not treated as `other`. A refund stays in its spending category and reduces the net total. "What was my highest charge?" is the largest money-out, so a deposit does not win. Named questions are parsed in code. Anything else asks the model for intent JSON only. The model does not see the ledger. The last intent is kept until the next upload replaces the statement. Responses are one JSON body. The server does not stream.
+Each row is categorized on upload. Merchant rules run first. Only unknown merchant names go to the model, in batches of 40. A model failure stores `unknown` and the next query tries again. Rows saved before categories existed are backfilled from the rules on the next read, so they are not treated as `other`. A refund stays in its spending category and reduces the net total. "What was my highest charge?" is the largest money-out, so a deposit does not win. Named questions are parsed in code. An explicit `YYYY-MM-DD` that is not a real calendar day, or a range whose start is after its end, is HTTP 400 and is not handed to the model. Anything else asks the model for intent JSON only. The model does not see the ledger. The last intent is kept until the next upload replaces the statement. Responses are one JSON body. The server does not stream.
 
 ## Model
 
@@ -67,7 +67,7 @@ Two gaps found while booting the app:
 | `ollama` 0.6.3 | Used only when `LLM_PROVIDER` is `ollama`. The import is `ollama/browser` (global `fetch`). The Node entry of the package reads image files with `node:fs` and is not used. |
 | `dotenv` | A dependency, and not imported. Vars and secrets arrive on `process.env`. |
 
-The dry-run bundle is **1750.15 KiB uncompressed** (gzip 401.32 KiB). The limit is **64 MiB uncompressed** ([Limits](https://developers.cloudflare.com/workers/platform/limits/)). Wrangler 4.157.0 produced that bundle with `npm run check:worker`.
+The dry-run bundle is **1750.92 KiB uncompressed** (gzip 401.41 KiB). The limit is **64 MiB uncompressed** ([Limits](https://developers.cloudflare.com/workers/platform/limits/)). Wrangler 4.157.0 produced that bundle with `npm run check:worker`.
 
 ## Secrets, variables, and storage
 
@@ -203,7 +203,7 @@ npm start              # Node, http://localhost:4000
 `npm run check:worker` with Wrangler 4.157.0:
 
 ```text
-Total Upload: 1750.15 KiB / gzip: 401.32 KiB
+Total Upload: 1750.92 KiB / gzip: 401.41 KiB
 env.LEDGER (Ledger)     Durable Object
 env.AI                  AI
 env.LLM_PROVIDER        workers-ai

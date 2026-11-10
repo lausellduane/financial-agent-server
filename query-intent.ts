@@ -39,6 +39,7 @@ export type Interpreted = {
   followUp: boolean;
   unrecognized: boolean;
   invalidDateRange: boolean;
+  invalidCalendarDate: boolean;
 };
 
 const OPS = new Set<QueryOp>(["sum", "list", "max", "count"]);
@@ -438,20 +439,31 @@ function dateRange(question: string): {
   from: string | null;
   to: string | null;
   invalid: boolean;
+  calendar: boolean;
 } {
-  const isos = [...question.matchAll(/\b(\d{4}-\d{2}-\d{2})\b/g)]
-    .map((match) => match[1] ?? "")
-    .filter((value) => isIsoDate(value));
-  if (isos.length >= 2) {
-    const from = isos[0] ?? null;
-    const to = isos[isos.length - 1] ?? null;
-    if (from && to && from > to) return { from: null, to: null, invalid: true };
-    return { from, to, invalid: false };
+  const tokens = [...question.matchAll(/\b(\d{4}-\d{2}-\d{2})\b/g)].map(
+    (match) => match[1] ?? "",
+  );
+  // An explicit ISO token that is not a real day must not be dropped. Dropping
+  // it widens a single date to the whole ledger, or narrows a range to the
+  // one endpoint that happened to be valid.
+  if (tokens.some((token) => !isIsoDate(token))) {
+    return { from: null, to: null, invalid: true, calendar: true };
   }
-  if (isos.length === 1) return { from: isos[0] ?? null, to: isos[0] ?? null, invalid: false };
+  if (tokens.length >= 2) {
+    const from = tokens[0] ?? null;
+    const to = tokens[tokens.length - 1] ?? null;
+    if (from && to && from > to) {
+      return { from: null, to: null, invalid: true, calendar: false };
+    }
+    return { from, to, invalid: false, calendar: false };
+  }
+  if (tokens.length === 1) {
+    return { from: tokens[0] ?? null, to: tokens[0] ?? null, invalid: false, calendar: false };
+  }
   const month = monthRange(question);
-  if (month) return { from: month.from, to: month.to, invalid: false };
-  return { from: null, to: null, invalid: false };
+  if (month) return { from: month.from, to: month.to, invalid: false, calendar: false };
+  return { from: null, to: null, invalid: false, calendar: false };
 }
 
 function detectOp(question: string, hasFilter: boolean): QueryOp | null {
@@ -511,7 +523,8 @@ export function interpretQuestion(
       confident: false,
       followUp: false,
       unrecognized: false,
-      invalidDateRange: true,
+      invalidDateRange: !dates.calendar,
+      invalidCalendarDate: dates.calendar,
     };
   }
 
@@ -531,6 +544,7 @@ export function interpretQuestion(
       followUp: true,
       unrecognized: false,
       invalidDateRange: false,
+      invalidCalendarDate: false,
     };
   }
 
@@ -589,6 +603,7 @@ export function interpretQuestion(
     followUp: false,
     unrecognized,
     invalidDateRange: false,
+    invalidCalendarDate: false,
   };
 }
 
