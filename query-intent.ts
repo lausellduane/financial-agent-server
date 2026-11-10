@@ -89,7 +89,14 @@ const CATEGORY_PATTERNS: { category: Category; pattern: RegExp }[] = [
       /\b(eat(?:ing)? out|dining|restaurants?|fast food|take-?out|takeout|food delivery)\b/i,
   },
   { category: "groceries", pattern: /\b(grocer(?:y|ies)|supermarket)\b/i },
-  { category: "shopping", pattern: /\b(shopping|clothes|clothing|retail)\b/i },
+  {
+    category: "shopping",
+    pattern: /\b(shopping|clothes|clothing|retail|general merchandise|merchandise)\b/i,
+  },
+  {
+    category: "entertainment/events",
+    pattern: /\b(entertainment|events?|tickets|concerts?)\b/i,
+  },
   {
     category: "subscriptions",
     pattern: /\b(subscriptions?|streaming|memberships?)\b/i,
@@ -97,7 +104,7 @@ const CATEGORY_PATTERNS: { category: Category; pattern: RegExp }[] = [
   {
     category: "utilities/telecom",
     pattern:
-      /\b(utilities|utility|electric|telecom|internet|natural gas|gas bill)\b/i,
+      /\b(utilities|utility|electric|telecom|internet|natural gas|gas bill|bills|water bill|sewer bill)\b/i,
   },
   {
     category: "healthcare",
@@ -117,6 +124,10 @@ const CATEGORY_PATTERNS: { category: Category; pattern: RegExp }[] = [
   {
     category: "home",
     pattern: /\b(home improvement|hardware|household|hvac)\b/i,
+  },
+  {
+    category: "housing/mortgage",
+    pattern: /\b(mortgage|mortgages|home loan|housing)\b/i,
   },
 ];
 
@@ -241,6 +252,12 @@ export function applyQuestionGuards(
   }
   if (allowExpand && transfers && !categories.includes("transfers")) {
     categories = [...categories, "transfers"];
+  }
+  // "bills" and "mortgage" are exact. Home is a store or repair, not a stand-in.
+  if (/\b(mortgage|mortgages|home loan|housing)\b/i.test(topic)) {
+    categories = ["housing/mortgage"];
+  } else if (/\bbills\b/i.test(topic)) {
+    categories = ["utilities/telecom"];
   }
   const strippedAll =
     intent.categories.length > 0 &&
@@ -633,6 +650,7 @@ op is sum, list, max, or count.
 dateFrom and dateTo are YYYY-MM-DD or null.
 combine is "or" when any category or merchant should match (gas and coffee). combine is "and" when a merchant narrows a category.
 Leave income and transfers out of categories unless the user asked for income, paychecks, deposits, transfers, PayPal, Zelle, or Venmo.
+A mortgage or housing question is housing/mortgage only. A bills question is utilities/telecom only. Do not substitute home, shopping, or another nearby category. If nothing in the list fits, return an empty categories array.
 If this refines the previous intent, keep its categories and add exclusions.
 Do not return transaction indexes, code, or rows.
 Previous intent: ${previousText}`,

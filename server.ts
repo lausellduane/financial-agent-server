@@ -138,6 +138,24 @@ function needsCategory(category: string | null): boolean {
   return category === null || category === "unknown";
 }
 
+// A merchant rule replaces a stored category that disagrees with it, including
+// one the model previously saved. "other" with no matching rule stays put.
+function recordsToResolve(records: LedgerRecord[]): LedgerRecord[] {
+  if (!records.length) return [];
+  const payloads = records.map((record) => record.payload);
+  const fields = pickDisplayFields(payloads);
+  const signed = usesSignedCents(payloads, fields.amount);
+  return records.filter((record) => {
+    const narrative = rowNarrative(record.payload, fields.description);
+    const cents = parseAmountCents(
+      fields.amount ? record.payload[fields.amount] : undefined,
+    );
+    const ruled = categorizeNarrative(narrative, cents, signed);
+    if (ruled !== "unknown") return ruled !== record.category;
+    return needsCategory(record.category);
+  });
+}
+
 async function classifyUnknown(narratives: string[]): Promise<Map<string, Category>> {
   const assigned = new Map<string, Category>();
   for (let offset = 0; offset < narratives.length; offset += CATEGORY_BATCH) {
@@ -284,7 +302,7 @@ async function hydrate(
   identity: AccessIdentity | undefined,
 ): Promise<{ records: LedgerRecord[]; version: number; unknown: number }> {
   const loaded = await readLedger(identity);
-  const pending = loaded.records.filter((record) => needsCategory(record.category));
+  const pending = recordsToResolve(loaded.records);
   if (!pending.length) {
     return {
       records: loaded.records,
