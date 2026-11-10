@@ -561,5 +561,51 @@ test("node mode separates dining, bills, subscriptions, and the mortgage payment
   assert.match(retail, /MICROSOFT STORE/);
   assert.match(retail, /PIXEL/);
   assert.doesNotMatch(retail, /NETFLIX|XBOX/);
+
+  const insured = await upload(
+    csv([
+      "2026-10-01,CARY OBGYN 919-4675941,-50.00",
+      "2026-10-02,WALGREENS,-7.65",
+      "2026-10-03,WALGREENS STORE,-7.71",
+      "2026-10-04,WALGREENS STORE,-2.03",
+      "2026-10-05,BLUE CROSS BLUE SHIELD,-438.44",
+      "2026-10-06,LOWE'S,-17.06",
+      "2026-10-07,LOWES #00677* GARNER,-38.00",
+      "2026-10-08,PEAK SEASONS HVAC PEAKSEASONSHV NC100126,-17.16",
+    ]),
+  );
+  assert.equal(insured.status, 200);
+  assert.equal(insured.body.uncategorized, 0);
+  const insurance = await ask("How much did I spent in insurance?");
+  assert.match(insurance, /Blue Cross Blue Shield/);
+  assert.match(insurance, /Total: \$438\.44/);
+  assert.doesNotMatch(insurance, /OBGYN|WALGREENS|LOWE|PEAK SEASONS/);
+  const medical = await ask("How much did I spend on medical?");
+  assert.match(medical, /OBGYN/);
+  assert.match(medical, /WALGREENS/);
+  assert.match(medical, /Total: \$67\.39/);
+  assert.doesNotMatch(medical, /Blue Cross|LOWE/);
+  const car = await ask("How about car insurance?");
+  assert.match(car, /No car insurance charges were found/);
+  assert.doesNotMatch(car, /LOWE|PEAK SEASONS|OBGYN|WALGREENS|Blue Cross|578\.05/);
+
+  assert.equal(
+    (
+      await upload(
+        csv([
+          "2026-10-01,GEICO,-90.00",
+          "2026-10-02,LOWE'S,-17.06",
+          "2026-10-03,CARY OBGYN 919-4675941,-50.00",
+          "2026-10-04,BLUE CROSS BLUE SHIELD,-438.44",
+        ]),
+      )
+    ).status,
+    200,
+  );
+  await ask("How much did I spent in insurance?");
+  const onlyCar = await ask("How about car insurance?");
+  assert.match(onlyCar, /GEICO/);
+  assert.match(onlyCar, /Total: \$90\.00/);
+  assert.doesNotMatch(onlyCar, /LOWE|OBGYN|Blue Cross/);
   setCompleteChatForTests(null);
 });

@@ -2,7 +2,11 @@ import { env, exports } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { categorizeNarrative, parseCategoryAssignments } from "../categories.ts";
+import {
+  CATEGORY_RULES_VERSION,
+  categorizeNarrative,
+  parseCategoryAssignments,
+} from "../categories.ts";
 import { LEDGER_MIGRATION } from "../ledger.ts";
 import {
   buildIntentMessages,
@@ -224,6 +228,59 @@ describe("categorizeNarrative", () => {
     const billsQuestion = interpretQuestion("How much did I spent in bills?", null, []);
     expect(billsQuestion?.confident).toBe(true);
     expect(billsQuestion?.intent.categories).toEqual(["utilities/telecom"]);
+    expect(categorizeNarrative("BLUE CROSS BLUE SHIELD", -43844, true)).toBe(
+      "insurance/health",
+    );
+    expect(categorizeNarrative("BCBS PREMIUM", -43844, true)).toBe("insurance/health");
+    expect(categorizeNarrative("WALGREENS STORE 123", -765, true)).toBe("healthcare");
+    expect(categorizeNarrative("CARY OBGYN 919-4675941", -5000, true)).toBe("healthcare");
+    expect(categorizeNarrative("CVS/PHARMACY", -500, true)).toBe("healthcare");
+    expect(categorizeNarrative("GEICO AUTO", -9000, true)).toBe("insurance/auto");
+    expect(categorizeNarrative("PROGRESSIVE INSURANCE", -11000, true)).toBe(
+      "insurance/auto",
+    );
+    expect(categorizeNarrative("PROGRESSIVE LEASING", -4000, true)).toBe("unknown");
+    expect(categorizeNarrative("STATE FARM", -12000, true)).toBe("insurance/auto");
+    const healthInsurance = interpretQuestion("How much did I spent in insurance?", null, []);
+    expect(healthInsurance?.confident).toBe(true);
+    expect(healthInsurance?.intent.categories).toEqual(["insurance/health"]);
+    const carInsurance = interpretQuestion(
+      "How about car insurance?",
+      healthInsurance?.intent ?? null,
+      [],
+    );
+    expect(carInsurance?.followUp).toBe(false);
+    expect(carInsurance?.intent.categories).toEqual(["insurance/auto"]);
+    expect(formatAnswer([], carInsurance!.intent)).toBe(
+      "No car insurance charges were found.",
+    );
+    expect(categorizeNarrative("WELLS FARGO BANK MORTGAGE", -150000, true)).toBe(
+      "housing/mortgage",
+    );
+    expect(categorizeNarrative("NAVY FCU MTG PAYMENT", -90000, true)).toBe(
+      "housing/mortgage",
+    );
+    expect(categorizeNarrative("SHELL FEDERAL CREDIT UNION", -7500, true)).toBe("transfers");
+    expect(categorizeNarrative("MTG ARENA", -2000, true)).toBe("unknown");
+    expect(categorizeNarrative("LOTTERY TICKETS", -1000, true)).toBe("unknown");
+    expect(categorizeNarrative("FOUR SEASONS HVAC", -20000, true)).toBe("home");
+    expect(categorizeNarrative("KANSAS CITY WATER STREET", -1500, true)).toBe("unknown");
+    expect(categorizeNarrative("CITY WATER DEPT", -3600, true)).toBe("utilities/telecom");
+    expect(categorizeNarrative("MICROSOFT*STORE", -5000, true)).toBe("shopping");
+    expect(categorizeNarrative("MSBILL.INFO XBOX", -1699, true)).toBe("subscriptions");
+    expect(categorizeNarrative("SQ *SHAKE SHACK MEMBER NIGHT", -1200, true)).toBe("dining");
+    const diningAndBills = interpretQuestion("dining and bills", null, []);
+    expect(diningAndBills?.intent.categories).toEqual(["dining", "utilities/telecom"]);
+    expect(
+      intentFromModel(
+        JSON.stringify({ categories: ["dining", "home"], op: "sum" }),
+        "dining and bills",
+      )?.categories,
+    ).toEqual(["dining", "utilities/telecom"]);
+    expect(
+      interpretQuestion("How about car insurance?", diningAndBills?.intent ?? null, [])
+        ?.intent.categories,
+    ).toEqual(["insurance/auto"]);
     expect(
       intentFromModel(
         JSON.stringify({ categories: ["home"], op: "sum" }),
@@ -364,9 +421,11 @@ describe("intent validation and aggregation", () => {
       "How much I spent eating out?",
     );
     expect(onlyIncome?.scope).toBe("filtered");
-    expect(onlyIncome?.categories).toEqual([]);
+    expect(onlyIncome?.categories).toEqual(["dining"]);
     const txs = screenshotViews();
-    expect(selectTransactions(txs, onlyIncome as QueryIntent)).toEqual([]);
+    const picked = selectTransactions(txs, onlyIncome as QueryIntent);
+    expect(picked.some((tx) => tx.narrative.includes("CHIPOTLE"))).toBe(true);
+    expect(picked.some((tx) => tx.narrative.includes("PAYROLL"))).toBe(false);
   });
 
   it("sums only restaurants for the eating-out screenshot", () => {
@@ -621,21 +680,20 @@ async function query(email: string, question: string): Promise<{ answer?: string
 
 async function expectConflict(response: Response, absent: string): Promise<void> {
   expect(response.status).toBe(409);
-  let body: { error?: string; answer?: string } | undefined;
-  let refusal = "";
   try {
-    body = (await response.json()) as { error?: string; answer?: string };
-  } catch (error) {
-    refusal = error instanceof Error ? error.message : String(error);
-  }
-  if (refusal) {
-    expect(refusal).toMatch(/different request/);
+    const body = (await response.json()) as { error?: string; answer?: string };
+    expect(body.error).toMatch(/statement changed/i);
+    expect(body.error).toMatch(/Ask again/);
+    expect(body.answer).toBeUndefined();
+    expect(JSON.stringify(body)).not.toContain(absent);
     return;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    // Replacing the statement is I/O in another context, so workerd will not
+    // hand this body to the test. Require that refusal, then drop the stream.
+    expect(message).toMatch(/different request/);
   }
-  expect(body?.error).toMatch(/statement changed/i);
-  expect(body?.error).toMatch(/Ask again/);
-  expect(body?.answer).toBeUndefined();
-  expect(JSON.stringify(body)).not.toContain(absent);
+  await response.body?.cancel().catch(() => undefined);
 }
 
 async function replaceDuringQuery(email: string): Promise<void> {
@@ -1099,6 +1157,7 @@ describe("/api spending queries", () => {
     vi.spyOn(env.AI, "run").mockImplementation(async () => {
       markEntered();
       await gate;
+      await replaceDuringQuery(email);
       return {
         response: JSON.stringify({
           categories: ["shopping"],
@@ -1118,7 +1177,6 @@ describe("/api spending queries", () => {
       body: JSON.stringify({ question: "How much did I spend on hobbies?" }),
     });
     await entered;
-    await replaceDuringQuery(email);
     release();
     const response = await pending;
     await expectConflict(response, "20.00");
@@ -1143,6 +1201,7 @@ describe("/api spending queries", () => {
     vi.spyOn(env.AI, "run").mockImplementation(async () => {
       markEntered();
       await gate;
+      await replaceDuringQuery(email);
       throw new Error("model down");
     });
     const token = await tokenFor(email);
@@ -1152,7 +1211,6 @@ describe("/api spending queries", () => {
       body: JSON.stringify({ question: "How much did I spend on hobbies?" }),
     });
     await entered;
-    await replaceDuringQuery(email);
     release();
     const response = await pending;
     await expectConflict(response, "20.00");
@@ -1183,6 +1241,7 @@ describe("/api spending queries", () => {
     vi.spyOn(env.AI, "run").mockImplementation(async () => {
       markEntered();
       await gate;
+      await replaceDuringQuery(email);
       return {
         response: JSON.stringify({
           items: [{ merchant: "ZOOPLEX SNACKBAR", category: "dining" }],
@@ -1196,7 +1255,6 @@ describe("/api spending queries", () => {
       body: JSON.stringify({ question: "How much did I spend?" }),
     });
     await entered;
-    await replaceDuringQuery(email);
     release();
     const response = await pending;
     await expectConflict(response, "9.50");
@@ -1603,5 +1661,122 @@ describe("/api spending queries", () => {
     expect(shopping.answer).toContain("PIXEL");
     expect(shopping.answer).not.toContain("NETFLIX");
     expect(shopping.answer).not.toContain("XBOX");
+  });
+
+  it("keeps insurance, medical care, and a car-insurance follow-up apart", async () => {
+    const email = "insurance@example.com";
+    const run = vi.spyOn(env.AI, "run").mockImplementation(async () => {
+      throw new Error("rules cover these merchants");
+    });
+    const rows: Array<[string, string, string]> = [
+      ["2026-10-01", "CARY OBGYN 919-4675941", "-50.00"],
+      ["2026-10-02", "WALGREENS", "-7.65"],
+      ["2026-10-03", "WALGREENS STORE", "-7.71"],
+      ["2026-10-04", "WALGREENS STORE", "-2.03"],
+      ["2026-10-05", "BLUE CROSS BLUE SHIELD", "-438.44"],
+      ["2026-10-06", "LOWE'S", "-17.06"],
+      ["2026-10-07", "LOWES #00677* GARNER", "-38.00"],
+      ["2026-10-08", "PEAK SEASONS HVAC PEAKSEASONSHV NC100126", "-17.16"],
+    ];
+    expect((await upload(email, csvOf(rows))).status).toBe(200);
+    expect(run).not.toHaveBeenCalled();
+    const stub = env.LEDGER.get(env.LEDGER.idFromName(ledgerName(email)));
+    await stub.replace(
+      rows.map(([date, description, amount]) => ({
+        payload: { Date: date, Description: description, Amount: amount },
+        category: "healthcare",
+      })),
+      { startDate: "2026-10-01", endDate: "2026-10-08" },
+    );
+
+    const insurance = await query(email, "How much did I spent in insurance?");
+    expect(run).not.toHaveBeenCalled();
+    expect(insurance.answer).toContain("Blue Cross Blue Shield");
+    expect(insurance.answer).toContain("Total: $438.44");
+    expect(insurance.answer).not.toContain("OBGYN");
+    expect(insurance.answer).not.toContain("WALGREENS");
+    expect(insurance.answer).not.toContain("LOWE");
+    expect(insurance.answer).not.toContain("PEAK SEASONS");
+
+    const medical = await query(email, "How much did I spend on medical?");
+    expect(medical.answer).toContain("OBGYN");
+    expect(medical.answer).toContain("WALGREENS");
+    expect(medical.answer).toContain("Total: $67.39");
+    expect(medical.answer).not.toContain("Blue Cross");
+    expect(medical.answer).not.toContain("LOWE");
+
+    const car = await query(email, "How about car insurance?");
+    expect(car.answer).toBe("No car insurance charges were found.");
+    expect(car.answer).not.toContain("LOWE");
+    expect(car.answer).not.toContain("PEAK SEASONS");
+    expect(car.answer).not.toContain("OBGYN");
+    expect(car.answer).not.toContain("WALGREENS");
+    expect(car.answer).not.toContain("Blue Cross");
+    expect(car.answer).not.toContain("578.05");
+
+    const withAuto = "auto-insurance@example.com";
+    expect(
+      (
+        await upload(
+          withAuto,
+          csvOf([
+            ["2026-10-01", "GEICO", "-90.00"],
+            ["2026-10-02", "LOWE'S", "-17.06"],
+            ["2026-10-03", "CARY OBGYN 919-4675941", "-50.00"],
+            ["2026-10-04", "BLUE CROSS BLUE SHIELD", "-438.44"],
+          ]),
+        )
+      ).status,
+    ).toBe(200);
+    await query(withAuto, "How much did I spent in insurance?");
+    const onlyCar = await query(withAuto, "How about car insurance?");
+    expect(onlyCar.answer).toContain("GEICO");
+    expect(onlyCar.answer).toContain("Total: $90.00");
+    expect(onlyCar.answer).not.toContain("LOWE");
+    expect(onlyCar.answer).not.toContain("OBGYN");
+    expect(onlyCar.answer).not.toContain("Blue Cross");
+  });
+
+  it("keeps a signed credit as income and rechecks a stale ledger once", async () => {
+    const email = "signed-credit@example.com";
+    vi.spyOn(env.AI, "run").mockImplementation(async () => {
+      throw new Error("rules cover the credit");
+    });
+    const stub = env.LEDGER.get(env.LEDGER.idFromName(ledgerName(email)));
+    await stub.replace(
+      [
+        {
+          payload: { Date: "2026-10-01", Description: "CHIPOTLE", Amount: "-10.00" },
+          category: "dining",
+        },
+        {
+          payload: { Date: "2026-10-02", Description: "MYSTERY CREDIT 42", Amount: "5.00" },
+          category: "dining",
+        },
+      ],
+      { startDate: "2026-10-01", endDate: "2026-10-02" },
+    );
+    const spent = await query(email, "How much did I spend?");
+    expect(spent.answer).toContain("CHIPOTLE");
+    expect(spent.answer).toContain("Total: $10.00");
+    expect(spent.answer).not.toContain("5.00");
+    const once = await stub.load();
+    expect(
+      once.records.find((row) => row.payload.Description === "MYSTERY CREDIT 42")?.category,
+    ).toBe("income");
+    const again = await query(email, "How much did I spend?");
+    expect(again.answer).toContain("Total: $10.00");
+    const twice = await stub.load();
+    expect(
+      twice.records.find((row) => row.payload.Description === "MYSTERY CREDIT 42")?.category,
+    ).toBe("income");
+    const stamp = await runInDurableObject(stub, async (_instance, state) => {
+      return state.storage.sql
+        .exec<{ value: string }>(
+          "SELECT value FROM ledger_meta WHERE key = 'category_rules_version'",
+        )
+        .toArray()[0]?.value;
+    });
+    expect(stamp).toBe(CATEGORY_RULES_VERSION);
   });
 });

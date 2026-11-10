@@ -10,6 +10,8 @@ export const CATEGORIES = [
   "subscriptions",
   "utilities/telecom",
   "healthcare",
+  "insurance/health",
+  "insurance/auto",
   "transfers",
   "income",
   "cloud/software",
@@ -19,6 +21,9 @@ export const CATEGORIES = [
 ] as const;
 
 export type Category = (typeof CATEGORIES)[number];
+
+// Bump this when merchant rules change so a stored ledger is rechecked once.
+export const CATEGORY_RULES_VERSION = "9";
 
 export function isCategory(value: string): value is Category {
   return (CATEGORIES as readonly string[]).includes(value);
@@ -315,6 +320,16 @@ function wordsOf(value: string): string[] {
 // Whole tokens only. "MOBIL" must not match "MOBILE", and "SHELL" must not
 // match "SHELLFISH". Punctuation still splits tokens, so "CHICK-FIL" matches
 // "CHICK-FIL-A" and "LOWE'S" matches "LOWE'S".
+const boundaryByToken = new Map<string, RegExp>();
+
+function tokenBoundary(needle: string): RegExp {
+  const cached = boundaryByToken.get(needle);
+  if (cached) return cached;
+  const compiled = new RegExp(`(^|[^A-Z0-9])${escapeReg(needle)}([^A-Z0-9]|$)`);
+  boundaryByToken.set(needle, compiled);
+  return compiled;
+}
+
 export function tokenIn(
   text: string,
   token: string,
@@ -323,10 +338,7 @@ export function tokenIn(
   const hay = text.toUpperCase();
   const needle = token.toUpperCase().trim();
   if (!needle) return false;
-  const boundary = new RegExp(
-    `(^|[^A-Z0-9])${escapeReg(needle)}([^A-Z0-9]|$)`,
-  );
-  if (boundary.test(hay)) return true;
+  if (tokenBoundary(needle).test(hay)) return true;
   if (boundaryOnly) return false;
   const needleWords = wordsOf(needle);
   const hayWords = wordsOf(hay);
@@ -399,15 +411,11 @@ function isEventTicket(text: string): boolean {
   if (/\b(PARKING|CITATION|CITATIONS|TOLL|TOLLS|SPEEDING|TRAFFIC)\b/.test(text)) {
     return false;
   }
-  if (
+  return (
     /\b(ETIX|TICKETMASTER|TICKET\s+MASTER|STUBHUB|STUB\s+HUB|EVENTBRITE|SEATGEEK|SEAT\s+GEEK|VIVID\s+SEATS|TICKPICK|FANDANGO|LIVENATION|LIVE\s+NATION|TICKETWEB|TODAYTIX)\b/.test(
       text,
-    ) ||
-    /(^|[^A-Z0-9])AXS([^A-Z0-9]|$)/.test(text)
-  ) {
-    return true;
-  }
-  return /\bTICKETS\b/.test(text);
+    ) || /(^|[^A-Z0-9])AXS([^A-Z0-9]|$)/.test(text)
+  );
 }
 
 // Square restaurants stay dining. A Square charge that says it is a
@@ -416,7 +424,9 @@ function isSquareMembership(text: string): boolean {
   const square =
     /(^|[^A-Z0-9])SQ([^A-Z0-9]|$)/.test(text) || text.includes("GOSQ");
   if (!square) return false;
-  return /\b(MEMBERSHIPS?|MEMBERS?|DUES|SUBSCRIPTIONS?|RECURRING|PLAY)\b/.test(text);
+  if (/\b(MEMBERSHIP|DUES|SUBSCRIPTION|RECURRING)\b/.test(text)) return true;
+  // "PLAY" alone is too wide. Cub House's descriptor is the play-space case.
+  return /\bPLAY\b/.test(text) && (text.includes("GOSQ") || /\bCUB\b/.test(text));
 }
 
 function isMaintenancePlan(text: string): boolean {
@@ -424,8 +434,8 @@ function isMaintenancePlan(text: string): boolean {
     return true;
   }
   if (/\b(MAINTENANCE|PROTECTION)\s+(PLAN|AGREEMENT|CONTRACT)\b/.test(text)) return true;
-  // A seasonal HVAC membership is a plan. A one-time HVAC repair stays home.
-  return /\bHVAC\b/.test(text) && /\b(PLAN|AGREEMENT|MEMBERSHIP|SEASONS)\b/.test(text);
+  // A named maintenance plan. "FOUR SEASONS HVAC" is still a repair.
+  return /\bHVAC\b/.test(text) && /\b(PLAN|AGREEMENT|MEMBERSHIP)\b/.test(text);
 }
 
 function isWaterSewerUtility(text: string): boolean {
@@ -433,11 +443,10 @@ function isWaterSewerUtility(text: string): boolean {
   if (/\b(PUBLIC\s+UTILITIES|UTILITY\s+BILL|UTILITIES\s+BILL)\b/.test(text)) return true;
   if (/\bCOUNTY\s+UTIL/.test(text)) return true;
   if (/\bJOCO\b/.test(text) && /\b(WATER|SEWER|UTIL)/.test(text)) return true;
+  if (/\b(WATER|SEWER)\b/.test(text) && /\bCOUNTY\b/.test(text)) return true;
   return (
     /\b(WATER|SEWER)\b/.test(text) &&
-    /\b(COUNTY|MUNICIPAL|CITY|TOWN|DEPT|DEPARTMENT|DISTRICT|AUTHORITY|UTILITY|UTILITIES|BILL)\b/.test(
-      text,
-    )
+    /\b(MUNICIPAL|DEPT|DEPARTMENT|DISTRICT|AUTHORITY|UTILITY|UTILITIES|BILL)\b/.test(text)
   );
 }
 
@@ -446,11 +455,14 @@ function isGoogleOrMicrosoftRetail(text: string): boolean {
   if (/\b(GOOGLE\s+STORE|GOOGLE\s+HARDWARE)\b/.test(text)) return true;
   if (/GOOGLE\s*\*\s*PIXEL/.test(text)) return true;
   if (/\bPIXEL\s+\d/.test(text) && /\bGOOGLE\b/.test(text)) return true;
+  // A store descriptor wins even when the same line also names Xbox or MSBILL.
+  if (/\bMICROSOFT\s+STORE\b/.test(text) || /MICROSOFT\*(STORE|SURFACE)/.test(text)) {
+    return true;
+  }
   if (/\b(XBOX|GAME\s*PASS|GAMEPASS|MSBILL|OFFICE\s*365|MICROSOFT\s*365|M365)\b/.test(text)) {
     return false;
   }
-  if (/MICROSOFT\*(XBOX|365|GAME)/.test(text)) return false;
-  return /\bMICROSOFT\s+STORE\b/.test(text) || /MICROSOFT\*SURFACE/.test(text);
+  return false;
 }
 
 // The letter X is not a subscription. The service's own descriptors are.
@@ -462,10 +474,37 @@ function isXSubscription(text: string): boolean {
   return false;
 }
 
+function isHealthInsurance(text: string): boolean {
+  if (/\b(AUTO|CAR|VEHICLE|RENTERS|RENTER)\b/.test(text) && /\bINS/.test(text)) return false;
+  if (
+    /\b(BLUE\s+CROSS|BLUE\s+SHIELD|BCBS|AETNA|CIGNA|HUMANA|ANTHEM|KAISER|MOLINA|UNITED\s*HEALTH|UNITEDHEALTH|OSCAR\s+HEALTH)\b/.test(
+      text,
+    )
+  ) {
+    return true;
+  }
+  if (/\bHEALTH\s+INS(?:URANCE)?\b/.test(text)) return true;
+  return /\bINSURANCE\s+PREMIUM\b/.test(text) && !/\b(AUTO|CAR|VEHICLE|HOME|RENTERS)\b/.test(text);
+}
+
+function isAutoInsurance(text: string): boolean {
+  if (/\b(CAR|AUTO|VEHICLE)\s+INS(?:URANCE)?\b/.test(text)) return true;
+  if (/\bPROGRESSIVE\b/.test(text) && !/\bLEASING\b/.test(text)) return true;
+  if (/\b(GEICO|STATE\s+FARM|ALLSTATE|NATIONWIDE)\b/.test(text)) return true;
+  if (/(^|[^A-Z0-9])ERIE([^A-Z0-9]|$)/.test(text) && /\b(INS|AUTO|CAR)\b/.test(text)) return true;
+  if (/(^|[^A-Z0-9])USAA([^A-Z0-9]|$)/.test(text)) return true;
+  return false;
+}
+
 // Lender payments only. "PLANET HOME" and Lowe's are not a mortgage.
 function isMortgagePayment(text: string): boolean {
   if (/\b(MORTGAGES?|HOME\s+LOAN)\b/.test(text)) return true;
-  if (/(^|[^A-Z0-9])MTG([^A-Z0-9]|$)/.test(text)) return true;
+  if (
+    /(^|[^A-Z0-9])MTG([^A-Z0-9]|$)/.test(text) &&
+    /\b(PMT|PAYMENT|PYMT|LOAN|MORTGAGE|ACH)\b/.test(text)
+  ) {
+    return true;
+  }
   return /\b(MR\s+COOPER|PENNYMAC|ROCKET\s+MORTGAGE|FREEDOM\s+MORTGAGE|LOANCARE|CENLAR|SHELLPOINT|NEWREZ|NATIONSTAR|ROUNDPOINT|OCWEN|LAKEVIEW\s+LOAN)\b/.test(
     text,
   );
@@ -503,6 +542,9 @@ export function categorizeNarrative(
 ): Category | "unknown" {
   const text = narrative.toUpperCase();
   if (hasIncomeKeyword(text)) return "income";
+  // A mortgage payment to a bank is still a mortgage. The institution check
+  // would otherwise call every outflow a transfer.
+  if (isMortgagePayment(text)) return "housing/mortgage";
   // A credit-union or bank line is not a Shell/Mobil station, even when the
   // institution's name contains that brand. Credits are income. Money sent
   // to the institution is a transfer, not fuel.
@@ -518,7 +560,8 @@ export function categorizeNarrative(
   if (isGoogleOrMicrosoftRetail(text)) return "shopping";
   if (isXSubscription(text)) return "subscriptions";
   if (isWaterSewerUtility(text)) return "utilities/telecom";
-  if (isMortgagePayment(text)) return "housing/mortgage";
+  if (isAutoInsurance(text)) return "insurance/auto";
+  if (isHealthInsurance(text)) return "insurance/health";
   const ruled = RULES.find((rule) => matchesRule(text, rule))?.category;
   if (ruled) return ruled;
   if (signedLedger && amountCents > 0) return "income";
@@ -542,7 +585,9 @@ shopping = retail that is not groceries, including dollar stores and discount st
 entertainment/events = ticket vendors and live events, such as Etix, Ticketmaster, StubHub, or AXS. Not a parking ticket and not a restaurant.
 subscriptions = Netflix, Disney+/Hulu, Peacock, Ring, Cloudflare, Xbox Game Pass, MSBILL, X Premium or X Corp, a Google* product-code charge, Square memberships, and home maintenance plans. A Google or Microsoft store purchase is shopping. A one-time HVAC repair is home.
 utilities/telecom = power, county or municipal water and sewer, natural gas, phone, internet. ATT is utilities/telecom. A city gas bill is utilities/telecom. Lowe's is not a utility.
-healthcare = doctors, dental, OBGYN, pharmacy.
+healthcare = doctors, dental, OBGYN, clinics, and pharmacies such as Walgreens, CVS, and Rite Aid. Not an insurance premium.
+insurance/health = health-insurance premiums such as Blue Cross, BCBS, Aetna, or Cigna. Not a doctor and not a pharmacy.
+insurance/auto = car insurance such as GEICO, Progressive, State Farm, Allstate, Nationwide, Erie, or USAA. Not a store and not a doctor.
 transfers = PayPal, Zelle, Venmo, wires.
 income = paychecks and direct deposits.
 cloud/software = Amazon Web Services and other cloud hosts. Not Amazon retail.
