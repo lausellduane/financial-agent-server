@@ -19,7 +19,13 @@ import {
   type QueryIntent,
   type TxView,
 } from "../query-intent.ts";
-import { cleanMerchantName, dedupeKeys, formatCents, parseAmountCents } from "../statement.ts";
+import {
+  cleanMerchantName,
+  dedupeKeys,
+  formatCents,
+  parseAmountCents,
+  pickDisplayFields,
+} from "../statement.ts";
 
 const ISSUER = "https://testteam.cloudflareaccess.com";
 const AUD = "test-aud";
@@ -675,6 +681,39 @@ describe("intent validation and aggregation", () => {
     expect(since("groceries since March", null).confident).toBe(false);
   });
 
+  it("keeps the day in since March 15 and hands an unplaceable day to the model", () => {
+    const since = (question: string, latest: string | null) => {
+      const parsed = interpretQuestion(question, null, [], latest);
+      return {
+        confident: parsed?.confident,
+        from: parsed?.intent.dateFrom,
+        to: parsed?.intent.dateTo,
+        unplaced: parsed?.unplacedSince,
+      };
+    };
+    expect(since("How much did I spend on groceries since March 15?", "2026-04-02")).toEqual({
+      confident: true,
+      from: "2026-03-15",
+      to: null,
+      unplaced: false,
+    });
+    expect(since("groceries since March 15th, 2025", null)).toMatchObject({
+      confident: true,
+      from: "2025-03-15",
+    });
+    // March 15 is after the last ledger day, so it is last year's.
+    expect(since("groceries since March 15", "2026-03-10")).toMatchObject({
+      from: "2025-03-15",
+    });
+    for (const question of [
+      "groceries since February 30",
+      "groceries since last March",
+      "groceries since 3/1",
+    ]) {
+      expect(since(question, "2026-04-02")).toMatchObject({ confident: false, unplaced: true });
+    }
+  });
+
   it("does not treat shellfish as the shell station when excluding", () => {
     const shell = view("SHELL OIL", "-15.00", true);
     const fish = {
@@ -729,6 +768,38 @@ describe("intent validation and aggregation", () => {
   });
 });
 
+describe("duplicate keys", () => {
+  it("picks the key's text column from header names, not row contents", () => {
+    const header = (row: Record<string, string>) => row;
+    const full = [
+      header({ Date: "2026-03-01", Details: "A", Description: "STARBUCKS STORE 1234 RALEIGH NC", Amount: "-4.00" }),
+      header({ Date: "2026-03-02", Details: "B", Description: "STARBUCKS STORE 1234 RALEIGH NC", Amount: "-5.00" }),
+      header({ Date: "2026-03-03", Details: "C", Description: "STARBUCKS STORE 1234 RALEIGH NC", Amount: "-6.00" }),
+      header({ Date: "2026-03-04", Details: "DEBIT CARD PURCHASE SHELL OIL", Description: "SHELL OIL 5678", Amount: "-40.00" }),
+    ];
+    const partial = full.slice(0, 3);
+    // Content scoring reads these two files differently, so a key built on
+    // it would change between a full and a partial export.
+    expect(pickDisplayFields(full).description).not.toBe(pickDisplayFields(partial).description);
+    expect(dedupeKeys(partial)).toEqual(dedupeKeys(full).slice(0, 3));
+    expect(dedupeKeys(full)[0]).toContain("STARBUCKS");
+  });
+
+  it("keeps the same key when a later export adds text or empty money columns", () => {
+    const base = { Date: "2026-03-01", Description: "SHELL OIL", Amount: "-40.00" };
+    const [plain] = dedupeKeys([base]);
+    const [withMemo] = dedupeKeys([{ ...base, Memo: "fuel stop", Reference: "8812" }]);
+    const [withCredit] = dedupeKeys([{ ...base, Credit: "" }]);
+    const [reordered] = dedupeKeys([{ Amount: "-40", Memo: "x", Description: "shell  oil", Date: "3/1/2026" }]);
+    expect(withMemo).toBe(plain);
+    expect(withCredit).toBe(plain);
+    expect(reordered).toBe(plain);
+    const [payee] = dedupeKeys([{ Date: "2026-03-01", Memo: "ref 1", Payee: "SHELL OIL", Amount: "-40.00" }]);
+    const [payeeOtherMemo] = dedupeKeys([{ Date: "2026-03-01", Memo: "ref 2", Payee: "SHELL OIL", Amount: "-40.00" }]);
+    expect(payeeOtherMemo).toBe(payee);
+  });
+});
+
 describe("ledger migration", () => {
   it("adds category and query intent onto a pre-category table", async () => {
     const stub = env.LEDGER.get(env.LEDGER.idFromName("migration-old"));
@@ -738,7 +809,7 @@ describe("ledger migration", () => {
         .toArray()
         .map((row) => row.name);
       expect(names).toEqual(expect.arrayContaining(LEDGER_MIGRATIONS));
-      expect(LEDGER_MIGRATION).toBe("002_append_dedupe_key");
+      expect(LEDGER_MIGRATION).toBe("003_upload_layout_header_key");
       state.storage.sql.exec("DROP TABLE transactions");
       state.storage.sql.exec(
         "CREATE TABLE transactions (id INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT NOT NULL)",
@@ -752,8 +823,10 @@ describe("ledger migration", () => {
     await stub.migrate();
     expect(migrated.columns).toContain("category");
     expect(migrated.columns).toContain("dedupe_key");
+    expect(migrated.columns).toContain("upload_id");
     const loaded = await stub.load();
     expect(loaded.records[0]?.category).toBeNull();
+    expect(loaded.records[0]?.layout?.fields.description).toBe("Description");
     expect(loaded.records[0]?.payload.Description).toBe("CHIPOTLE");
     expect(loaded.version).toBe(0);
     await runInDurableObject(stub, async (_instance, state) => {
@@ -776,8 +849,80 @@ describe("ledger migration", () => {
     expect(again).toMatchObject({ ok: true, added: 0, duplicates: 1, total: 1 });
   });
 
-  it("appends, dedupes, and refuses to pass the row limit in one transaction", async () => {
+  it("rewrites 002 keys from header names and fixes each legacy layout without deleting rows", async () => {
+    const stub = env.LEDGER.get(env.LEDGER.idFromName("migration-002"));
+    const payloads = [
+      { Date: "2026-03-01", Description: "MTA FARE", Memo: "subway", Amount: "-2.75" },
+      { Date: "2026-03-01", Description: "MTA FARE", Memo: "subway", Amount: "-2.75" },
+      { Date: "2026-03-02", Description: "SHELL OIL", Memo: "", Amount: "-40.00" },
+    ];
+    await runInDurableObject(stub, async (_instance, state) => {
+      state.storage.sql.exec("DROP TABLE transactions");
+      state.storage.sql.exec("DROP TABLE uploads");
+      state.storage.sql.exec(
+        "CREATE TABLE transactions (id INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT NOT NULL, category TEXT, dedupe_key TEXT)",
+      );
+      state.storage.sql.exec(
+        "DELETE FROM schema_migrations WHERE name = '003_upload_layout_header_key'",
+      );
+      for (const payload of payloads) {
+        state.storage.sql.exec(
+          "INSERT INTO transactions (payload, category, dedupe_key) VALUES (?, 'gas/auto', 'content-scored-key')",
+          JSON.stringify(payload),
+        );
+      }
+    });
+    await stub.migrate();
+    await stub.migrate();
+    await runInDurableObject(stub, async (_instance, state) => {
+      const rows = state.storage.sql
+        .exec<{ dedupe_key: string; upload_id: number | null }>(
+          "SELECT dedupe_key, upload_id FROM transactions ORDER BY id",
+        )
+        .toArray();
+      expect(rows.map((row) => row.dedupe_key)).toEqual(dedupeKeys(payloads));
+      expect(rows.every((row) => row.upload_id !== null)).toBe(true);
+      expect(new Set(rows.map((row) => row.upload_id)).size).toBe(1);
+    });
+    const loaded = await stub.load();
+    expect(loaded.records).toHaveLength(3);
+    expect(loaded.records[0]?.layout).toMatchObject({ signed: true });
+    // The same statement again, without the Memo column: nothing new.
+    const again = await seed(
+      stub,
+      payloads.map(({ Memo: _memo, ...payload }) => ({ payload, category: "gas/auto" })),
+      { startDate: null, endDate: null },
+    );
+    expect(again).toMatchObject({ ok: true, added: 0, duplicates: 3, total: 3 });
+  });
+
+  it("keeps real repeats in one file and still skips a re-upload", async () => {
     const stub = env.LEDGER.get(env.LEDGER.idFromName("append-direct@example.com"));
+    const fare = {
+      payload: { Date: "2026-03-01", Description: "MTA FARE", Amount: "-2.75" },
+      category: "transportation",
+    };
+    const range = { startDate: "2026-03-01", endDate: "2026-03-01" };
+    // A shorter export with one copy, then the full statement with two.
+    const one = await seed(stub, [fare], range);
+    expect(one).toMatchObject({ ok: true, added: 1, duplicates: 0, total: 1 });
+    const two = await seed(stub, [fare, fare], range);
+    expect(two).toMatchObject({ ok: true, added: 1, duplicates: 1, total: 2 });
+    if (!two.ok) throw new Error("append failed");
+    expect(await stub.saveIntent('{"categories":["dining"],"op":"sum"}', two.version)).toBe(true);
+    // Same two rows again: nothing added, version and saved question kept.
+    const again = await seed(stub, [fare, fare], range);
+    expect(again).toMatchObject({ ok: true, added: 0, duplicates: 2, total: 2, version: two.version });
+    // One copy again: nothing added and the second stored fare stays.
+    const shorter = await seed(stub, [fare], range);
+    expect(shorter).toMatchObject({ ok: true, added: 0, duplicates: 1, total: 2 });
+    expect(await stub.currentVersion()).toBe(two.version);
+    expect((await stub.loadIntent()).intent).toContain("dining");
+    expect((await stub.summary()).count).toBe(2);
+  });
+
+  it("refuses to pass the row limit in one transaction", async () => {
+    const stub = env.LEDGER.get(env.LEDGER.idFromName("append-limit@example.com"));
     const row = (date: string, description: string, amount: string) => ({
       payload: { Date: date, Description: description, Amount: amount },
       category: "groceries",
@@ -787,7 +932,7 @@ describe("ledger migration", () => {
       [row("2026-02-03", "FOOD LION", "-50.00"), row("2026-02-03", "FOOD LION", "-50.00")],
       { startDate: "2026-02-03", endDate: "2026-02-03" },
     );
-    expect(first).toMatchObject({ ok: true, added: 1, duplicates: 1, total: 1 });
+    expect(first).toMatchObject({ ok: true, added: 2, duplicates: 0, total: 2 });
     const keys = dedupeKeys([
       row("2026-03-01", "PUBLIX", "-5.00").payload,
       row("2026-03-02", "PUBLIX", "-6.00").payload,
@@ -799,15 +944,32 @@ describe("ledger migration", () => {
       ],
       { startDate: "2026-03-01", endDate: "2026-03-02" },
       null,
-      2,
+      3,
     );
-    expect(tooMany).toEqual({ ok: false, total: 3 });
+    expect(tooMany).toEqual({ ok: false, total: 4 });
     expect((await stub.currentVersion())).toBe(first.ok ? first.version : -1);
     expect((await stub.summary())).toMatchObject({
-      count: 1,
+      count: 2,
       startDate: "2026-02-03",
       endDate: "2026-02-03",
     });
+  });
+
+  it("clears the ledger, bumps the version, and drops the saved question", async () => {
+    const stub = env.LEDGER.get(env.LEDGER.idFromName("clear-direct@example.com"));
+    const first = await seed(
+      stub,
+      [{ payload: { Date: "2026-01-01", Description: "CHIPOTLE", Amount: "-1.00" }, category: "dining" }],
+      { startDate: "2026-01-01", endDate: "2026-01-01" },
+    );
+    if (!first.ok) throw new Error("seed failed");
+    expect(await stub.saveIntent('{"categories":["dining"],"op":"sum"}', first.version)).toBe(true);
+    const cleared = await stub.clear();
+    expect(cleared).toEqual({ removed: 1, version: first.version + 1 });
+    expect(await stub.summary()).toMatchObject({ loaded: false, count: 0 });
+    expect((await stub.loadIntent()).intent).toBeNull();
+    expect(await stub.saveIntent('{"categories":["dining"],"op":"sum"}', first.version)).toBe(false);
+    expect(await stub.updateCategories([{ id: 1, category: "home" }], first.version)).toBe(false);
   });
 
   it("stores intent per identity and ignores a write after another upload", async () => {
@@ -1214,27 +1376,175 @@ describe("/api spending queries", () => {
     ].join("\n");
     const march = await upload(email, marchCsv);
     expect(march.status).toBe(200);
-    expect(await march.json()).toMatchObject({ count: 5, added: 2, duplicates: 3, total: 5 });
+    // Both FOOD LION visits on 3/5 are real and kept.
+    expect(await march.json()).toMatchObject({ count: 5, added: 3, duplicates: 2, total: 6 });
     const next = (await (await authed("/api/report", token)).json()) as {
       count: number;
       startDate: string;
       endDate: string;
       uploadedAt: string;
     };
-    expect(next).toMatchObject({ count: 5, startDate: "2026-02-03", endDate: "2026-04-02" });
+    expect(next).toMatchObject({ count: 6, startDate: "2026-02-03", endDate: "2026-04-02" });
     expect(first.uploadedAt < next.uploadedAt).toBe(true);
 
+    const stub = env.LEDGER.get(env.LEDGER.idFromName(ledgerName(email)));
+    const versionBefore = await stub.currentVersion();
     const again = await upload(email, marchCsv);
-    expect(await again.json()).toMatchObject({ added: 0, total: 5 });
+    expect(await again.json()).toMatchObject({ added: 0, duplicates: 5, total: 6 });
+    // Nothing new, so a question in flight is not interrupted.
+    expect(await stub.currentVersion()).toBe(versionBefore);
 
     const sinceMarch = await query(email, "How much did I spend on groceries since March?");
     expect(sinceMarch.answer).toContain("60.00");
     expect(sinceMarch.answer).toContain("25.00");
-    expect(sinceMarch.answer).toContain("Total: $85.00");
+    expect(sinceMarch.answer).toContain("Total: $145.00");
     expect(sinceMarch.answer).not.toContain("50.00");
     expect(sinceMarch.answer).not.toContain("30.00");
+    const sinceDay = await query(email, "How much did I spend on groceries since March 10?");
+    expect(sinceDay.answer).toContain("Total: $25.00");
+    expect(sinceDay.answer).not.toContain("60.00");
     const all = await query(email, "How much did I spend on groceries?");
-    expect(all.answer).toContain("Total: $165.00");
+    expect(all.answer).toContain("Total: $225.00");
+  });
+
+  it("reads each upload with its own sign, even when two banks share a header row", async () => {
+    const email = "two-banks@example.com";
+    const run = vi.spyOn(env.AI, "run").mockImplementation(async () => {
+      throw new Error("no model call expected");
+    });
+    // Bank A lists charges as positive amounts.
+    expect((await upload(email, csvOf([["2026-01-02", "SHELL OIL", "40.00"]]))).status).toBe(200);
+    const before = await query(email, "How much did I spend on gas?");
+    expect(before.answer).toContain("Total: $40.00");
+    // Bank B, same headers, signs charges negative and deposits positive.
+    expect(
+      (
+        await upload(
+          email,
+          csvOf([
+            ["2026-01-05", "EXXON", "-25.00"],
+            ["2026-01-06", "DIRECT DEPOSIT ACME PAYROLL", "900.00"],
+          ]),
+        )
+      ).status,
+    ).toBe(200);
+    const gas = await query(email, "How much did I spend on gas?");
+    expect(gas.answer).toContain("Total: $65.00");
+    expect(gas.answer).not.toContain("-$40.00");
+    const highest = await query(email, "What was my highest charge?");
+    expect(highest.answer).toContain("40.00");
+    expect(highest.answer).not.toContain("900");
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it("keeps two header layouts apart in one ledger", async () => {
+    const email = "two-layouts@example.com";
+    vi.spyOn(env.AI, "run").mockImplementation(async () => {
+      throw new Error("no model call expected");
+    });
+    expect(
+      (await upload(email, csvOf([["2026-01-02", "SHELL OIL", "-40.00"], ["2026-01-03", "PAYROLL DIRECT DEPOSIT", "900.00"]])))
+        .status,
+    ).toBe(200);
+    // Another bank: other column names, and charges are positive.
+    const other = [
+      "Posted Date,Merchant Name,Transaction Amount",
+      "01/04/2026,EXXON,25.00",
+      "01/05/2026,CHEVRON,10.00",
+    ].join("\n");
+    const second = await upload(email, other);
+    expect(second.status).toBe(200);
+    expect(await second.json()).toMatchObject({ added: 2, total: 4 });
+    const gas = await query(email, "How much did I spend on gas?");
+    expect(gas.answer).toContain("SHELL");
+    expect(gas.answer).toContain("EXXON");
+    expect(gas.answer).toContain("CHEVRON");
+    expect(gas.answer).toContain("Total: $75.00");
+    // Re-uploading the second file adds nothing.
+    expect(await (await upload(email, other)).json()).toMatchObject({ added: 0, total: 4 });
+  });
+
+  it("says it couldn't place a since date when the model fails", async () => {
+    const email = "since-unplaced@example.com";
+    expect(
+      (await upload(email, csvOf([["2026-03-02", "FOOD LION", "-50.00"], ["2026-04-01", "PUBLIX", "-25.00"]])))
+        .status,
+    ).toBe(200);
+    const run = vi.spyOn(env.AI, "run").mockImplementation(async () => {
+      throw new Error("model down");
+    });
+    for (const question of ["groceries since last March", "groceries since 3/1"]) {
+      const answer = await query(email, question);
+      expect(answer.answer).toMatch(/couldn't place that date/);
+      expect(answer.answer).not.toContain("Total");
+      expect(answer.answer).not.toContain("50.00");
+    }
+    expect(run).toHaveBeenCalled();
+    const stub = env.LEDGER.get(env.LEDGER.idFromName(ledgerName(email)));
+    expect((await stub.loadIntent()).intent).toBeNull();
+  });
+
+  it("returns 413 before any model call when a full ledger would pass the limit, and clear frees it", async () => {
+    const email = "full-ledger@example.com";
+    const stub = env.LEDGER.get(env.LEDGER.idFromName(ledgerName(email)));
+    const rows = Array.from({ length: 20_000 }, (_, index) => ({
+      payload: {
+        Date: "2026-01-01",
+        Description: "SHELL OIL",
+        Amount: `-${Math.floor((index + 100) / 100)}.${String((index + 100) % 100).padStart(2, "0")}`,
+      },
+      category: "gas/auto",
+    }));
+    const seeded = await seed(stub, rows, { startDate: "2026-01-01", endDate: "2026-01-01" });
+    expect(seeded).toMatchObject({ ok: true, total: 20_000 });
+    const run = vi.spyOn(env.AI, "run").mockImplementation(async () => {
+      throw new Error("no model call expected");
+    });
+    const over = await upload(email, csvOf([["2026-02-01", "ZOOPLEX SNACKBAR", "-9.50"]]));
+    expect(over.status).toBe(413);
+    expect(((await over.json()) as { error?: string }).error).toMatch(/20001 rows\. The limit is 20000\./);
+    expect(run).not.toHaveBeenCalled();
+    expect((await stub.summary()).count).toBe(20_000);
+
+    // Without Access the clear route writes nothing.
+    const anonymous = await handler.fetch(
+      new Request("https://example.com/api/ledger", { method: "DELETE" }),
+    );
+    expect(anonymous.status).toBe(401);
+    expect((await stub.summary()).count).toBe(20_000);
+    // Another person's clear does not touch this ledger.
+    const otherToken = await tokenFor("someone-else@example.com");
+    expect((await authed("/api/ledger", otherToken, { method: "DELETE" })).status).toBe(200);
+    expect((await stub.summary()).count).toBe(20_000);
+
+    const version = await stub.currentVersion();
+    const token = await tokenFor(email);
+    const cleared = await authed("/api/ledger", token, { method: "DELETE" });
+    expect(cleared.status).toBe(200);
+    expect(await cleared.json()).toEqual({ ok: true, removed: 20_000, total: 0 });
+    expect(await stub.currentVersion()).toBe(version + 1);
+    expect(await (await authed("/api/report", token)).json()).toMatchObject({ loaded: false, count: 0 });
+
+    const fresh = await upload(email, csvOf([["2026-02-01", "SHELL OIL", "-40.00"]]));
+    expect(fresh.status).toBe(200);
+    expect(await fresh.json()).toMatchObject({ added: 1, total: 1 });
+  });
+
+  it("clears the saved question so a follow-up starts over", async () => {
+    const email = "clear-intent@example.com";
+    expect((await upload(email, csvOf([["2026-01-02", "CHIPOTLE", "-10.00"]]))).status).toBe(200);
+    vi.spyOn(env.AI, "run").mockImplementation(async () => {
+      throw new Error("no model call expected");
+    });
+    expect((await query(email, "How much did I spend eating out?")).answer).toContain("Total: $10.00");
+    const stub = env.LEDGER.get(env.LEDGER.idFromName(ledgerName(email)));
+    expect((await stub.loadIntent()).intent).toContain("dining");
+    const token = await tokenFor(email);
+    expect((await authed("/api/ledger", token, { method: "DELETE" })).status).toBe(200);
+    expect((await stub.loadIntent()).intent).toBeNull();
+    const after = await queryRaw(email, "How much did I spend eating out?");
+    expect(after.status).toBe(400);
+    expect(after.body.error).toMatch(/upload a transaction report first/);
   });
 
   it("nets a refund on the worker and keeps a deposit out of the highest charge", async () => {

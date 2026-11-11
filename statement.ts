@@ -253,34 +253,38 @@ function pickMerchantField(rows: Record<string, string>[]): string {
   return best;
 }
 
+const DATE_HEADERS = [
+  "Date",
+  "Run Date",
+  "Transaction Date",
+  "Trans. Date",
+  "Trans Date",
+  "Posted Date",
+  "Post Date",
+  "Posting Date",
+];
+
+const AMOUNT_HEADERS = [
+  "Amount",
+  "Transaction Amount",
+  "Amt",
+  "Withdrawal",
+  "Withdrawal (-)",
+  "Withdrawal(-)",
+  "Debit",
+  "Debit Amount",
+  "Credit",
+  "Amount ($)",
+];
+
 export function pickDisplayFields(rows: Record<string, string>[]): DisplayFields {
   const keys = Object.keys(rows[0] ?? {});
   return {
     date:
-      findField(keys, [
-        "Date",
-        "Run Date",
-        "Transaction Date",
-        "Trans. Date",
-        "Trans Date",
-        "Posted Date",
-        "Post Date",
-        "Posting Date",
-      ]) ?? keys[0],
+      findField(keys, DATE_HEADERS) ?? keys[0],
     description: pickMerchantField(rows),
     amount:
-      findField(keys, [
-        "Amount",
-        "Transaction Amount",
-        "Amt",
-        "Withdrawal",
-        "Withdrawal (-)",
-        "Withdrawal(-)",
-        "Debit",
-        "Debit Amount",
-        "Credit",
-        "Amount ($)",
-      ]) ??
+      findField(keys, AMOUNT_HEADERS) ??
       keys.find((key) => /amount/i.test(key)) ??
       keys[2],
   };
@@ -409,12 +413,41 @@ export function parseCsv(rawCsv: string): Promise<Record<string, string>[]> {
 
 export type ShapeFields = { fields: DisplayFields; signed: boolean };
 
-// Rows from different bank exports can sit in one ledger. Columns and the sign
-// convention are picked per header layout, not from whichever row is first.
+// The columns and sign convention one upload was read with. It is saved with
+// the upload, so a later file from another bank (even with the same header
+// row) cannot change how these rows read.
+export type UploadLayout = ShapeFields;
+
+export function uploadLayout(rows: Record<string, string>[]): UploadLayout {
+  const fields = pickDisplayFields(rows);
+  return { fields, signed: usesSignedCents(rows, fields.amount) };
+}
+
+export function parseLayout(raw: string | null | undefined): UploadLayout | null {
+  if (!raw) return null;
+  try {
+    const value = JSON.parse(raw) as Partial<UploadLayout> | null;
+    const fields = value?.fields;
+    if (!fields || typeof fields.description !== "string") return null;
+    return {
+      fields: {
+        date: typeof fields.date === "string" ? fields.date : undefined,
+        description: fields.description,
+        amount: typeof fields.amount === "string" ? fields.amount : undefined,
+      },
+      signed: value.signed === true,
+    };
+  } catch {
+    return null;
+  }
+}
+
 export function headerShape(row: Record<string, string>): string {
   return Object.keys(row).join("\u001f");
 }
 
+// Only for rows saved before layouts were stored with each upload. Those came
+// from one replace-only upload, so a header row stands in for the file.
 export function shapeFields(
   rows: Record<string, string>[],
 ): (row: Record<string, string>) => ShapeFields {
@@ -426,44 +459,127 @@ export function shapeFields(
     else groups.set(shape, [row]);
   }
   const resolved = new Map<string, ShapeFields>();
-  for (const [shape, group] of groups) {
-    const fields = pickDisplayFields(group);
-    resolved.set(shape, { fields, signed: usesSignedCents(group, fields.amount) });
-  }
+  for (const [shape, group] of groups) resolved.set(shape, uploadLayout(group));
   return (row) => {
     const shape = headerShape(row);
     const found = resolved.get(shape);
     if (found) return found;
-    const fields = pickDisplayFields([row]);
-    const fallback = { fields, signed: usesSignedCents([row], fields.amount) };
+    const fallback = uploadLayout([row]);
     resolved.set(shape, fallback);
     return fallback;
   };
 }
 
 const MONEY_COLUMN = /amount|amt|debit|credit|withdrawal|deposit/i;
+const NOT_TEXT_COLUMN =
+  /date|amount|amt|debit|credit|withdrawal|deposit|balance|qty|quantity|price|commission|fees?|account|symbol|type|status|settlement|check ?(number|no)|category/i;
 
-// Same merchant, date, and amount is one transaction, even if the bank would
-// call two identical charges separate visits. Compares parsed values, so a
-// re-export with "1,541.42" instead of "1541.42" or 3/1/2026 instead of
-// 2026-03-01 still matches.
-export function dedupeKey(row: Record<string, string>, fields: DisplayFields): string {
+// Header names, in order, for the text part of the duplicate key. Picked from
+// the header row only, never from row contents, so a partial re-export or an
+// extra Memo column in a later export keys the same charge the same way.
+const KEY_TEXT_HEADERS = [
+  "Action",
+  "Description",
+  "Transaction Description",
+  "Original Description",
+  "Merchant",
+  "Merchant Name",
+  "Payee",
+  "Name",
+  "Details",
+  "Transaction",
+  "Memo",
+];
+
+export type KeyFields = {
+  date: string | undefined;
+  text: string | undefined;
+  amount: string | undefined;
+};
+
+export function keyFields(keys: string[]): KeyFields {
+  const display = pickHeaderFields(keys);
+  const exact = new Map(keys.map((key) => [key.toLowerCase(), key]));
+  let text: string | undefined;
+  for (const name of KEY_TEXT_HEADERS) {
+    text = exact.get(name.toLowerCase());
+    if (text) break;
+  }
+  text ??= keys.find(
+    (key) =>
+      /desc|action|payee|merchant|name|details|transaction|memo/i.test(key) &&
+      !NOT_TEXT_COLUMN.test(key),
+  );
+  text ??= keys.find(
+    (key) => key !== display.date && key !== display.amount && !NOT_TEXT_COLUMN.test(key),
+  );
+  return { date: display.date, text, amount: display.amount };
+}
+
+// Date and amount columns are already chosen from header names alone.
+function pickHeaderFields(keys: string[]): { date: string | undefined; amount: string | undefined } {
+  return {
+    date: findField(keys, DATE_HEADERS) ?? keys[0],
+    amount: findField(keys, AMOUNT_HEADERS) ?? keys.find((key) => /amount/i.test(key)) ?? keys[2],
+  };
+}
+
+// One charge's identity: calendar date, the header-picked text column, and
+// cents. Parsed values are compared, so "1,541.42" and "1541.42", or 3/1/2026
+// and 2026-03-01, match. Two identical charges in one file share this key;
+// the ledger keeps as many of them as the fullest upload had (see append).
+export function dedupeKey(row: Record<string, string>, fields: KeyFields): string {
   const rawDate = fields.date ? String(row[fields.date] ?? "") : "";
   const date = normalizeDate(rawDate) || rawDate.trim().toUpperCase();
-  const merchant = String(row[fields.description] ?? "")
+  const text = (fields.text ? String(row[fields.text] ?? "") : "")
     .replace(/\s+/g, " ")
     .trim()
     .toUpperCase();
   const amount = parseAmountCents(fields.amount ? row[fields.amount] : undefined);
-  // Split debit/credit exports leave the picked column blank on the other side.
+  // Split debit/credit exports leave the picked column blank on the other
+  // side. Only nonzero values count, so an added empty column changes nothing.
   const otherMoney = Object.keys(row)
     .filter((key) => key !== fields.amount && MONEY_COLUMN.test(key) && !/balance/i.test(key))
-    .sort()
-    .map((key) => parseAmountCents(row[key]));
-  return JSON.stringify([date, merchant, amount, ...otherMoney]);
+    .map((key) => parseAmountCents(row[key]))
+    .filter((cents) => cents !== 0)
+    .sort((a, b) => a - b);
+  return JSON.stringify([date, text, amount, ...otherMoney]);
 }
 
+// Each row's key depends only on that row's own headers and values.
 export function dedupeKeys(rows: Record<string, string>[]): string[] {
-  const fieldsFor = shapeFields(rows);
-  return rows.map((row) => dedupeKey(row, fieldsFor(row).fields));
+  const byShape = new Map<string, KeyFields>();
+  return rows.map((row) => {
+    const shape = headerShape(row);
+    let fields = byShape.get(shape);
+    if (!fields) {
+      fields = keyFields(Object.keys(row));
+      byShape.set(shape, fields);
+    }
+    return dedupeKey(row, fields);
+  });
+}
+
+// Which rows of a file are new. The n-th copy of a key in the file is new only
+// when the ledger holds fewer than n rows with that key. Two real $2.75 fares
+// on one day both store; uploading that file again adds nothing; a shorter
+// export with one copy adds nothing and deletes nothing.
+export function freshByOccurrence(
+  keys: string[],
+  storedCount: (key: string) => number,
+): number[] {
+  const seen = new Map<string, number>();
+  const stored = new Map<string, number>();
+  const fresh: number[] = [];
+  keys.forEach((key, index) => {
+    const occurrence = (seen.get(key) ?? 0) + 1;
+    seen.set(key, occurrence);
+    let have = stored.get(key);
+    if (have === undefined) {
+      have = storedCount(key);
+      stored.set(key, have);
+    }
+    if (occurrence > have) fresh.push(index);
+  });
+  return fresh;
 }

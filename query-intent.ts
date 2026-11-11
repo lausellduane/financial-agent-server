@@ -40,6 +40,8 @@ export type Interpreted = {
   unrecognized: boolean;
   invalidDateRange: boolean;
   invalidCalendarDate: boolean;
+  // The question says "since" but code could not place the date.
+  unplacedSince?: boolean;
 };
 
 const OPS = new Set<QueryOp>(["sum", "list", "max", "count"]);
@@ -497,27 +499,36 @@ function monthRange(question: string): { from: string; to: string } | null {
   };
 }
 
-// "since March", "since March 2026", or "since 2026-03-01" is open-ended.
-// A month without a year is the latest such month on or before the ledger's
-// last date. Without a ledger date it is left to the model, as before.
+// "since March", "since March 15", "since March 2026", "since March 15, 2026",
+// or "since 2026-03-01" is open-ended. A month (and day) without a year is the
+// latest such date on or before the ledger's last date. Without a ledger date,
+// or with a day that is not on the calendar, it is left to the model.
 function sinceDate(question: string, latestDate: string | null): string | null {
   const iso = question.match(/\bsince\s+(\d{4}-\d{2}-\d{2})\b/i);
   if (iso?.[1]) return iso[1];
   const named = question.match(
-    new RegExp(`\\bsince\\s+(${MONTHS.join("|")})(?:\\s+(20\\d{2}))?\\b`, "i"),
+    new RegExp(
+      `\\bsince\\s+(${MONTHS.join("|")})(?:\\s+(\\d{1,2})(?:st|nd|rd|th)?)?(?:,?\\s+(20\\d{2}))?\\b`,
+      "i",
+    ),
   );
   if (!named?.[1]) return null;
   const month = MONTHS.indexOf(named[1].toLowerCase()) + 1;
   if (!month) return null;
-  let year = named[2] ? Number(named[2]) : NaN;
-  if (!named[2]) {
-    const latest = latestDate?.match(/^(\d{4})-(\d{2})-\d{2}$/);
-    if (!latest?.[1] || !latest[2]) return null;
+  const day = named[2] ? Number(named[2]) : 1;
+  const mmdd = `${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+  let year: number;
+  if (named[3]) {
+    year = Number(named[3]);
+  } else {
+    const latest = latestDate?.match(/^(\d{4})-\d{2}-\d{2}$/);
+    if (!latest?.[1] || !latestDate) return null;
     year = Number(latest[1]);
-    if (month > Number(latest[2])) year -= 1;
+    if (`${year}-${mmdd}` > latestDate) year -= 1;
   }
   if (!Number.isInteger(year)) return null;
-  return `${year}-${String(month).padStart(2, "0")}-01`;
+  const value = `${year}-${mmdd}`;
+  return isIsoDate(value) ? value : null;
 }
 
 function dateRange(question: string, latestDate: string | null = null): {
@@ -575,7 +586,13 @@ function unrecognizedTopic(question: string, consumedTokens: string[]): boolean 
   for (const entry of CATEGORY_PATTERNS) text = stripPattern(text, entry.pattern);
   text = stripPattern(text, /\b(gas|gasoline|fuel|coffee|starbucks|dunkin|paypal|aws|netflix)\b/i);
   text = stripPattern(text, /\b20\d{2}-\d{2}-\d{2}\b/);
-  text = stripPattern(text, new RegExp(`\\b(${MONTHS.join("|")})(\\s+20\\d{2})?\\b`, "i"));
+  text = stripPattern(
+    text,
+    new RegExp(
+      `\\b(${MONTHS.join("|")})(\\s+\\d{1,2}(st|nd|rd|th)?)?(,?\\s+20\\d{2})?\\b`,
+      "i",
+    ),
+  );
   text = text.replace(/\$[\d,.]+/g, " ");
   for (const token of consumedTokens) text = stripPattern(text, new RegExp(`\\b${escapeReg(token)}\\b`, "i"));
   const words = text.split(/[^a-z0-9]+/).filter((word) => word.length > 2);
@@ -694,6 +711,7 @@ export function interpretQuestion(
     unrecognized,
     invalidDateRange: false,
     invalidCalendarDate: false,
+    unplacedSince,
   };
 }
 
