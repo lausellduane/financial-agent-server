@@ -187,6 +187,27 @@ describe("categorizeNarrative", () => {
     expect(categorizeNarrative("JOHNSTON COUNTY PUBLIC UTILITIES", -6240, true)).toBe(
       "utilities/telecom",
     );
+    expect(categorizeNarrative("JOHNSTON COUNTY PUBLIC", -6240, true)).toBe(
+      "utilities/telecom",
+    );
+    expect(categorizeNarrative("JOHNSTON CO PUBLIC", -6240, true)).toBe(
+      "utilities/telecom",
+    );
+    expect(categorizeNarrative("JOHNSTON COUNTY PUBLIC SCHOOLS", -6240, true)).toBe(
+      "unknown",
+    );
+    expect(categorizeNarrative("JOHNSTON COUNTY PUBLIC SCH", -6240, true)).toBe("unknown");
+    expect(categorizeNarrative("JOHNSTON COUNTY PUBLIC LIBR", -6240, true)).toBe("unknown");
+    expect(categorizeNarrative("JOHNSTON COUNTY PUBLIC HLTH", -6240, true)).toBe("unknown");
+    expect(categorizeNarrative("WAKE COUNTY PUBLIC SAFETY", -6240, true)).toBe("unknown");
+    expect(categorizeNarrative("COUNTY PUBLIC WORKS", -6240, true)).toBe("unknown");
+    expect(categorizeNarrative("COUNTY PUBLIC TRANSIT", -6240, true)).toBe("unknown");
+    expect(categorizeNarrative("COUNTY PUBLIC PARKS", -6240, true)).toBe("unknown");
+    expect(categorizeNarrative("JOCO PUBLIC SCHOOLS", -6240, true)).toBe("unknown");
+    expect(categorizeNarrative("JOCO PUBLIC LIBRARY", -6240, true)).toBe("unknown");
+    expect(categorizeNarrative("JOCO UTILITIES", -4100, true)).toBe("utilities/telecom");
+    expect(categorizeNarrative("JOCO UTILITY", -4100, true)).toBe("utilities/telecom");
+    expect(categorizeNarrative("JOCO WATERSEWER", -4100, true)).toBe("utilities/telecom");
     expect(categorizeNarrative("JOCO WATER SEWER", -4100, true)).toBe("utilities/telecom");
     expect(categorizeNarrative("CITY WATER DEPT", -3600, true)).toBe("utilities/telecom");
     expect(categorizeNarrative("FIJI WATER", -200, true)).toBe("unknown");
@@ -199,7 +220,13 @@ describe("categorizeNarrative", () => {
     expect(categorizeNarrative("ACH DEBIT MTG PAYMENT", -151000, true)).toBe(
       "housing/mortgage",
     );
-    expect(categorizeNarrative("PLANET HOME", -154142, true)).toBe("unknown");
+    expect(categorizeNarrative("PLANET HOME", -154142, true)).toBe(
+      "housing/mortgage",
+    );
+    expect(categorizeNarrative("PLANET HOME LENDING", -154142, true)).toBe(
+      "housing/mortgage",
+    );
+    expect(categorizeNarrative("PLANET FITNESS", -4000, true)).toBe("unknown");
     expect(categorizeNarrative("PEACOCK TV LLC", -1393, true)).toBe("subscriptions");
     expect(categorizeNarrative("DISNEYPLUS", -1599, true)).toBe("subscriptions");
     expect(categorizeNarrative("DISNEY PLUS", -1599, true)).toBe("subscriptions");
@@ -236,11 +263,33 @@ describe("categorizeNarrative", () => {
     expect(categorizeNarrative("CARY OBGYN 919-4675941", -5000, true)).toBe("healthcare");
     expect(categorizeNarrative("CVS/PHARMACY", -500, true)).toBe("healthcare");
     expect(categorizeNarrative("GEICO AUTO", -9000, true)).toBe("insurance/auto");
+    expect(categorizeNarrative("GEICO PREM COLL", -10431, true)).toBe("insurance/auto");
     expect(categorizeNarrative("PROGRESSIVE INSURANCE", -11000, true)).toBe(
+      "insurance/auto",
+    );
+    expect(categorizeNarrative("PROG PREMIER INS PREM", -16836, true)).toBe(
       "insurance/auto",
     );
     expect(categorizeNarrative("PROGRESSIVE LEASING", -4000, true)).toBe("unknown");
     expect(categorizeNarrative("STATE FARM", -12000, true)).toBe("insurance/auto");
+    expect(categorizeNarrative("CHASE CREDIT CAUTOPAY", -14838, true)).toBe(
+      "credit-cards",
+    );
+    expect(categorizeNarrative("SYNCHRONY BANKPAYMENT", -10000, true)).toBe(
+      "credit-cards",
+    );
+    expect(categorizeNarrative("AMEX EPAYMENT ACH PMT", -300, true)).toBe("credit-cards");
+    expect(categorizeNarrative("AMEX EPAYMENT ACH PMT", -17440, true)).toBe(
+      "credit-cards",
+    );
+    expect(categorizeNarrative("ATT PAYMENT", -10067, true)).toBe("utilities/telecom");
+    const cardPayments = interpretQuestion(
+      "How much did I spend on credit card payments?",
+      null,
+      [],
+    );
+    expect(cardPayments?.confident).toBe(true);
+    expect(cardPayments?.intent.categories).toEqual(["credit-cards"]);
     const healthInsurance = interpretQuestion("How much did I spent in insurance?", null, []);
     expect(healthInsurance?.confident).toBe(true);
     expect(healthInsurance?.intent.categories).toEqual(["insurance/health"]);
@@ -1410,10 +1459,11 @@ describe("/api spending queries", () => {
       ["2026-10-10", "DUKE ENERGY", "-227.32"],
       ["2026-10-11", "ATT PAYMENT", "-100.67"],
       ["2026-10-12", "PIEDMONT NATURAL GAS", "-49.86"],
-      ["2026-10-13", "JOHNSTON COUNTY PUBLIC UTILITIES", "-62.40"],
+      ["2026-10-13", "JOHNSTON COUNTY PUBLIC", "-62.40"],
       ["2026-10-14", "CITY GAS BILL", "-80.00"],
       ["2026-10-15", "MR COOPER MORTGAGE PMT", "-1510.00"],
-      ["2026-10-16", "SHELL OIL", "-40.00"],
+      ["2026-10-16", "PLANET HOME", "-1541.42"],
+      ["2026-10-17", "SHELL OIL", "-40.00"],
     ];
     expect((await upload(email, csvOf(rows))).status).toBe(200);
     expect(run).not.toHaveBeenCalled();
@@ -1462,10 +1512,13 @@ describe("/api spending queries", () => {
     expect(bills.answer).not.toContain("38.00");
     expect(bills.answer).not.toContain("17.16");
     expect(bills.answer).not.toContain("SHELL OIL");
+    expect(bills.answer).not.toContain("Planet Home");
+    expect(bills.answer).not.toContain("1541.42");
 
     const mortgage = await query(email, "How much did I spent in mortgage?");
     expect(mortgage.answer).toContain("MR COOPER");
-    expect(mortgage.answer).toContain("Total: $1510.00");
+    expect(mortgage.answer).toContain("Planet Home");
+    expect(mortgage.answer).toContain("Total: $3051.42");
     expect(mortgage.answer).not.toContain("LOWE");
     expect(mortgage.answer).not.toContain("PEAK SEASONS");
     expect(mortgage.answer).not.toContain("72.22");
@@ -1481,9 +1534,10 @@ describe("/api spending queries", () => {
     expect(categoryOf("LOWE'S")).toBe("home");
     expect(categoryOf("LOWES #00677* GARNER")).toBe("home");
     expect(categoryOf("PEAK SEASONS HVAC PEAKSEASONSHV NC100126")).toBe("subscriptions");
-    expect(categoryOf("JOHNSTON COUNTY PUBLIC UTILITIES")).toBe("utilities/telecom");
+    expect(categoryOf("JOHNSTON COUNTY PUBLIC")).toBe("utilities/telecom");
     expect(categoryOf("CITY GAS BILL")).toBe("utilities/telecom");
     expect(categoryOf("MR COOPER MORTGAGE PMT")).toBe("housing/mortgage");
+    expect(categoryOf("PLANET HOME")).toBe("housing/mortgage");
     expect(categoryOf("SHELL OIL")).toBe("gas/auto");
   });
 
@@ -1613,6 +1667,76 @@ describe("/api spending queries", () => {
     expect(onlyCar.answer).not.toContain("LOWE");
     expect(onlyCar.answer).not.toContain("OBGYN");
     expect(onlyCar.answer).not.toContain("Blue Cross");
+  });
+
+  it("keeps car insurance, medical insurance, and credit-card payments apart", async () => {
+    const email = "card-insurance@example.com";
+    const run = vi.spyOn(env.AI, "run").mockImplementation(async () => {
+      throw new Error("rules cover these merchants");
+    });
+    expect(
+      (
+        await upload(
+          email,
+          csvOf([
+            ["2026-10-01", "GEICO PREM COLL", "-104.31"],
+            ["2026-10-02", "PROG PREMIER INS PREM", "-168.36"],
+            ["2026-10-03", "BLUE CROSS BLUE SHIELD", "-438.44"],
+            ["2026-10-04", "CHASE CREDIT CAUTOPAY", "-148.38"],
+            ["2026-10-05", "SYNCHRONY BANKPAYMENT", "-100.00"],
+            ["2026-10-06", "AMEX EPAYMENT ACH PMT", "-3.00"],
+            ["2026-10-07", "AMEX EPAYMENT ACH PMT", "-174.40"],
+            ["2026-10-08", "PLANET HOME", "-1541.42"],
+            ["2026-10-09", "ATT PAYMENT", "-100.67"],
+          ]),
+        )
+      ).status,
+    ).toBe(200);
+    expect(run).not.toHaveBeenCalled();
+
+    const bills = await query(email, "How much did I spent in bills?");
+    expect(bills.answer).toContain("ATT PAYMENT");
+    expect(bills.answer).not.toContain("Planet Home");
+    expect(bills.answer).not.toContain("1541.42");
+    expect(bills.answer).not.toContain("GEICO");
+    expect(bills.answer).not.toContain("CHASE");
+
+    const mortgage = await query(email, "How much did I spent in mortgage?");
+    expect(mortgage.answer).toContain("Planet Home");
+    expect(mortgage.answer).toContain("Total: $1541.42");
+    expect(mortgage.answer).not.toContain("ATT");
+    expect(mortgage.answer).not.toContain("CHASE");
+
+    const insurance = await query(email, "How much did I spent in insurance?");
+    expect(insurance.answer).toContain("Blue Cross Blue Shield");
+    expect(insurance.answer).toContain("Total: $438.44");
+    expect(insurance.answer).not.toContain("Progressive");
+    expect(insurance.answer).not.toContain("PROG");
+    expect(insurance.answer).not.toContain("GEICO");
+    expect(insurance.answer).not.toContain("CHASE");
+    expect(insurance.answer).not.toContain("AMEX");
+    expect(insurance.answer).not.toContain("SYNCHRONY");
+
+    const car = await query(email, "How much did I spend on car insurance?");
+    expect(car.answer).toContain("GEICO PREM COLL");
+    expect(car.answer).toContain("PROG PREMIER INS PREM");
+    expect(car.answer).toContain("Total: $272.67");
+    expect(car.answer).not.toContain("Blue Cross");
+    expect(car.answer).not.toContain("CHASE");
+    expect(car.answer).not.toContain("SYNCHRONY");
+    expect(car.answer).not.toContain("AMEX");
+    expect(car.answer).not.toContain("Planet Home");
+
+    const cards = await query(email, "How much did I spend on credit card payments?");
+    expect(cards.answer).toContain("CHASE CREDIT CAUTOPAY");
+    expect(cards.answer).toContain("SYNCHRONY BANKPAYMENT");
+    expect(cards.answer).toContain("AMEX EPAYMENT ACH PMT");
+    expect(cards.answer).toContain("Total: $425.78");
+    expect(cards.answer).not.toContain("GEICO");
+    expect(cards.answer).not.toContain("PROG");
+    expect(cards.answer).not.toContain("Blue Cross");
+    expect(cards.answer).not.toContain("Planet Home");
+    expect(cards.answer).not.toContain("ATT");
   });
 
   it("keeps a signed credit as income and rechecks a stale ledger once", async () => {

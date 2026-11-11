@@ -121,6 +121,10 @@ const CATEGORY_PATTERNS: { category: Category; pattern: RegExp }[] = [
   },
   { category: "transfers", pattern: /\b(transfers?|zelle|venmo|wire)\b/i },
   {
+    category: "credit-cards",
+    pattern: /\b(credit\s*cards?|credit[- ]card payments?|card payments?)\b/i,
+  },
+  {
     category: "income",
     pattern:
       /\b(income|paycheck|paychecks|payroll|salary|direct deposit|wages?)\b/i,
@@ -242,6 +246,14 @@ function asksForTransfers(topic: string): boolean {
   return /\b(transfers?|zelle|venmo|paypal|wire)\b/i.test(topic);
 }
 
+function asksForCreditCards(topic: string): boolean {
+  return /\b(credit\s*cards?|credit[- ]card payments?|card payments?)\b/i.test(topic);
+}
+
+function isNonSpendingCategory(category: Category): boolean {
+  return category === "income" || category === "transfers" || category === "credit-cards";
+}
+
 export function applyQuestionGuards(
   intent: QueryIntent,
   question: string,
@@ -250,9 +262,11 @@ export function applyQuestionGuards(
   const topic = question.split(":")[0] ?? question;
   const income = asksForIncome(topic);
   const transfers = asksForTransfers(topic);
+  const creditCards = asksForCreditCards(topic);
   let categories = intent.categories.filter((category) => {
     if (category === "income") return income;
     if (category === "transfers") return transfers;
+    if (category === "credit-cards") return creditCards;
     return true;
   });
   if (allowExpand && income && !categories.includes("income")) {
@@ -260,6 +274,9 @@ export function applyQuestionGuards(
   }
   if (allowExpand && transfers && !categories.includes("transfers")) {
     categories = [...categories, "transfers"];
+  }
+  if (allowExpand && creditCards && !categories.includes("credit-cards")) {
+    categories = [...categories, "credit-cards"];
   }
   // A question that names categories uses those categories. "dining and bills"
   // keeps both. A follow-up that only names the new topic replaces the old
@@ -291,9 +308,7 @@ function isExcluded(tx: TxView, needles: string[]): boolean {
 function nonSpendingOnly(intent: QueryIntent): boolean {
   return (
     intent.categories.length > 0 &&
-    intent.categories.every(
-      (category) => category === "income" || category === "transfers",
-    )
+    intent.categories.every((category) => isNonSpendingCategory(category))
   );
 }
 
@@ -317,7 +332,7 @@ export function transactionMatches(tx: TxView, intent: QueryIntent): boolean {
   const hay = `${tx.narrative} ${tx.merchant}`;
   const merchantOk = intent.merchants.some((needle) => textHasMerchant(hay, needle));
   const categoryOk = intent.categories.includes(tx.category);
-  const nonSpending = tx.category === "income" || tx.category === "transfers";
+  const nonSpending = isNonSpendingCategory(tx.category);
   if (nonSpending && !categoryOk && !merchantOk) return false;
 
   if (intent.categories.length && intent.merchants.length) {
@@ -678,8 +693,8 @@ categories must be chosen from: ${CATEGORIES.join(", ")}.
 op is sum, list, max, or count.
 dateFrom and dateTo are YYYY-MM-DD or null.
 combine is "or" when any category or merchant should match (gas and coffee). combine is "and" when a merchant narrows a category.
-Leave income and transfers out of categories unless the user asked for income, paychecks, deposits, transfers, PayPal, Zelle, or Venmo.
-A mortgage or housing question is housing/mortgage only. A bills question is utilities/telecom only. Health insurance is insurance/health. Car insurance is insurance/auto. Do not answer those with healthcare, home, or another nearby category.
+Leave income, transfers, and credit-cards out of categories unless the user asked for income, paychecks, deposits, transfers, PayPal, Zelle, Venmo, or credit-card payments.
+A mortgage or housing question is housing/mortgage only. A bills question is utilities/telecom only. Health insurance is insurance/health only, not car insurance. Car insurance is insurance/auto only and does not include credit-card autopay. A credit-card payment question is credit-cards only. Do not answer those with healthcare, home, or another nearby category.
 If the user names a new category, replace the previous categories. Keep the previous categories only when the user is excluding or correcting a charge.
 If nothing in the list fits, return an empty categories array.
 Do not return transaction indexes, code, or rows.

@@ -272,14 +272,14 @@ describe("/api with a valid Access JWT", () => {
     const token = await tokenFor("no-dates@example.com");
     const run = vi.spyOn(env.AI, "run").mockImplementation(async () => ({
       response: JSON.stringify({
-        items: [{ merchant: "PLANET HOME", category: "home" }],
+        items: [{ merchant: "ACME WIDGETS", category: "home" }],
       }),
     }));
     const form = new FormData();
     form.set(
       "file",
       new File(
-        ["Date,Description,Amount\nnot-a-date,PLANET HOME,-1541.42\n"],
+        ["Date,Description,Amount\nnot-a-date,ACME WIDGETS,-1541.42\n"],
         "nodate.csv",
         { type: "text/csv" },
       ),
