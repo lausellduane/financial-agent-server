@@ -187,6 +187,15 @@ describe("categorizeNarrative", () => {
     expect(categorizeNarrative("JOHNSTON COUNTY PUBLIC UTILITIES", -6240, true)).toBe(
       "utilities/telecom",
     );
+    expect(categorizeNarrative("JOHNSTON COUNTY PUBLIC", -6240, true)).toBe(
+      "utilities/telecom",
+    );
+    expect(categorizeNarrative("JOHNSTON CO PUBLIC", -6240, true)).toBe(
+      "utilities/telecom",
+    );
+    expect(categorizeNarrative("JOHNSTON COUNTY PUBLIC SCHOOLS", -6240, true)).toBe(
+      "unknown",
+    );
     expect(categorizeNarrative("JOCO WATER SEWER", -4100, true)).toBe("utilities/telecom");
     expect(categorizeNarrative("CITY WATER DEPT", -3600, true)).toBe("utilities/telecom");
     expect(categorizeNarrative("FIJI WATER", -200, true)).toBe("unknown");
@@ -1410,7 +1419,7 @@ describe("/api spending queries", () => {
       ["2026-10-10", "DUKE ENERGY", "-227.32"],
       ["2026-10-11", "ATT PAYMENT", "-100.67"],
       ["2026-10-12", "PIEDMONT NATURAL GAS", "-49.86"],
-      ["2026-10-13", "JOHNSTON COUNTY PUBLIC UTILITIES", "-62.40"],
+      ["2026-10-13", "JOHNSTON COUNTY PUBLIC", "-62.40"],
       ["2026-10-14", "CITY GAS BILL", "-80.00"],
       ["2026-10-15", "MR COOPER MORTGAGE PMT", "-1510.00"],
       ["2026-10-16", "SHELL OIL", "-40.00"],
@@ -1481,7 +1490,7 @@ describe("/api spending queries", () => {
     expect(categoryOf("LOWE'S")).toBe("home");
     expect(categoryOf("LOWES #00677* GARNER")).toBe("home");
     expect(categoryOf("PEAK SEASONS HVAC PEAKSEASONSHV NC100126")).toBe("subscriptions");
-    expect(categoryOf("JOHNSTON COUNTY PUBLIC UTILITIES")).toBe("utilities/telecom");
+    expect(categoryOf("JOHNSTON COUNTY PUBLIC")).toBe("utilities/telecom");
     expect(categoryOf("CITY GAS BILL")).toBe("utilities/telecom");
     expect(categoryOf("MR COOPER MORTGAGE PMT")).toBe("housing/mortgage");
     expect(categoryOf("SHELL OIL")).toBe("gas/auto");
