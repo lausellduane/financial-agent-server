@@ -23,7 +23,7 @@ export const CATEGORIES = [
 export type Category = (typeof CATEGORIES)[number];
 
 // Bump this when merchant rules change so a stored ledger is rechecked once.
-export const CATEGORY_RULES_VERSION = "9";
+export const CATEGORY_RULES_VERSION = "10";
 
 export function isCategory(value: string): value is Category {
   return (CATEGORIES as readonly string[]).includes(value);
@@ -442,8 +442,17 @@ function isWaterSewerUtility(text: string): boolean {
   if (/\b(PARK|FIJI|DASANI|AQUAFINA|POLAND|NESTLE|BOTTLED)\b/.test(text)) return false;
   if (/\b(PUBLIC\s+UTILITIES|UTILITY\s+BILL|UTILITIES\s+BILL)\b/.test(text)) return true;
   if (/\bCOUNTY\s+UTIL/.test(text)) return true;
-  if (/\bJOCO\b/.test(text) && /\b(WATER|SEWER|UTIL)/.test(text)) return true;
+  if (/\bJOCO\b/.test(text) && /\b(WATER|SEWER|UTIL|PUBLIC)\b/.test(text)) return true;
   if (/\b(WATER|SEWER)\b/.test(text) && /\bCOUNTY\b/.test(text)) return true;
+  // Bank statements often truncate "County Public Utilities" to "COUNTY PUBLIC".
+  if (
+    (/\bCOUNTY\s+PUBLIC\b/.test(text) || /\bJOHNSTON\s+CO\s+PUBLIC\b/.test(text)) &&
+    !/\b(SCHOOLS?|LIBRARIES|LIBRARY|HEALTH|SHERIFF|TAX|COURT|COLLEGE|UNIVERSITY|DEFENDER|HOSPITAL|MUSEUM)\b/.test(
+      text,
+    )
+  ) {
+    return true;
+  }
   return (
     /\b(WATER|SEWER)\b/.test(text) &&
     /\b(MUNICIPAL|DEPT|DEPARTMENT|DISTRICT|AUTHORITY|UTILITY|UTILITIES|BILL)\b/.test(text)

@@ -481,7 +481,7 @@ test("node mode separates dining, bills, subscriptions, and the mortgage payment
       "2026-10-10,DUKE ENERGY,-227.32",
       "2026-10-11,ATT PAYMENT,-100.67",
       "2026-10-12,PIEDMONT NATURAL GAS,-49.86",
-      "2026-10-13,JOHNSTON COUNTY PUBLIC UTILITIES,-62.40",
+      "2026-10-13,JOHNSTON COUNTY PUBLIC,-62.40",
       "2026-10-14,CITY GAS BILL,-80.00",
       "2026-10-15,MR COOPER MORTGAGE PMT,-1510.00",
       "2026-10-16,SHELL OIL,-40.00",
