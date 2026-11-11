@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
-import { after, before, test } from "node:test";
+import { after, before, beforeEach, test } from "node:test";
 import { setCompleteChatForTests, type ChatTurn } from "./llm.ts";
-import { app } from "./server.ts";
+import { app, resetMemoryLedgerForTests } from "./server.ts";
 
 let base = "";
 let server: http.Server;
@@ -15,6 +15,11 @@ before(async () => {
   });
   const address = server.address() as AddressInfo;
   base = `http://127.0.0.1:${address.port}`;
+});
+
+// The Node ledger is process-wide and uploads append, so each test starts empty.
+beforeEach(() => {
+  resetMemoryLedgerForTests();
 });
 
 after(async () => {
@@ -114,9 +119,11 @@ test("node mode retries a merchant that failed categorization", async () => {
   setCompleteChatForTests(null);
 });
 
-test("node mode drops question context when the statement is replaced", async () => {
-  setCompleteChatForTests(async () =>
-    JSON.stringify({
+test("node mode drops question context when another statement is appended", async () => {
+  const prompts: string[] = [];
+  setCompleteChatForTests(async (messages: ChatTurn[]) => {
+    prompts.push(messages.map((message) => message.content).join("\n"));
+    return JSON.stringify({
       categories: ["gas/auto"],
       merchants: [],
       excludeMerchants: [],
@@ -124,8 +131,8 @@ test("node mode drops question context when the statement is replaced", async ()
       dateTo: null,
       op: "sum",
       combine: "or",
-    }),
-  );
+    });
+  });
   assert.equal(
     (await upload(csv(["2026-01-02,CHIPOTLE,-10.00", "2026-01-03,STARBUCKS,-4.00"])))
       .status,
@@ -138,10 +145,12 @@ test("node mode drops question context when the statement is replaced", async ()
       .status,
     200,
   );
-  const follow = await ask("exclude chipotle");
+  const follow = await ask("and the other one?");
+  assert.ok(prompts.length > 0);
+  assert.match(prompts[prompts.length - 1] ?? "", /Previous intent: null/);
   assert.match(follow, /SHELL/);
-  assert.doesNotMatch(follow, /STARBUCKS/);
-  assert.doesNotMatch(follow, /CHIPOTLE/);
+  assert.match(follow, /Total: \$40\.00/);
+  assert.doesNotMatch(follow, /STARBUCKS|CHIPOTLE/);
   setCompleteChatForTests(null);
 });
 
@@ -162,6 +171,8 @@ test("node mode keeps a mobile deposit out of gas and highest charge", async () 
   assert.match(gas, /Total: \$40\.00/);
   assert.doesNotMatch(gas, /2500|2460|CHIPOTLE/);
 
+  // An unsigned export is a separate scenario, not part of the signed ledger.
+  resetMemoryLedgerForTests();
   assert.equal(
     (await upload(csv(["2026-01-02,COSTCO,30.00", "2026-01-03,MOBILE DEPOSIT,2500.00"])))
       .status,
@@ -279,6 +290,7 @@ test("node mode does not treat a credit-union credit as fuel", async () => {
     "SHELL FEDERAL CREDIT UNION DEPOSIT",
     "SHELL FEDERAL CREDIT UNION",
   ]) {
+    resetMemoryLedgerForTests();
     assert.equal(
       (
         await upload(
@@ -523,6 +535,8 @@ test("node mode separates dining, bills, subscriptions, and the mortgage payment
   assert.match(mortgage, /Total: \$3051\.42/);
   assert.doesNotMatch(mortgage, /LOWE|PEAK SEASONS|72\.22/);
 
+  // Each statement below is its own scenario. Uploads append, so start empty.
+  resetMemoryLedgerForTests();
   const streamed = await upload(
     csv([
       "2026-10-01,PEACOCK TV LLC,-13.93",
@@ -564,6 +578,8 @@ test("node mode separates dining, bills, subscriptions, and the mortgage payment
   assert.match(retail, /PIXEL/);
   assert.doesNotMatch(retail, /NETFLIX|XBOX/);
 
+  // Each statement below is its own scenario. Uploads append, so start empty.
+  resetMemoryLedgerForTests();
   const insured = await upload(
     csv([
       "2026-10-01,CARY OBGYN 919-4675941,-50.00",
@@ -591,6 +607,7 @@ test("node mode separates dining, bills, subscriptions, and the mortgage payment
   assert.match(car, /No car insurance charges were found/);
   assert.doesNotMatch(car, /LOWE|PEAK SEASONS|OBGYN|WALGREENS|Blue Cross|578\.05/);
 
+  resetMemoryLedgerForTests();
   assert.equal(
     (
       await upload(
@@ -659,4 +676,115 @@ test("node mode keeps car insurance, medical insurance, and credit-card payments
   assert.match(cards, /Total: \$425\.78/);
   assert.doesNotMatch(cards, /GEICO|PROG|Blue Cross|Planet Home|ATT/i);
   setCompleteChatForTests(null);
+});
+
+type UploadBody = {
+  count?: number;
+  added?: number;
+  duplicates?: number;
+  total?: number;
+  error?: string;
+};
+
+type Report = {
+  loaded: boolean;
+  count: number;
+  startDate: string | null;
+  endDate: string | null;
+  uploadedAt: string | null;
+};
+
+async function report(): Promise<Report> {
+  return (await (await fetch(`${base}/api/report`)).json()) as Report;
+}
+
+test("node mode appends a second statement and drops repeated merchant, date, and amount", async () => {
+  setCompleteChatForTests(async () => {
+    throw new Error("no model call expected");
+  });
+  const feb = await upload(
+    csv([
+      "2026-02-03,FOOD LION,-50.00",
+      "2026-02-10,PUBLIX,-30.00",
+      "2026-02-11,SHELL OIL,-40.00",
+    ]),
+  );
+  assert.equal(feb.status, 200);
+  assert.deepEqual(
+    { added: (feb.body as UploadBody).added, total: (feb.body as UploadBody).total },
+    { added: 3, total: 3 },
+  );
+  const first = await report();
+  assert.deepEqual(
+    { count: first.count, startDate: first.startDate, endDate: first.endDate },
+    { count: 3, startDate: "2026-02-03", endDate: "2026-02-11" },
+  );
+
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  const marchCsv = csv([
+    // Already stored from February.
+    "2026-02-10,PUBLIX,-30.00",
+    // Same row, other date and amount formatting.
+    "02/11/2026,SHELL OIL,-40",
+    "2026-03-05,FOOD LION,-60.00",
+    // Repeated inside this file. Counted once by rule.
+    "2026-03-05,FOOD LION,-60.00",
+    "2026-04-02,PUBLIX,-25.00",
+  ]);
+  const march = await upload(marchCsv);
+  assert.equal(march.status, 200);
+  const body = march.body as UploadBody;
+  assert.deepEqual(
+    { count: body.count, added: body.added, duplicates: body.duplicates, total: body.total },
+    { count: 5, added: 2, duplicates: 3, total: 5 },
+  );
+  const next = await report();
+  assert.deepEqual(
+    { loaded: next.loaded, count: next.count, startDate: next.startDate, endDate: next.endDate },
+    { loaded: true, count: 5, startDate: "2026-02-03", endDate: "2026-04-02" },
+  );
+  assert.ok(first.uploadedAt && next.uploadedAt && first.uploadedAt < next.uploadedAt);
+
+  const again = await upload(marchCsv);
+  assert.equal(again.status, 200);
+  assert.equal((again.body as UploadBody).added, 0);
+  assert.equal((again.body as UploadBody).total, 5);
+  assert.equal((await report()).count, 5);
+
+  const groceries = await ask("How much did I spend on groceries?");
+  assert.match(groceries, /Total: \$165\.00/);
+
+  const sinceMarch = await ask("How much did I spend on groceries since March?");
+  assert.match(sinceMarch, /60\.00/);
+  assert.match(sinceMarch, /25\.00/);
+  assert.match(sinceMarch, /Total: \$85\.00/);
+  assert.doesNotMatch(sinceMarch, /50\.00|30\.00|SHELL/);
+
+  const range = await ask("How much did I spend on groceries from 2026-02-01 to 2026-03-31?");
+  assert.match(range, /Total: \$140\.00/);
+  assert.doesNotMatch(range, /25\.00/);
+  setCompleteChatForTests(null);
+});
+
+test("node mode refuses an upload that would pass the ledger row limit", async () => {
+  const rows = (count: number, start: number) =>
+    Array.from({ length: count }, (_, index) => {
+      const cents = start + index;
+      return `2026-01-01,SHELL OIL,-${Math.floor(cents / 100)}.${String(cents % 100).padStart(2, "0")}`;
+    });
+  const first = await upload(csv(rows(15_000, 100)));
+  assert.equal(first.status, 200);
+  assert.equal((first.body as UploadBody).total, 15_000);
+
+  const over = await upload(csv(rows(6_000, 100_000)));
+  assert.equal(over.status, 413);
+  assert.match((over.body as UploadBody).error ?? "", /21000 rows\. The limit is 20000\./);
+  const after = await report();
+  assert.equal(after.count, 15_000);
+
+  // Rows already stored do not count against the limit twice.
+  const overlap = await upload(csv([...rows(5_000, 100), ...rows(5_000, 100_000)]));
+  assert.equal(overlap.status, 200);
+  assert.equal((overlap.body as UploadBody).added, 5_000);
+  assert.equal((await report()).count, 20_000);
 });

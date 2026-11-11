@@ -406,3 +406,64 @@ export function parseCsv(rawCsv: string): Promise<Record<string, string>[]> {
       .on("error", reject);
   });
 }
+
+export type ShapeFields = { fields: DisplayFields; signed: boolean };
+
+// Rows from different bank exports can sit in one ledger. Columns and the sign
+// convention are picked per header layout, not from whichever row is first.
+export function headerShape(row: Record<string, string>): string {
+  return Object.keys(row).join("\u001f");
+}
+
+export function shapeFields(
+  rows: Record<string, string>[],
+): (row: Record<string, string>) => ShapeFields {
+  const groups = new Map<string, Record<string, string>[]>();
+  for (const row of rows) {
+    const shape = headerShape(row);
+    const group = groups.get(shape);
+    if (group) group.push(row);
+    else groups.set(shape, [row]);
+  }
+  const resolved = new Map<string, ShapeFields>();
+  for (const [shape, group] of groups) {
+    const fields = pickDisplayFields(group);
+    resolved.set(shape, { fields, signed: usesSignedCents(group, fields.amount) });
+  }
+  return (row) => {
+    const shape = headerShape(row);
+    const found = resolved.get(shape);
+    if (found) return found;
+    const fields = pickDisplayFields([row]);
+    const fallback = { fields, signed: usesSignedCents([row], fields.amount) };
+    resolved.set(shape, fallback);
+    return fallback;
+  };
+}
+
+const MONEY_COLUMN = /amount|amt|debit|credit|withdrawal|deposit/i;
+
+// Same merchant, date, and amount is one transaction, even if the bank would
+// call two identical charges separate visits. Compares parsed values, so a
+// re-export with "1,541.42" instead of "1541.42" or 3/1/2026 instead of
+// 2026-03-01 still matches.
+export function dedupeKey(row: Record<string, string>, fields: DisplayFields): string {
+  const rawDate = fields.date ? String(row[fields.date] ?? "") : "";
+  const date = normalizeDate(rawDate) || rawDate.trim().toUpperCase();
+  const merchant = String(row[fields.description] ?? "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toUpperCase();
+  const amount = parseAmountCents(fields.amount ? row[fields.amount] : undefined);
+  // Split debit/credit exports leave the picked column blank on the other side.
+  const otherMoney = Object.keys(row)
+    .filter((key) => key !== fields.amount && MONEY_COLUMN.test(key) && !/balance/i.test(key))
+    .sort()
+    .map((key) => parseAmountCents(row[key]));
+  return JSON.stringify([date, merchant, amount, ...otherMoney]);
+}
+
+export function dedupeKeys(rows: Record<string, string>[]): string[] {
+  const fieldsFor = shapeFields(rows);
+  return rows.map((row) => dedupeKey(row, fieldsFor(row).fields));
+}

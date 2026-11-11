@@ -1,5 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { CATEGORIES } from "./categories.js";
+import { dedupeKeys } from "./statement.js";
 
 export type TxRow = Record<string, string>;
 
@@ -25,11 +26,28 @@ export type ReportSummary = {
 export type StoredRow = {
   payload: TxRow;
   category: string;
+  // Same merchant, date, and amount. See dedupeKey in statement.ts.
+  key: string;
 };
+
+export type AppendResult =
+  | {
+      ok: true;
+      added: number;
+      duplicates: number;
+      total: number;
+      version: number;
+    }
+  | { ok: false; total: number };
 
 // Rows saved before categories existed have a NULL category. "unknown" means
 // a later attempt still owes the model a category. Neither is "other".
-export const LEDGER_MIGRATION = "001_category_and_query_intent";
+// 002 adds the dedupe key so a second upload appends instead of replacing.
+export const LEDGER_MIGRATIONS = [
+  "001_category_and_query_intent",
+  "002_append_dedupe_key",
+];
+export const LEDGER_MIGRATION: string = LEDGER_MIGRATIONS[LEDGER_MIGRATIONS.length - 1] ?? "";
 
 const INSERT_BATCH = 40;
 const ALLOWED = new Set<string>([...CATEGORIES, "unknown"]);
@@ -57,6 +75,13 @@ export function applyLedgerMigrations(sql: Sql): void {
     // earlier defaulted schema (see the spike doc).
     sql.exec("ALTER TABLE transactions ADD COLUMN category TEXT");
   }
+  if (!columns.some((column) => column.name === "dedupe_key")) {
+    sql.exec("ALTER TABLE transactions ADD COLUMN dedupe_key TEXT");
+  }
+  sql.exec(
+    "CREATE INDEX IF NOT EXISTS transactions_dedupe_key ON transactions (dedupe_key)",
+  );
+  backfillDedupeKeys(sql);
   sql.exec(`
     CREATE TABLE IF NOT EXISTS ledger_meta (
       key TEXT PRIMARY KEY,
@@ -69,14 +94,52 @@ export function applyLedgerMigrations(sql: Sql): void {
       name TEXT NOT NULL UNIQUE
     )
   `);
-  sql.exec(
-    "INSERT OR IGNORE INTO schema_migrations (name) VALUES (?)",
-    LEDGER_MIGRATION,
-  );
+  for (const name of LEDGER_MIGRATIONS) {
+    sql.exec("INSERT OR IGNORE INTO schema_migrations (name) VALUES (?)", name);
+  }
 }
 
-// One object per Access identity. The statement version is what stops a slow
-// query from writing the previous question back onto a replacement upload.
+// Rows stored by the replace-only upload have no key. Fill it in so the next
+// upload of the same statement is recognized. Nothing is deleted here, even if
+// an old upload stored the same charge twice.
+function backfillDedupeKeys(sql: Sql): void {
+  const missing = Number(
+    sql
+      .exec<{ n: number }>("SELECT COUNT(*) AS n FROM transactions WHERE dedupe_key IS NULL")
+      .toArray()[0]?.n ?? 0,
+  );
+  if (!missing) return;
+  const stored = sql
+    .exec<{ id: number; payload: string; dedupe_key: string | null }>(
+      "SELECT id, payload, dedupe_key FROM transactions ORDER BY id",
+    )
+    .toArray();
+  const keys = dedupeKeys(stored.map((row) => JSON.parse(row.payload) as TxRow));
+  stored.forEach((row, index) => {
+    if (row.dedupe_key !== null) return;
+    sql.exec(
+      "UPDATE transactions SET dedupe_key = ? WHERE id = ?",
+      keys[index] ?? null,
+      row.id,
+    );
+  });
+}
+
+function earlier(a: string | null, b: string | null): string | null {
+  if (!a) return b;
+  if (!b) return a;
+  return a < b ? a : b;
+}
+
+function later(a: string | null, b: string | null): string | null {
+  if (!a) return b;
+  if (!b) return a;
+  return a > b ? a : b;
+}
+
+// One object per Access identity. Uploads append to it. The statement version
+// still bumps on every upload, which stops a slow query from writing the
+// previous question or categories back onto a ledger that changed under it.
 export class Ledger extends DurableObject {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -123,51 +186,104 @@ export class Ledger extends DurableObject {
     return Number.isInteger(parsed) && parsed >= 0 ? parsed : 0;
   }
 
-  async replace(
+  private count(): number {
+    return Number(
+      this.ctx.storage.sql
+        .exec<{ n: number }>("SELECT COUNT(*) AS n FROM transactions")
+        .toArray()[0]?.n ?? 0,
+    );
+  }
+
+  private hasKey(key: string): boolean {
+    return (
+      this.ctx.storage.sql
+        .exec("SELECT 1 FROM transactions WHERE dedupe_key = ? LIMIT 1", key)
+        .toArray().length > 0
+    );
+  }
+
+  // Keys from this list that are not stored yet, in order, without repeats.
+  async unseenKeys(keys: string[]): Promise<string[]> {
+    return this.ctx.storage.transactionSync(() => {
+      const seen = new Set<string>();
+      const fresh: string[] = [];
+      for (const key of keys) {
+        if (seen.has(key)) continue;
+        seen.add(key);
+        if (!this.hasKey(key)) fresh.push(key);
+      }
+      return fresh;
+    });
+  }
+
+  // Adds rows whose key is not stored yet. Rejects the whole upload, without
+  // bumping the version, if the ledger would pass maxRows.
+  async append(
     rows: StoredRow[],
     range: DateRange = { startDate: null, endDate: null },
     rulesVersion: string | null = null,
-  ): Promise<{ count: number; version: number }> {
+    maxRows: number = Number.POSITIVE_INFINITY,
+  ): Promise<AppendResult> {
     const uploadedAt = new Date().toISOString();
-    let version = 0;
-    this.ctx.storage.transactionSync(() => {
-      version = this.version() + 1;
-      this.ctx.storage.sql.exec("DELETE FROM transactions");
-      for (let offset = 0; offset < rows.length; offset += INSERT_BATCH) {
-        const chunk = rows.slice(offset, offset + INSERT_BATCH);
-        const placeholders = chunk.map(() => "(?, ?)").join(", ");
+    return this.ctx.storage.transactionSync((): AppendResult => {
+      const before = this.count();
+      const seen = new Set<string>();
+      const fresh: StoredRow[] = [];
+      for (const row of rows) {
+        if (seen.has(row.key)) continue;
+        seen.add(row.key);
+        if (!this.hasKey(row.key)) fresh.push(row);
+      }
+      const total = before + fresh.length;
+      if (total > maxRows) return { ok: false, total };
+
+      const version = this.version() + 1;
+      for (let offset = 0; offset < fresh.length; offset += INSERT_BATCH) {
+        const chunk = fresh.slice(offset, offset + INSERT_BATCH);
+        const placeholders = chunk.map(() => "(?, ?, ?)").join(", ");
         const bindings = chunk.flatMap((row) => [
           JSON.stringify(row.payload),
           storedCategory(row.category),
+          row.key,
         ]);
         this.ctx.storage.sql.exec(
-          `INSERT INTO transactions (payload, category) VALUES ${placeholders}`,
+          `INSERT INTO transactions (payload, category, dedupe_key) VALUES ${placeholders}`,
           ...bindings,
         );
       }
+      const text = (key: string) => this.readMeta(key) || null;
+      const hadRows = before > 0;
+      const startDate = hadRows ? earlier(text("start_date"), range.startDate) : range.startDate;
+      const endDate = hadRows ? later(text("end_date"), range.endDate) : range.endDate;
       this.putMeta("statement_version", String(version));
       this.putMeta("intent", "");
       this.putMeta("intent_version", "");
       this.putMeta("uploaded_at", uploadedAt);
-      this.putMeta("start_date", range.startDate ?? "");
-      this.putMeta("end_date", range.endDate ?? "");
-      if (rulesVersion) this.putMeta("category_rules_version", rulesVersion);
-      else {
-        this.ctx.storage.sql.exec(
-          "DELETE FROM ledger_meta WHERE key = 'category_rules_version'",
-        );
+      this.putMeta("start_date", startDate ?? "");
+      this.putMeta("end_date", endDate ?? "");
+      // Older rows keep their stamp. If it is stale, the next query re-rules
+      // the whole ledger, new rows included.
+      if (!hadRows) {
+        if (rulesVersion) this.putMeta("category_rules_version", rulesVersion);
+        else {
+          this.ctx.storage.sql.exec(
+            "DELETE FROM ledger_meta WHERE key = 'category_rules_version'",
+          );
+        }
       }
+      return {
+        ok: true,
+        added: fresh.length,
+        duplicates: rows.length - fresh.length,
+        total,
+        version,
+      };
     });
-    return { count: rows.length, version };
   }
 
   async summary(): Promise<ReportSummary> {
     return this.ctx.storage.transactionSync(() => {
-      const count = Number(
-        this.ctx.storage.sql
-          .exec<{ n: number }>("SELECT COUNT(*) AS n FROM transactions")
-          .toArray()[0]?.n ?? 0,
-      );
+      const count = this.count();
       if (!count) {
         return {
           loaded: false,
