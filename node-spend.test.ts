@@ -269,6 +269,7 @@ test("node mode returns 409 when categorization finishes on a replaced statement
   const response = await pending;
   const body = (await response.json()) as { error?: string };
   assert.equal(response.status, 409);
+  assert.match(body.error ?? "", /Ask again/);
   assert.doesNotMatch(JSON.stringify(body), /9\.50/);
   setCompleteChatForTests(null);
 });
@@ -460,5 +461,151 @@ test("node mode rejects an invalid date before categorizing an unknown merchant"
   assert.match(exact, /ZOOPLEX/);
   assert.match(exact, /Total: \$5\.35/);
   assert.doesNotMatch(exact, /10\.00/);
+  setCompleteChatForTests(null);
+});
+
+test("node mode separates dining, bills, subscriptions, and the mortgage payment", async () => {
+  setCompleteChatForTests(async () => {
+    throw new Error("rules cover these merchants");
+  });
+  const uploaded = await upload(
+    csv([
+      "2026-10-02,CHIPOTLE,-10.00",
+      "2026-10-03,SQ *SHAKE SHACK RALEIGH,-8.00",
+      "2026-10-04,DOLLAR TREE GARNER,-4.00",
+      "2026-10-05,DOA FAIR ETIX TICKETS RALEIGH,-26.20",
+      "2026-10-06,SQ *THE CUB HOUSE PLAY GOSQ.COM,-23.99",
+      "2026-10-07,LOWE'S,-17.06",
+      "2026-10-08,LOWES #00677* GARNER,-38.00",
+      "2026-10-09,PEAK SEASONS HVAC PEAKSEASONSHV NC100126,-17.16",
+      "2026-10-10,DUKE ENERGY,-227.32",
+      "2026-10-11,ATT PAYMENT,-100.67",
+      "2026-10-12,PIEDMONT NATURAL GAS,-49.86",
+      "2026-10-13,JOHNSTON COUNTY PUBLIC UTILITIES,-62.40",
+      "2026-10-14,CITY GAS BILL,-80.00",
+      "2026-10-15,MR COOPER MORTGAGE PMT,-1510.00",
+      "2026-10-16,SHELL OIL,-40.00",
+    ]),
+  );
+  assert.equal(uploaded.status, 200);
+  assert.equal(uploaded.body.uncategorized, 0);
+
+  const eating = await ask("How much did I spent eating out?");
+  assert.match(eating, /CHIPOTLE/);
+  assert.match(eating, /SHAKE SHACK/);
+  assert.match(eating, /Total: \$18\.00/);
+  assert.doesNotMatch(eating, /DOLLAR TREE|ETIX|CUB HOUSE/);
+
+  const shopping = await ask("shopping");
+  assert.match(shopping, /DOLLAR TREE/);
+  assert.match(shopping, /Total: \$4\.00/);
+  const tickets = await ask("How much did I spend on tickets?");
+  assert.match(tickets, /ETIX/);
+  assert.match(tickets, /Total: \$26\.20/);
+  const subs = await ask("subscriptions");
+  assert.match(subs, /CUB HOUSE/);
+  assert.match(subs, /PEAK SEASONS/);
+  assert.match(subs, /Total: \$41\.15/);
+  assert.doesNotMatch(subs, /LOWE|SHAKE SHACK/);
+
+  const bills = await ask("How much did I spent in bills?");
+  assert.match(bills, /Duke Energy/);
+  assert.match(bills, /ATT/);
+  assert.match(bills, /Piedmont/);
+  assert.match(bills, /JOHNSTON/);
+  assert.match(bills, /Total: \$520\.25/);
+  assert.doesNotMatch(bills, /LOWE|PEAK SEASONS|17\.06|38\.00|17\.16|SHELL OIL/);
+
+  const mortgage = await ask("How much did I spent in mortgage?");
+  assert.match(mortgage, /MR COOPER/);
+  assert.match(mortgage, /Total: \$1510\.00/);
+  assert.doesNotMatch(mortgage, /LOWE|PEAK SEASONS|72\.22/);
+
+  const streamed = await upload(
+    csv([
+      "2026-10-01,PEACOCK TV LLC,-13.93",
+      "2026-10-02,NETFLIX.COM NETFLIX.COM,-21.44",
+      "2026-10-03,RING SOLO PLAN RING.COM,-4.99",
+      "2026-10-04,GOOGLE*G1SK003M 650-2530000,-9.99",
+      "2026-10-05,DISNEYPLUS HULU BUNDLE,-15.99",
+      "2026-10-06,CLOUDFLARE,-20.00",
+      "2026-10-07,MICROSOFT*XBOX GAME PASS,-16.99",
+      "2026-10-08,X CORP,-8.00",
+      "2026-10-09,SQ *THE CUB HOUSE PLAY GOSQ.COM,-23.99",
+      "2026-10-10,PEAK SEASONS HVAC PEAKSEASONSHV NC100126,-17.16",
+      "2026-10-11,MICROSOFT STORE,-50.00",
+      "2026-10-12,GOOGLE *PIXEL 8,-199.00",
+      "2026-10-13,CHIPOTLE,-10.00",
+    ]),
+  );
+  assert.equal(streamed.status, 200);
+  assert.equal(streamed.body.uncategorized, 0);
+  const streamedSubs = await ask("How much did I spent in subscriptions?");
+  for (const name of [
+    "PEACOCK",
+    "NETFLIX",
+    "RING",
+    "GOOGLE*G1SK003M",
+    "DISNEYPLUS",
+    "CLOUDFLARE",
+    "XBOX",
+    "X CORP",
+    "CUB HOUSE",
+    "PEAK SEASONS",
+  ]) {
+    assert.match(streamedSubs, new RegExp(name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  }
+  assert.match(streamedSubs, /Total: \$152\.48/);
+  assert.doesNotMatch(streamedSubs, /MICROSOFT STORE|PIXEL|CHIPOTLE/);
+  const retail = await ask("shopping");
+  assert.match(retail, /MICROSOFT STORE/);
+  assert.match(retail, /PIXEL/);
+  assert.doesNotMatch(retail, /NETFLIX|XBOX/);
+
+  const insured = await upload(
+    csv([
+      "2026-10-01,CARY OBGYN 919-4675941,-50.00",
+      "2026-10-02,WALGREENS,-7.65",
+      "2026-10-03,WALGREENS STORE,-7.71",
+      "2026-10-04,WALGREENS STORE,-2.03",
+      "2026-10-05,BLUE CROSS BLUE SHIELD,-438.44",
+      "2026-10-06,LOWE'S,-17.06",
+      "2026-10-07,LOWES #00677* GARNER,-38.00",
+      "2026-10-08,PEAK SEASONS HVAC PEAKSEASONSHV NC100126,-17.16",
+    ]),
+  );
+  assert.equal(insured.status, 200);
+  assert.equal(insured.body.uncategorized, 0);
+  const insurance = await ask("How much did I spent in insurance?");
+  assert.match(insurance, /Blue Cross Blue Shield/);
+  assert.match(insurance, /Total: \$438\.44/);
+  assert.doesNotMatch(insurance, /OBGYN|WALGREENS|LOWE|PEAK SEASONS/);
+  const medical = await ask("How much did I spend on medical?");
+  assert.match(medical, /OBGYN/);
+  assert.match(medical, /WALGREENS/);
+  assert.match(medical, /Total: \$67\.39/);
+  assert.doesNotMatch(medical, /Blue Cross|LOWE/);
+  const car = await ask("How about car insurance?");
+  assert.match(car, /No car insurance charges were found/);
+  assert.doesNotMatch(car, /LOWE|PEAK SEASONS|OBGYN|WALGREENS|Blue Cross|578\.05/);
+
+  assert.equal(
+    (
+      await upload(
+        csv([
+          "2026-10-01,GEICO,-90.00",
+          "2026-10-02,LOWE'S,-17.06",
+          "2026-10-03,CARY OBGYN 919-4675941,-50.00",
+          "2026-10-04,BLUE CROSS BLUE SHIELD,-438.44",
+        ]),
+      )
+    ).status,
+    200,
+  );
+  await ask("How much did I spent in insurance?");
+  const onlyCar = await ask("How about car insurance?");
+  assert.match(onlyCar, /GEICO/);
+  assert.match(onlyCar, /Total: \$90\.00/);
+  assert.doesNotMatch(onlyCar, /LOWE|OBGYN|Blue Cross/);
   setCompleteChatForTests(null);
 });

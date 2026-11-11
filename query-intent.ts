@@ -89,7 +89,14 @@ const CATEGORY_PATTERNS: { category: Category; pattern: RegExp }[] = [
       /\b(eat(?:ing)? out|dining|restaurants?|fast food|take-?out|takeout|food delivery)\b/i,
   },
   { category: "groceries", pattern: /\b(grocer(?:y|ies)|supermarket)\b/i },
-  { category: "shopping", pattern: /\b(shopping|clothes|clothing|retail)\b/i },
+  {
+    category: "shopping",
+    pattern: /\b(shopping|clothes|clothing|retail|general merchandise|merchandise)\b/i,
+  },
+  {
+    category: "entertainment/events",
+    pattern: /\b(entertainment|events?|tickets|concerts?)\b/i,
+  },
   {
     category: "subscriptions",
     pattern: /\b(subscriptions?|streaming|memberships?)\b/i,
@@ -97,12 +104,20 @@ const CATEGORY_PATTERNS: { category: Category; pattern: RegExp }[] = [
   {
     category: "utilities/telecom",
     pattern:
-      /\b(utilities|utility|electric|telecom|internet|natural gas|gas bill)\b/i,
+      /\b(utilities|utility|electric|telecom|internet|natural gas|gas bill|bills|water bill|sewer bill)\b/i,
+  },
+  {
+    category: "insurance/auto",
+    pattern: /\b((?:car|auto|vehicle)\s+insurance)\b/i,
+  },
+  {
+    category: "insurance/health",
+    pattern: /\b((?:health|medical)\s+insurance|insurance)\b/i,
   },
   {
     category: "healthcare",
     pattern:
-      /\b(healthcare|health care|medical|doctor|dentist|pharmacy|hospital)\b/i,
+      /\b(healthcare|health care|medical(?!\s+insurance)|doctor|dentist|pharmacy|hospital)\b/i,
   },
   { category: "transfers", pattern: /\b(transfers?|zelle|venmo|wire)\b/i },
   {
@@ -117,6 +132,10 @@ const CATEGORY_PATTERNS: { category: Category; pattern: RegExp }[] = [
   {
     category: "home",
     pattern: /\b(home improvement|hardware|household|hvac)\b/i,
+  },
+  {
+    category: "housing/mortgage",
+    pattern: /\b(mortgage|mortgages|home loan|housing)\b/i,
   },
 ];
 
@@ -242,6 +261,14 @@ export function applyQuestionGuards(
   if (allowExpand && transfers && !categories.includes("transfers")) {
     categories = [...categories, "transfers"];
   }
+  // A question that names categories uses those categories. "dining and bills"
+  // keeps both. A follow-up that only names the new topic replaces the old
+  // list, because that list is not part of this question. A correction
+  // ("exclude chipotle") keeps the previous categories.
+  if (!isCorrection(topic)) {
+    const named = categoriesNamedIn(topic);
+    if (named.length) categories = named;
+  }
   const strippedAll =
     intent.categories.length > 0 &&
     categories.length === 0 &&
@@ -324,7 +351,12 @@ export function totalCents(rows: TxView[], intent?: QueryIntent): number {
 }
 
 export function formatAnswer(rows: TxView[], intent: QueryIntent): string {
-  if (!rows.length) return "No matching charges located.";
+  if (!rows.length) {
+    if (intent.categories.length === 1 && intent.categories[0] === "insurance/auto") {
+      return "No car insurance charges were found.";
+    }
+    return "No matching charges located.";
+  }
   const lines = rows.map(
     (row) => `${row.merchant}: ${formatSignedCents(lineCents(row, intent))}`,
   );
@@ -417,6 +449,20 @@ function dedupe(values: string[]): string[] {
 
 function pushCategory(categories: Category[], category: Category): void {
   if (!categories.includes(category)) categories.push(category);
+}
+
+function categoriesNamedIn(topic: string): Category[] {
+  const named: Category[] = [];
+  const carInsurance = /\b(?:car|auto|vehicle)\s+insurance\b/i.test(topic);
+  for (const entry of CATEGORY_PATTERNS) {
+    if (carInsurance && entry.category === "insurance/health") continue;
+    if (entry.pattern.test(topic)) pushCategory(named, entry.category);
+  }
+  const naturalGas = /\b(natural gas|gas bill)\b/i.test(topic);
+  if (!naturalGas && /\b(gas|gasoline|fuel)\b/i.test(topic)) {
+    pushCategory(named, "gas/auto");
+  }
+  return named;
 }
 
 function monthRange(question: string): { from: string; to: string } | null {
@@ -633,7 +679,9 @@ op is sum, list, max, or count.
 dateFrom and dateTo are YYYY-MM-DD or null.
 combine is "or" when any category or merchant should match (gas and coffee). combine is "and" when a merchant narrows a category.
 Leave income and transfers out of categories unless the user asked for income, paychecks, deposits, transfers, PayPal, Zelle, or Venmo.
-If this refines the previous intent, keep its categories and add exclusions.
+A mortgage or housing question is housing/mortgage only. A bills question is utilities/telecom only. Health insurance is insurance/health. Car insurance is insurance/auto. Do not answer those with healthcare, home, or another nearby category.
+If the user names a new category, replace the previous categories. Keep the previous categories only when the user is excluding or correcting a charge.
+If nothing in the list fits, return an empty categories array.
 Do not return transaction indexes, code, or rows.
 Previous intent: ${previousText}`,
     },

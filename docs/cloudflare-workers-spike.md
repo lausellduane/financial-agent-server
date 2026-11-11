@@ -15,7 +15,7 @@
 
 The companion UI (`lausellduane/financial-agent-ui`, Expo 57 / React Native) posts to the upload and query routes and reads `count` from the upload response and `answer` or `error` from the query response. `App.tsx` hardcodes `http://localhost:4000` on web and iOS, and `http://10.0.2.2:4000` on the Android emulator. It sends no auth header and no session id. The web build needs CORS. Native builds do not.
 
-Each row is categorized on upload. Merchant rules run first. Only unknown merchant names go to the model, in batches of 40. A model failure stores `unknown` and the next query tries again. Rows saved before categories existed are backfilled from the rules on the next read, so they are not treated as `other`. A refund stays in its spending category and reduces the net total. "What was my highest charge?" is the largest money-out, so a deposit does not win. Named questions are parsed in code. An explicit `YYYY-MM-DD` that is not a real calendar day, or a range whose start is after its end, is HTTP 400 before categorization, intent, or any stored-category change. Anything else asks the model for intent JSON only. The model does not see the ledger. The last intent is kept until the next upload replaces the statement. Responses are one JSON body. The server does not stream.
+Each row is categorized on upload. Merchant rules run first. Only unknown merchant names go to the model, in batches of 40. A model failure stores `unknown` and the next query tries again. Rows saved before categories existed are backfilled from the rules on the next read, so they are not treated as `other`. A later query also rewrites a stored category when a merchant rule now disagrees with it. Dollar and discount stores are shopping. Ticket vendors are `entertainment/events`. A Square membership, a home maintenance plan, Disney+/Hulu, Cloudflare, Xbox Game Pass, and X Premium are subscriptions. A Google or Microsoft store purchase stays shopping. A Square restaurant stays dining. County and municipal water and sewer are utilities. A mortgage payment is `housing/mortgage`. Questions about bills and mortgage stay on those categories and do not fall back to home. Health insurance is `insurance/health` and car insurance is `insurance/auto`. A pharmacy or doctor stays healthcare. A follow-up that names a new category replaces the previous one. A refund stays in its spending category and reduces the net total. "What was my highest charge?" is the largest money-out, so a deposit does not win. Named questions are parsed in code. An explicit `YYYY-MM-DD` that is not a real calendar day, or a range whose start is after its end, is HTTP 400 before categorization, intent, or any stored-category change. Anything else asks the model for intent JSON only. The model does not see the ledger. The last intent is kept until the next upload replaces the statement. Responses are one JSON body. The server does not stream.
 
 ## Model
 
@@ -67,7 +67,7 @@ Two gaps found while booting the app:
 | `ollama` 0.6.3 | Used only when `LLM_PROVIDER` is `ollama`. The import is `ollama/browser` (global `fetch`). The Node entry of the package reads image files with `node:fs` and is not used. |
 | `dotenv` | A dependency, and not imported. Vars and secrets arrive on `process.env`. |
 
-The dry-run bundle is **1751.29 KiB uncompressed** (gzip 401.45 KiB). The limit is **64 MiB uncompressed** ([Limits](https://developers.cloudflare.com/workers/platform/limits/)). Wrangler 4.157.0 produced that bundle with `npm run check:worker`.
+The dry-run bundle is **1761.91 KiB uncompressed** (gzip 404.33 KiB). The limit is **64 MiB uncompressed** ([Limits](https://developers.cloudflare.com/workers/platform/limits/)). Wrangler 4.157.0 produced that bundle with `npm run check:worker`.
 
 ## Secrets, variables, and storage
 
@@ -98,7 +98,7 @@ On the Worker, parsed rows go to a SQLite Durable Object, class `Ledger`, bindin
 
 The earlier proof of concept keyed the object by the raw email. Those objects are orphaned. Anyone who uploaded on that deploy has to upload the statement again.
 
-Categories are stored on each row. A ledger created from current `master` has no category column; the migration adds a nullable column and the next read fills it from merchant rules. An unmerged earlier commit on this branch used `NOT NULL DEFAULT 'other'`. GitHub Actions workflows, the Deployments API, and `master` history show no deploy of that commit: `master` is the spike, the report route, and the Access token check. Rows already saved as `other` are not rewritten, because that can be a real classification. If a private deploy of that defaulted schema exists outside this repository, those rows stay `other` until someone uploads again.
+Categories are stored on each row. A ledger created from current `master` has no category column; the migration adds a nullable column and the next read fills it from merchant rules. An unmerged earlier commit on this branch used `NOT NULL DEFAULT 'other'`. GitHub Actions workflows, the Deployments API, and `master` history show no deploy of that commit: `master` is the spike, the report route, and the Access token check. Rows already saved as `other` are not rewritten when no merchant rule matches, because that can be a real classification. A matching rule does replace a stored category, including one the model saved as dining. If a private deploy of that defaulted schema exists outside this repository, those rows stay `other` until someone uploads again.
 
 A signed refund that matches a spending merchant reduces that category. A positive-only file does not say which of two identical merchant amounts is a refund, so those rows are not guessed. A credit that matches no spending rule, including an explicit mobile or direct deposit, is income. A credit union or bank line is not a fuel purchase when its name contains Shell or Mobil. A city gas bill is a utility. Gasoline at Costco is fuel. `CHIPOTLE PENDING` keeps the merchant name; a description that is only `pending` is still labeled Pending. Uncategorized charges and zero-amount rows stay in the stored count and are named, with the missing amount, when a total leaves them out. A question that is still running when a new statement is uploaded returns 409 and does not answer with the old amounts.
 
@@ -203,7 +203,7 @@ npm start              # Node, http://localhost:4000
 `npm run check:worker` with Wrangler 4.157.0:
 
 ```text
-Total Upload: 1751.29 KiB / gzip: 401.45 KiB
+Total Upload: 1761.91 KiB / gzip: 404.33 KiB
 env.LEDGER (Ledger)     Durable Object
 env.AI                  AI
 env.LLM_PROVIDER        workers-ai

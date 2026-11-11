@@ -126,6 +126,7 @@ export class Ledger extends DurableObject {
   async replace(
     rows: StoredRow[],
     range: DateRange = { startDate: null, endDate: null },
+    rulesVersion: string | null = null,
   ): Promise<{ count: number; version: number }> {
     const uploadedAt = new Date().toISOString();
     let version = 0;
@@ -150,6 +151,12 @@ export class Ledger extends DurableObject {
       this.putMeta("uploaded_at", uploadedAt);
       this.putMeta("start_date", range.startDate ?? "");
       this.putMeta("end_date", range.endDate ?? "");
+      if (rulesVersion) this.putMeta("category_rules_version", rulesVersion);
+      else {
+        this.ctx.storage.sql.exec(
+          "DELETE FROM ledger_meta WHERE key = 'category_rules_version'",
+        );
+      }
     });
     return { count: rows.length, version };
   }
@@ -184,7 +191,11 @@ export class Ledger extends DurableObject {
     });
   }
 
-  async load(): Promise<{ records: LedgerRecord[]; version: number }> {
+  async load(): Promise<{
+    records: LedgerRecord[];
+    version: number;
+    rulesVersion: string | null;
+  }> {
     return this.ctx.storage.transactionSync(() => {
       const version = this.version();
       const stored = this.ctx.storage.sql
@@ -194,6 +205,7 @@ export class Ledger extends DurableObject {
         .toArray();
       return {
         version,
+        rulesVersion: this.readMeta("category_rules_version"),
         records: stored.map((row) => ({
           id: row.id,
           payload: JSON.parse(row.payload) as TxRow,
@@ -207,6 +219,7 @@ export class Ledger extends DurableObject {
   async updateCategories(
     updates: { id: number; category: string }[],
     version: number,
+    rulesVersion: string | null = null,
   ): Promise<boolean> {
     return this.ctx.storage.transactionSync(() => {
       if (this.version() !== version) return false;
@@ -217,6 +230,7 @@ export class Ledger extends DurableObject {
           update.id,
         );
       }
+      if (rulesVersion) this.putMeta("category_rules_version", rulesVersion);
       return true;
     });
   }
@@ -226,6 +240,18 @@ export class Ledger extends DurableObject {
       if (this.version() !== version) return false;
       this.putMeta("intent", intent);
       this.putMeta("intent_version", String(version));
+      return true;
+    });
+  }
+
+  async loadRulesVersion(): Promise<string | null> {
+    return this.ctx.storage.transactionSync(() => this.readMeta("category_rules_version"));
+  }
+
+  async saveRulesVersion(rulesVersion: string, statementVersion: number): Promise<boolean> {
+    return this.ctx.storage.transactionSync(() => {
+      if (this.version() !== statementVersion) return false;
+      this.putMeta("category_rules_version", rulesVersion);
       return true;
     });
   }

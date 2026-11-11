@@ -14,6 +14,7 @@ import {
 import {
   CATEGORY_BATCH,
   buildCategoryMessages,
+  CATEGORY_RULES_VERSION,
   categorizeNarrative,
   isCategory,
   parseCategoryAssignments,
@@ -71,6 +72,7 @@ type MemoryLedger = {
   startDate: string | null;
   endDate: string | null;
   nextId: number;
+  rulesVersion: string | null;
 };
 
 // Node dev keeps one statement for the whole process. It is not split by
@@ -83,6 +85,7 @@ let memory: MemoryLedger = {
   startDate: null,
   endDate: null,
   nextId: 1,
+  rulesVersion: null,
 };
 
 const moduleUrl = import.meta.url;
@@ -138,6 +141,37 @@ function needsCategory(category: string | null): boolean {
   return category === null || category === "unknown";
 }
 
+type RuleContext = {
+  fields: ReturnType<typeof pickDisplayFields>;
+  signed: boolean;
+};
+
+function ruleContext(records: LedgerRecord[]): RuleContext {
+  const payloads = records.map((record) => record.payload);
+  const fields = pickDisplayFields(payloads);
+  return { fields, signed: usesSignedCents(payloads, fields.amount) };
+}
+
+function ruledCategory(record: LedgerRecord, context: RuleContext): ReturnType<typeof categorizeNarrative> {
+  const narrative = rowNarrative(record.payload, context.fields.description);
+  const cents = parseAmountCents(
+    context.fields.amount ? record.payload[context.fields.amount] : undefined,
+  );
+  return categorizeNarrative(narrative, cents, context.signed);
+}
+
+// A merchant rule replaces a stored category that disagrees with it, including
+// one the model previously saved. "other" with no matching rule stays put.
+// The sign and columns come from the whole ledger, not from this subset.
+function recordsToResolve(records: LedgerRecord[], context: RuleContext, stale: boolean): LedgerRecord[] {
+  return records.filter((record) => {
+    if (!stale) return needsCategory(record.category);
+    const ruled = ruledCategory(record, context);
+    if (ruled !== "unknown") return ruled !== record.category;
+    return needsCategory(record.category);
+  });
+}
+
 async function classifyUnknown(narratives: string[]): Promise<Map<string, Category>> {
   const assigned = new Map<string, Category>();
   for (let offset = 0; offset < narratives.length; offset += CATEGORY_BATCH) {
@@ -157,22 +191,16 @@ async function classifyUnknown(narratives: string[]): Promise<Map<string, Catego
   return assigned;
 }
 
-async function resolveCategories(records: LedgerRecord[]): Promise<LedgerRecord[]> {
+async function resolveCategories(
+  records: LedgerRecord[],
+  context: RuleContext,
+): Promise<LedgerRecord[]> {
   if (!records.length) return [];
-  const payloads = records.map((record) => record.payload);
-  const fields = pickDisplayFields(payloads);
-  const signed = usesSignedCents(payloads, fields.amount);
-  const draft = records.map((record) => {
-    const narrative = rowNarrative(record.payload, fields.description);
-    const cents = parseAmountCents(
-      fields.amount ? record.payload[fields.amount] : undefined,
-    );
-    return {
-      record,
-      narrative,
-      ruled: categorizeNarrative(narrative, cents, signed),
-    };
-  });
+  const draft = records.map((record) => ({
+    record,
+    narrative: rowNarrative(record.payload, context.fields.description),
+    ruled: ruledCategory(record, context),
+  }));
   const pending = [
     ...new Set(
       draft
@@ -192,9 +220,13 @@ async function resolveCategories(records: LedgerRecord[]): Promise<LedgerRecord[
 
 async function readLedger(
   identity: AccessIdentity | undefined,
-): Promise<{ records: LedgerRecord[]; version: number }> {
+): Promise<{ records: LedgerRecord[]; version: number; rulesVersion: string | null }> {
   if (!onWorkers()) {
-    return { records: memory.rows, version: memory.version };
+    return {
+      records: memory.rows,
+      version: memory.version,
+      rulesVersion: memory.rulesVersion,
+    };
   }
   if (!identity) throw new Error("Missing Access identity");
   return (await ledgerStub(identity)).load();
@@ -217,12 +249,12 @@ async function writeLedger(
       payload: row.payload,
       category: row.category,
     }));
+    memory.rulesVersion = CATEGORY_RULES_VERSION;
     return memory.version;
   }
   if (!identity) throw new Error("Missing Access identity");
-  const saved = await (
-    await ledgerStub(identity)
-  ).replace(rows, range);
+  const stub = await ledgerStub(identity);
+  const saved = await stub.replace(rows, range, CATEGORY_RULES_VERSION);
   return saved.version;
 }
 
@@ -230,19 +262,23 @@ async function updateCategories(
   updates: { id: number; category: string }[],
   version: number,
   identity: AccessIdentity | undefined,
+  rulesVersion: string | null = null,
 ): Promise<boolean> {
-  if (!updates.length) return true;
+  if (!updates.length && !rulesVersion) return true;
   if (!onWorkers()) {
     if (memory.version !== version) return false;
-    const byId = new Map(updates.map((update) => [update.id, update.category]));
-    memory.rows = memory.rows.map((row) => {
-      const category = byId.get(row.id);
-      return category === undefined ? row : { ...row, category };
-    });
+    if (updates.length) {
+      const byId = new Map(updates.map((update) => [update.id, update.category]));
+      memory.rows = memory.rows.map((row) => {
+        const category = byId.get(row.id);
+        return category === undefined ? row : { ...row, category };
+      });
+    }
+    if (rulesVersion) memory.rulesVersion = rulesVersion;
     return true;
   }
   if (!identity) throw new Error("Missing Access identity");
-  return (await ledgerStub(identity)).updateCategories(updates, version);
+  return (await ledgerStub(identity)).updateCategories(updates, version, rulesVersion);
 }
 
 async function readIntent(
@@ -280,29 +316,52 @@ async function writeIntent(
   return (await ledgerStub(identity)).saveIntent(raw, version);
 }
 
+async function saveRulesVersion(
+  version: string,
+  statementVersion: number,
+  identity: AccessIdentity | undefined,
+): Promise<boolean> {
+  if (!onWorkers()) {
+    if (memory.version !== statementVersion) return false;
+    memory.rulesVersion = version;
+    return true;
+  }
+  if (!identity) throw new Error("Missing Access identity");
+  return (await ledgerStub(identity)).saveRulesVersion(version, statementVersion);
+}
+
 async function hydrate(
   identity: AccessIdentity | undefined,
 ): Promise<{ records: LedgerRecord[]; version: number; unknown: number }> {
   const loaded = await readLedger(identity);
-  const pending = loaded.records.filter((record) => needsCategory(record.category));
-  if (!pending.length) {
-    return {
-      records: loaded.records,
-      version: loaded.version,
-      unknown: 0,
-    };
+  if (!loaded.records.length) {
+    return { records: [], version: loaded.version, unknown: 0 };
   }
-  const resolved = await resolveCategories(pending);
-  const updates = resolved
-    .filter((record) => record.category !== null)
-    .map((record) => ({ id: record.id, category: record.category ?? "unknown" }));
-  const wrote = await updateCategories(updates, loaded.version, identity);
-  if (!wrote) throw new StatementChanged();
-  const byId = new Map(resolved.map((record) => [record.id, record.category]));
-  const records = loaded.records.map((record) => {
-    const category = byId.get(record.id);
-    return category === undefined ? record : { ...record, category };
-  });
+  const context = ruleContext(loaded.records);
+  const stale = loaded.rulesVersion !== CATEGORY_RULES_VERSION;
+  const pending = recordsToResolve(loaded.records, context, stale);
+  let records = loaded.records;
+  if (pending.length) {
+    const resolved = await resolveCategories(pending, context);
+    const updates = resolved
+      .filter((record) => record.category !== null)
+      .map((record) => ({ id: record.id, category: record.category ?? "unknown" }));
+    const wrote = await updateCategories(
+      updates,
+      loaded.version,
+      identity,
+      stale ? CATEGORY_RULES_VERSION : null,
+    );
+    if (!wrote) throw new StatementChanged();
+    const byId = new Map(resolved.map((record) => [record.id, record.category]));
+    records = loaded.records.map((record) => {
+      const category = byId.get(record.id);
+      return category === undefined ? record : { ...record, category };
+    });
+  } else if (stale) {
+    const stamped = await saveRulesVersion(CATEGORY_RULES_VERSION, loaded.version, identity);
+    if (!stamped) throw new StatementChanged();
+  }
   return {
     records,
     version: loaded.version,
@@ -525,9 +584,8 @@ app.post(
         });
         return;
       }
-      const categorized = await resolveCategories(
-        rows.map((payload) => ({ id: 0, payload, category: null })),
-      );
+      const uploadedRows = rows.map((payload) => ({ id: 0, payload, category: null }));
+      const categorized = await resolveCategories(uploadedRows, ruleContext(uploadedRows));
       const range = rows.length ? statementDateRange(rows) : { startDate: null, endDate: null };
       await writeLedger(
         categorized.map((record) => ({
