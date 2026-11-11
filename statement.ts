@@ -560,26 +560,60 @@ export function dedupeKeys(rows: Record<string, string>[]): string[] {
   });
 }
 
-// Which rows of a file are new. The n-th copy of a key in the file is new only
-// when the ledger holds fewer than n rows with that key. Two real $2.75 fares
+// Each row's copy number of its key within the file: the first row with a
+// key is copy 1, the next row with the same key is copy 2, and so on.
+export function copyNumbers(keys: string[]): number[] {
+  const seen = new Map<string, number>();
+  return keys.map((key) => {
+    const copy = (seen.get(key) ?? 0) + 1;
+    seen.set(key, copy);
+    return copy;
+  });
+}
+
+// Which entries (by index) are new. Copy n of a key is new only when the
+// ledger holds fewer than n rows with that key. Callers that send only part
+// of a file pass each row's copy number from the whole file, so the second
+// fare in a file still counts as copy 2 when the first was already stored.
+// An entry without a valid copy number is numbered by its place in this list.
+// A copy number already used earlier in this list is not stored twice.
+export function freshByCopy(
+  entries: { key: string; copy?: number | undefined }[],
+  storedCount: (key: string) => number,
+): number[] {
+  const fallback = copyNumbers(entries.map((entry) => entry.key));
+  const stored = new Map<string, number>();
+  const used = new Map<string, Set<number>>();
+  const fresh: number[] = [];
+  entries.forEach((entry, index) => {
+    const given = entry.copy;
+    const copy =
+      typeof given === "number" && Number.isInteger(given) && given >= 1
+        ? given
+        : (fallback[index] ?? 1);
+    let taken = used.get(entry.key);
+    if (!taken) {
+      taken = new Set();
+      used.set(entry.key, taken);
+    }
+    if (taken.has(copy)) return;
+    taken.add(copy);
+    let have = stored.get(entry.key);
+    if (have === undefined) {
+      have = storedCount(entry.key);
+      stored.set(entry.key, have);
+    }
+    if (copy > have) fresh.push(index);
+  });
+  return fresh;
+}
+
+// Which rows of a whole file are new (see freshByCopy). Two real $2.75 fares
 // on one day both store; uploading that file again adds nothing; a shorter
 // export with one copy adds nothing and deletes nothing.
 export function freshByOccurrence(
   keys: string[],
   storedCount: (key: string) => number,
 ): number[] {
-  const seen = new Map<string, number>();
-  const stored = new Map<string, number>();
-  const fresh: number[] = [];
-  keys.forEach((key, index) => {
-    const occurrence = (seen.get(key) ?? 0) + 1;
-    seen.set(key, occurrence);
-    let have = stored.get(key);
-    if (have === undefined) {
-      have = storedCount(key);
-      stored.set(key, have);
-    }
-    if (occurrence > have) fresh.push(index);
-  });
-  return fresh;
+  return freshByCopy(keys.map((key) => ({ key })), storedCount);
 }

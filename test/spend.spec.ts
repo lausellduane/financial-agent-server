@@ -21,7 +21,10 @@ import {
 } from "../query-intent.ts";
 import {
   cleanMerchantName,
+  copyNumbers,
   dedupeKeys,
+  freshByCopy,
+  freshByOccurrence,
   formatCents,
   parseAmountCents,
   pickDisplayFields,
@@ -800,6 +803,26 @@ describe("duplicate keys", () => {
   });
 });
 
+describe("file copy numbers", () => {
+  it("numbers repeats within a file and keeps only copies past the stored count", () => {
+    expect(copyNumbers(["a", "b", "a", "a", "b"])).toEqual([1, 1, 2, 3, 2]);
+    const stored = (counts: Record<string, number>) => (key: string) => counts[key] ?? 0;
+    // Whole file [a, a] against one stored a: copy 2 is new.
+    expect(freshByOccurrence(["a", "a"], stored({ a: 1 }))).toEqual([1]);
+    // Only the planned-new subset is sent, with its copy number from the file.
+    expect(freshByCopy([{ key: "a", copy: 2 }], stored({ a: 1 }))).toEqual([0]);
+    expect(freshByCopy([{ key: "a", copy: 2 }], stored({ a: 2 }))).toEqual([]);
+    expect(freshByCopy([{ key: "a", copy: 3 }], stored({ a: 2 }))).toEqual([0]);
+    // Without copy numbers the subset would be read as copy 1 and dropped.
+    expect(freshByCopy([{ key: "a" }], stored({ a: 1 }))).toEqual([]);
+    // The same copy number twice is stored once; bad numbers fall back to order.
+    expect(
+      freshByCopy([{ key: "a", copy: 2 }, { key: "a", copy: 2 }], stored({ a: 1 })),
+    ).toEqual([0]);
+    expect(freshByCopy([{ key: "a", copy: 0 }, { key: "a", copy: Number.NaN }], stored({}))).toEqual([0, 1]);
+  });
+});
+
 describe("ledger migration", () => {
   it("adds category and query intent onto a pre-category table", async () => {
     const stub = env.LEDGER.get(env.LEDGER.idFromName("migration-old"));
@@ -919,6 +942,31 @@ describe("ledger migration", () => {
     expect(await stub.currentVersion()).toBe(two.version);
     expect((await stub.loadIntent()).intent).toContain("dining");
     expect((await stub.summary()).count).toBe(2);
+  });
+
+  it("adds a later copy when the route sends only the new rows with file copy numbers", async () => {
+    const stub = env.LEDGER.get(env.LEDGER.idFromName("append-subset@example.com"));
+    const fare = {
+      payload: { Date: "2026-03-01", Description: "MTA FARE", Amount: "-2.75" },
+      category: "transportation",
+    };
+    const [key = ""] = dedupeKeys([fare.payload]);
+    const range = { startDate: "2026-03-01", endDate: "2026-03-01" };
+    expect(await seed(stub, [fare], range)).toMatchObject({ ok: true, added: 1, total: 1 });
+    // The file was [fare, fare]; plan() marked index 1 new, so only copy 2 is sent.
+    const plan = await stub.plan([key, key]);
+    expect(plan).toEqual({ fresh: [1], stored: 1 });
+    const second = await stub.append([{ ...fare, key, copy: 2 }], range);
+    expect(second).toMatchObject({ ok: true, added: 1, total: 2 });
+    // Sent again (a racing upload of the same file), copy 2 is already stored.
+    const again = await stub.append([{ ...fare, key, copy: 2 }], range);
+    expect(again).toMatchObject({ ok: true, added: 0, total: 2 });
+    if (!second.ok || !again.ok) throw new Error("append failed");
+    expect(again.version).toBe(second.version);
+    // Three against two: only copy 3 is new.
+    const third = await stub.append([{ ...fare, key, copy: 3 }], range);
+    expect(third).toMatchObject({ ok: true, added: 1, total: 3 });
+    expect((await stub.summary()).count).toBe(3);
   });
 
   it("refuses to pass the row limit in one transaction", async () => {
@@ -1405,6 +1453,30 @@ describe("/api spending queries", () => {
     expect(sinceDay.answer).not.toContain("60.00");
     const all = await query(email, "How much did I spend on groceries?");
     expect(all.answer).toContain("Total: $225.00");
+  });
+
+  it("adds the second fare over HTTP when the ledger holds one", async () => {
+    const email = "fare-copies@example.com";
+    vi.spyOn(env.AI, "run").mockImplementation(async () => {
+      throw new Error("no model call expected");
+    });
+    const fare: [string, string, string] = ["2026-03-01", "FOOD LION", "-2.75"];
+    const totals = async (rows: Array<[string, string, string]>) => {
+      const response = await upload(email, csvOf(rows));
+      expect(response.status).toBe(200);
+      return response.json();
+    };
+    expect(await totals([fare])).toMatchObject({ added: 1, duplicates: 0, total: 1 });
+    expect(await totals([fare, fare])).toMatchObject({ added: 1, duplicates: 1, total: 2 });
+    const stub = env.LEDGER.get(env.LEDGER.idFromName(ledgerName(email)));
+    const version = await stub.currentVersion();
+    expect(await totals([fare, fare])).toMatchObject({ added: 0, duplicates: 2, total: 2 });
+    expect(await totals([fare])).toMatchObject({ added: 0, duplicates: 1, total: 2 });
+    expect(await stub.currentVersion()).toBe(version);
+    expect(
+      await totals([fare, ["2026-03-02", "FOOD LION", "-2.75"], fare, fare]),
+    ).toMatchObject({ added: 2, duplicates: 2, total: 4 });
+    expect((await stub.summary()).count).toBe(4);
   });
 
   it("reads each upload with its own sign, even when two banks share a header row", async () => {

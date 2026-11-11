@@ -37,6 +37,8 @@ import {
   columnStats,
   dedupeKeys,
   formatSignedCents,
+  copyNumbers,
+  freshByCopy,
   freshByOccurrence,
   normalizeDate,
   parseAmountCents,
@@ -303,15 +305,15 @@ function memoryKeyCounts(): Map<string, number> {
 // racing cannot store a row twice or pass the limit. An upload that adds no
 // rows leaves the version and the saved question alone.
 async function appendLedger(
-  rows: { payload: Record<string, string>; category: string; key: string }[],
+  rows: { payload: Record<string, string>; category: string; key: string; copy: number }[],
   identity: AccessIdentity | undefined,
   range: DateRange,
   layout: UploadLayout,
 ): Promise<AppendOutcome> {
   if (!onWorkers()) {
     const counts = memoryKeyCounts();
-    const fresh = freshByOccurrence(
-      rows.map((row) => row.key),
+    const fresh = freshByCopy(
+      rows.map((row) => ({ key: row.key, copy: row.copy })),
       (key) => counts.get(key) ?? 0,
     ).map((index) => rows[index] as (typeof rows)[number]);
     const before = memory.rows.length;
@@ -716,9 +718,14 @@ app.post(
       // Columns and sign come from the whole file, duplicates included, and
       // are saved with this upload.
       const layout = uploadLayout(rows);
+      // Each new row keeps its copy number from the whole file, so the append
+      // compares copy 2 of a fare with the one copy already stored instead of
+      // treating it as copy 1 of a shorter list.
+      const copies = copyNumbers(keys);
       const pending = plan.fresh.map((index) => ({
         payload: rows[index] ?? {},
         key: keys[index] ?? "",
+        copy: copies[index] ?? 1,
       }));
       const uploadedRows: LedgerRecord[] = pending.map((row) => ({
         id: 0,
@@ -733,6 +740,7 @@ app.post(
           payload: record.payload,
           category: record.category ?? "unknown",
           key: pending[index]?.key ?? "",
+          copy: pending[index]?.copy ?? 1,
         })),
         res.locals.access,
         range,

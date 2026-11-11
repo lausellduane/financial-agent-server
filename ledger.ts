@@ -2,6 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import { CATEGORIES } from "./categories.js";
 import {
   dedupeKeys,
+  freshByCopy,
   freshByOccurrence,
   headerShape,
   parseLayout,
@@ -37,6 +38,10 @@ export type StoredRow = {
   category: string;
   // Date, header-picked text, and amount. See dedupeKey in statement.ts.
   key: string;
+  // This row's copy number of its key within the whole uploaded file (see
+  // copyNumbers). Needed when only part of the file is sent. Without it, a
+  // row is numbered by its place in the rows sent.
+  copy?: number;
 };
 
 export type AppendResult =
@@ -299,7 +304,7 @@ export class Ledger extends DurableObject {
   }
 
   // Adds the file rows the ledger does not hold yet, counting repeats of one
-  // key (see freshByOccurrence). Rejects the whole upload, writing nothing,
+  // key by each row's copy number in the file (see freshByCopy). Rejects the whole upload, writing nothing,
   // if the ledger would pass maxRows. An upload with no new rows writes
   // nothing either, so a question in flight keeps its version and intent.
   async append(
@@ -312,8 +317,8 @@ export class Ledger extends DurableObject {
     const uploadedAt = new Date().toISOString();
     return this.ctx.storage.transactionSync((): AppendResult => {
       const before = this.count();
-      const fresh = freshByOccurrence(
-        rows.map((row) => row.key),
+      const fresh = freshByCopy(
+        rows.map((row) => ({ key: row.key, copy: row.copy })),
         (key) => this.keyCount(key),
       ).map((index) => rows[index] as StoredRow);
       const total = before + fresh.length;

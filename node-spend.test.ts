@@ -772,6 +772,34 @@ test("node mode appends a second statement, skips stored rows, and keeps real re
   setCompleteChatForTests(null);
 });
 
+test("node mode adds the second copy when a later file has more repeats than the ledger", async () => {
+  setCompleteChatForTests(async () => {
+    throw new Error("no model call expected");
+  });
+  // Two real $2.75 visits on one day, as a bus fare would be.
+  const fare = "2026-03-01,FOOD LION,-2.75";
+  const totals = async (rows: string[]) => {
+    const result = await upload(csv(rows));
+    assert.equal(result.status, 200);
+    const body = result.body as UploadBody;
+    return { added: body.added, duplicates: body.duplicates, total: body.total };
+  };
+  // One fare stored, then the full export with two: the second one is new.
+  assert.deepEqual(await totals([fare]), { added: 1, duplicates: 0, total: 1 });
+  assert.deepEqual(await totals([fare, fare]), { added: 1, duplicates: 1, total: 2 });
+  // The same two again add nothing, and one copy deletes nothing.
+  assert.deepEqual(await totals([fare, fare]), { added: 0, duplicates: 2, total: 2 });
+  assert.deepEqual(await totals([fare]), { added: 0, duplicates: 1, total: 2 });
+  // Three against two stored adds the third, next to another new row.
+  assert.deepEqual(
+    await totals([fare, "2026-03-02,FOOD LION,-2.75", fare, fare]),
+    { added: 2, duplicates: 2, total: 4 },
+  );
+  assert.equal((await report()).count, 4);
+  assert.match(await ask("How much did I spend on groceries?"), /Total: \$11\.00/);
+  setCompleteChatForTests(null);
+});
+
 test("node mode refuses an upload that would pass the ledger row limit", async () => {
   const rows = (count: number, start: number) =>
     Array.from({ length: count }, (_, index) => {
