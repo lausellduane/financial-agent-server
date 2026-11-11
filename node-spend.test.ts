@@ -611,3 +611,52 @@ test("node mode separates dining, bills, subscriptions, and the mortgage payment
   assert.doesNotMatch(onlyCar, /LOWE|OBGYN|Blue Cross/);
   setCompleteChatForTests(null);
 });
+
+test("node mode keeps car insurance, medical insurance, and credit-card payments apart", async () => {
+  setCompleteChatForTests(async () => {
+    throw new Error("rules cover these merchants");
+  });
+  const uploaded = await upload(
+    csv([
+      "2026-10-01,GEICO PREM COLL,-104.31",
+      "2026-10-02,PROG PREMIER INS PREM,-168.36",
+      "2026-10-03,BLUE CROSS BLUE SHIELD,-438.44",
+      "2026-10-04,CHASE CREDIT CAUTOPAY,-148.38",
+      "2026-10-05,SYNCHRONY BANKPAYMENT,-100.00",
+      "2026-10-06,AMEX EPAYMENT ACH PMT,-3.00",
+      "2026-10-07,AMEX EPAYMENT ACH PMT,-174.40",
+      "2026-10-08,PLANET HOME,-1541.42",
+      "2026-10-09,ATT PAYMENT,-100.67",
+    ]),
+  );
+  assert.equal(uploaded.status, 200);
+  assert.equal(uploaded.body.uncategorized, 0);
+
+  const bills = await ask("How much did I spent in bills?");
+  assert.match(bills, /ATT PAYMENT/);
+  assert.doesNotMatch(bills, /Planet Home|1541|GEICO|CHASE/i);
+
+  const mortgage = await ask("How much did I spent in mortgage?");
+  assert.match(mortgage, /Planet Home/i);
+  assert.match(mortgage, /Total: \$1541\.42/);
+  assert.doesNotMatch(mortgage, /ATT|CHASE/);
+
+  const insurance = await ask("How much did I spent in insurance?");
+  assert.match(insurance, /Blue Cross Blue Shield/);
+  assert.match(insurance, /Total: \$438\.44/);
+  assert.doesNotMatch(insurance, /PROG|GEICO|CHASE|AMEX|SYNCHRONY/i);
+
+  const car = await ask("How much did I spend on car insurance?");
+  assert.match(car, /GEICO PREM COLL/);
+  assert.match(car, /PROG PREMIER INS PREM/);
+  assert.match(car, /Total: \$272\.67/);
+  assert.doesNotMatch(car, /Blue Cross|CHASE|SYNCHRONY|AMEX|Planet Home/i);
+
+  const cards = await ask("How much did I spend on credit card payments?");
+  assert.match(cards, /CHASE CREDIT CAUTOPAY/);
+  assert.match(cards, /SYNCHRONY BANKPAYMENT/);
+  assert.match(cards, /AMEX EPAYMENT ACH PMT/);
+  assert.match(cards, /Total: \$425\.78/);
+  assert.doesNotMatch(cards, /GEICO|PROG|Blue Cross|Planet Home|ATT/i);
+  setCompleteChatForTests(null);
+});

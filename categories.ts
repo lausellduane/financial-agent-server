@@ -13,6 +13,7 @@ export const CATEGORIES = [
   "insurance/health",
   "insurance/auto",
   "transfers",
+  "credit-cards",
   "income",
   "cloud/software",
   "home",
@@ -23,7 +24,7 @@ export const CATEGORIES = [
 export type Category = (typeof CATEGORIES)[number];
 
 // Bump this when merchant rules change so a stored ledger is rechecked once.
-export const CATEGORY_RULES_VERSION = "11";
+export const CATEGORY_RULES_VERSION = "12";
 
 export function isCategory(value: string): value is Category {
   return (CATEGORIES as readonly string[]).includes(value);
@@ -491,8 +492,38 @@ function isXSubscription(text: string): boolean {
   return false;
 }
 
+function isCardIssuer(text: string): boolean {
+  return (
+    /\b(CHASE|AMEX|AMERICAN\s+EXPRESS|SYNCHRONY|CITI|CITIBANK|CAPITAL\s+ONE|DISCOVER|BARCLAYS|BARCLAYCARD)\b/.test(
+      text,
+    ) || /(^|[^A-Z0-9])AMEX([^A-Z0-9]|$)/.test(text)
+  );
+}
+
+function isCreditCardPayment(text: string): boolean {
+  if (/\bSYNCHRONY\b/.test(text)) return true;
+  if (/\bCHASE\s+CREDIT\b/.test(text)) return true;
+  if (
+    isCardIssuer(text) &&
+    /\b(CAUTOPAY|AUTOPAY|AUTO\s*PAY|EPAYMENT|E\s*PAYMENT|BANKPAYMENT|BANK\s*PAYMENT|CARD\s+PAYMENT|CC\s+PAYMENT)\b/.test(
+      text,
+    )
+  ) {
+    return true;
+  }
+  if (/\b(CREDIT\s+CARD|CREDITCARD)\b/.test(text) && /\b(PMT|PAYMENT|PYMT|ACH)\b/.test(text)) {
+    return true;
+  }
+  return (
+    isCardIssuer(text) &&
+    /\bAMEX\b/.test(text) &&
+    /\b(PMT|PAYMENT|PYMT|ACH|EPAYMENT)\b/.test(text)
+  );
+}
+
 function isHealthInsurance(text: string): boolean {
   if (/\b(AUTO|CAR|VEHICLE|RENTERS|RENTER)\b/.test(text) && /\bINS/.test(text)) return false;
+  if (/\b(PROGRESSIVE|PROG)\b/.test(text)) return false;
   if (
     /\b(BLUE\s+CROSS|BLUE\s+SHIELD|BCBS|AETNA|CIGNA|HUMANA|ANTHEM|KAISER|MOLINA|UNITED\s*HEALTH|UNITEDHEALTH|OSCAR\s+HEALTH)\b/.test(
       text,
@@ -505,8 +536,17 @@ function isHealthInsurance(text: string): boolean {
 }
 
 function isAutoInsurance(text: string): boolean {
+  if (isCreditCardPayment(text)) return false;
   if (/\b(CAR|AUTO|VEHICLE)\s+INS(?:URANCE)?\b/.test(text)) return true;
   if (/\bPROGRESSIVE\b/.test(text) && !/\bLEASING\b/.test(text)) return true;
+  // Statements often abbreviate Progressive as "PROG PREMIER INS PREM".
+  if (
+    /\bPROG\b/.test(text) &&
+    /\b(INS|PREM|PREMIER|AUTO|CAR|INSURANCE)\b/.test(text) &&
+    !/\bLEASING\b/.test(text)
+  ) {
+    return true;
+  }
   if (/\b(GEICO|STATE\s+FARM|ALLSTATE|NATIONWIDE)\b/.test(text)) return true;
   if (/(^|[^A-Z0-9])ERIE([^A-Z0-9]|$)/.test(text) && /\b(INS|AUTO|CAR)\b/.test(text)) return true;
   if (/(^|[^A-Z0-9])USAA([^A-Z0-9]|$)/.test(text)) return true;
@@ -562,6 +602,7 @@ export function categorizeNarrative(
   // A mortgage payment to a bank is still a mortgage. The institution check
   // would otherwise call every outflow a transfer.
   if (isMortgagePayment(text)) return "housing/mortgage";
+  if (isCreditCardPayment(text)) return "credit-cards";
   // A credit-union or bank line is not a Shell/Mobil station, even when the
   // institution's name contains that brand. Credits are income. Money sent
   // to the institution is a transfer, not fuel.
@@ -604,8 +645,9 @@ subscriptions = Netflix, Disney+/Hulu, Peacock, Ring, Cloudflare, Xbox Game Pass
 utilities/telecom = power, county or municipal water and sewer, natural gas, phone, internet. ATT is utilities/telecom. A city gas bill is utilities/telecom. Lowe's is not a utility.
 healthcare = doctors, dental, OBGYN, clinics, and pharmacies such as Walgreens, CVS, and Rite Aid. Not an insurance premium.
 insurance/health = health-insurance premiums such as Blue Cross, BCBS, Aetna, or Cigna. Not a doctor and not a pharmacy.
-insurance/auto = car insurance such as GEICO, Progressive, State Farm, Allstate, Nationwide, Erie, or USAA. Not a store and not a doctor.
+insurance/auto = car insurance such as GEICO, Progressive, PROG PREMIER INS, State Farm, Allstate, Nationwide, Erie, or USAA. Not a store, not a doctor, and not a credit-card autopay.
 transfers = PayPal, Zelle, Venmo, wires.
+credit-cards = payments to a credit-card issuer such as Chase, Amex, Synchrony, or Capital One, including CAUTOPAY, AUTOPAY, EPAYMENT, and BANKPAYMENT. Not a card purchase at a store and not car insurance.
 income = paychecks and direct deposits.
 cloud/software = Amazon Web Services and other cloud hosts. Not Amazon retail.
 home = hardware stores and home repair. Not a mortgage payment and not a utility bill.
