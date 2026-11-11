@@ -484,7 +484,8 @@ test("node mode separates dining, bills, subscriptions, and the mortgage payment
       "2026-10-13,JOHNSTON COUNTY PUBLIC,-62.40",
       "2026-10-14,CITY GAS BILL,-80.00",
       "2026-10-15,MR COOPER MORTGAGE PMT,-1510.00",
-      "2026-10-16,SHELL OIL,-40.00",
+      "2026-10-16,PLANET HOME,-1541.42",
+      "2026-10-17,SHELL OIL,-40.00",
     ]),
   );
   assert.equal(uploaded.status, 200);
@@ -514,11 +515,12 @@ test("node mode separates dining, bills, subscriptions, and the mortgage payment
   assert.match(bills, /Piedmont/);
   assert.match(bills, /JOHNSTON/);
   assert.match(bills, /Total: \$520\.25/);
-  assert.doesNotMatch(bills, /LOWE|PEAK SEASONS|17\.06|38\.00|17\.16|SHELL OIL/);
+  assert.doesNotMatch(bills, /LOWE|PEAK SEASONS|17\.06|38\.00|17\.16|SHELL OIL|Planet Home|1541/i);
 
   const mortgage = await ask("How much did I spent in mortgage?");
   assert.match(mortgage, /MR COOPER/);
-  assert.match(mortgage, /Total: \$1510\.00/);
+  assert.match(mortgage, /Planet Home/i);
+  assert.match(mortgage, /Total: \$3051\.42/);
   assert.doesNotMatch(mortgage, /LOWE|PEAK SEASONS|72\.22/);
 
   const streamed = await upload(

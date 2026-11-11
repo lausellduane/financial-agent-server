@@ -23,7 +23,7 @@ export const CATEGORIES = [
 export type Category = (typeof CATEGORIES)[number];
 
 // Bump this when merchant rules change so a stored ledger is rechecked once.
-export const CATEGORY_RULES_VERSION = "10";
+export const CATEGORY_RULES_VERSION = "11";
 
 export function isCategory(value: string): value is Category {
   return (CATEGORIES as readonly string[]).includes(value);
@@ -513,7 +513,7 @@ function isAutoInsurance(text: string): boolean {
   return false;
 }
 
-// Lender payments only. "PLANET HOME" and Lowe's are not a mortgage.
+// Lender payments only. Lowe's and a bare "HOME" are not a mortgage.
 function isMortgagePayment(text: string): boolean {
   if (/\b(MORTGAGES?|HOME\s+LOAN)\b/.test(text)) return true;
   if (
@@ -522,7 +522,7 @@ function isMortgagePayment(text: string): boolean {
   ) {
     return true;
   }
-  return /\b(MR\s+COOPER|PENNYMAC|ROCKET\s+MORTGAGE|FREEDOM\s+MORTGAGE|LOANCARE|CENLAR|SHELLPOINT|NEWREZ|NATIONSTAR|ROUNDPOINT|OCWEN|LAKEVIEW\s+LOAN)\b/.test(
+  return /\b(PLANET\s+HOME|PLANETHOME|MR\s+COOPER|PENNYMAC|ROCKET\s+MORTGAGE|FREEDOM\s+MORTGAGE|LOANCARE|CENLAR|SHELLPOINT|NEWREZ|NATIONSTAR|ROUNDPOINT|OCWEN|LAKEVIEW\s+LOAN)\b/.test(
     text,
   );
 }

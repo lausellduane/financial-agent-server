@@ -220,7 +220,13 @@ describe("categorizeNarrative", () => {
     expect(categorizeNarrative("ACH DEBIT MTG PAYMENT", -151000, true)).toBe(
       "housing/mortgage",
     );
-    expect(categorizeNarrative("PLANET HOME", -154142, true)).toBe("unknown");
+    expect(categorizeNarrative("PLANET HOME", -154142, true)).toBe(
+      "housing/mortgage",
+    );
+    expect(categorizeNarrative("PLANET HOME LENDING", -154142, true)).toBe(
+      "housing/mortgage",
+    );
+    expect(categorizeNarrative("PLANET FITNESS", -4000, true)).toBe("unknown");
     expect(categorizeNarrative("PEACOCK TV LLC", -1393, true)).toBe("subscriptions");
     expect(categorizeNarrative("DISNEYPLUS", -1599, true)).toBe("subscriptions");
     expect(categorizeNarrative("DISNEY PLUS", -1599, true)).toBe("subscriptions");
@@ -1434,7 +1440,8 @@ describe("/api spending queries", () => {
       ["2026-10-13", "JOHNSTON COUNTY PUBLIC", "-62.40"],
       ["2026-10-14", "CITY GAS BILL", "-80.00"],
       ["2026-10-15", "MR COOPER MORTGAGE PMT", "-1510.00"],
-      ["2026-10-16", "SHELL OIL", "-40.00"],
+      ["2026-10-16", "PLANET HOME", "-1541.42"],
+      ["2026-10-17", "SHELL OIL", "-40.00"],
     ];
     expect((await upload(email, csvOf(rows))).status).toBe(200);
     expect(run).not.toHaveBeenCalled();
@@ -1483,10 +1490,13 @@ describe("/api spending queries", () => {
     expect(bills.answer).not.toContain("38.00");
     expect(bills.answer).not.toContain("17.16");
     expect(bills.answer).not.toContain("SHELL OIL");
+    expect(bills.answer).not.toContain("Planet Home");
+    expect(bills.answer).not.toContain("1541.42");
 
     const mortgage = await query(email, "How much did I spent in mortgage?");
     expect(mortgage.answer).toContain("MR COOPER");
-    expect(mortgage.answer).toContain("Total: $1510.00");
+    expect(mortgage.answer).toContain("Planet Home");
+    expect(mortgage.answer).toContain("Total: $3051.42");
     expect(mortgage.answer).not.toContain("LOWE");
     expect(mortgage.answer).not.toContain("PEAK SEASONS");
     expect(mortgage.answer).not.toContain("72.22");
@@ -1505,6 +1515,7 @@ describe("/api spending queries", () => {
     expect(categoryOf("JOHNSTON COUNTY PUBLIC")).toBe("utilities/telecom");
     expect(categoryOf("CITY GAS BILL")).toBe("utilities/telecom");
     expect(categoryOf("MR COOPER MORTGAGE PMT")).toBe("housing/mortgage");
+    expect(categoryOf("PLANET HOME")).toBe("housing/mortgage");
     expect(categoryOf("SHELL OIL")).toBe("gas/auto");
   });
 
