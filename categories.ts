@@ -438,18 +438,26 @@ function isMaintenancePlan(text: string): boolean {
   return /\bHVAC\b/.test(text) && /\b(PLAN|AGREEMENT|MEMBERSHIP)\b/.test(text);
 }
 
+function isCountyPublicOffice(text: string): boolean {
+  // Include short prefixes so truncated statement names still drop out.
+  return /\b(SCH|SCHOOLS?|LIBR|LIBRARIES|LIBRARY|HLTH|HEALTH|SAFETY|WORKS|TRANSIT|PARKS?|SHERIFF|TAX|COURT|COLLEGE|UNIVERSITY|DEFENDER|HOSPITAL|MUSEUM)\b/.test(
+    text,
+  );
+}
+
 function isWaterSewerUtility(text: string): boolean {
   if (/\b(PARK|FIJI|DASANI|AQUAFINA|POLAND|NESTLE|BOTTLED)\b/.test(text)) return false;
   if (/\b(PUBLIC\s+UTILITIES|UTILITY\s+BILL|UTILITIES\s+BILL)\b/.test(text)) return true;
   if (/\bCOUNTY\s+UTIL/.test(text)) return true;
-  if (/\bJOCO\b/.test(text) && /\b(WATER|SEWER|UTIL|PUBLIC)\b/.test(text)) return true;
+  // UTIL is a prefix so JOCO UTILITIES, JOCO UTILITY, and JOCO WATERSEWER match.
+  if (/\bJOCO\b/.test(text) && /\b(WATER|SEWER|UTIL)/.test(text)) return true;
   if (/\b(WATER|SEWER)\b/.test(text) && /\bCOUNTY\b/.test(text)) return true;
   // Bank statements often truncate "County Public Utilities" to "COUNTY PUBLIC".
   if (
-    (/\bCOUNTY\s+PUBLIC\b/.test(text) || /\bJOHNSTON\s+CO\s+PUBLIC\b/.test(text)) &&
-    !/\b(SCHOOLS?|LIBRARIES|LIBRARY|HEALTH|SHERIFF|TAX|COURT|COLLEGE|UNIVERSITY|DEFENDER|HOSPITAL|MUSEUM)\b/.test(
-      text,
-    )
+    (/\bCOUNTY\s+PUBLIC\b/.test(text) ||
+      /\bJOHNSTON\s+CO\s+PUBLIC\b/.test(text) ||
+      /\bJOCO\s+PUBLIC\b/.test(text)) &&
+    !isCountyPublicOffice(text)
   ) {
     return true;
   }

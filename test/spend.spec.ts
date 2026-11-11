@@ -196,6 +196,18 @@ describe("categorizeNarrative", () => {
     expect(categorizeNarrative("JOHNSTON COUNTY PUBLIC SCHOOLS", -6240, true)).toBe(
       "unknown",
     );
+    expect(categorizeNarrative("JOHNSTON COUNTY PUBLIC SCH", -6240, true)).toBe("unknown");
+    expect(categorizeNarrative("JOHNSTON COUNTY PUBLIC LIBR", -6240, true)).toBe("unknown");
+    expect(categorizeNarrative("JOHNSTON COUNTY PUBLIC HLTH", -6240, true)).toBe("unknown");
+    expect(categorizeNarrative("WAKE COUNTY PUBLIC SAFETY", -6240, true)).toBe("unknown");
+    expect(categorizeNarrative("COUNTY PUBLIC WORKS", -6240, true)).toBe("unknown");
+    expect(categorizeNarrative("COUNTY PUBLIC TRANSIT", -6240, true)).toBe("unknown");
+    expect(categorizeNarrative("COUNTY PUBLIC PARKS", -6240, true)).toBe("unknown");
+    expect(categorizeNarrative("JOCO PUBLIC SCHOOLS", -6240, true)).toBe("unknown");
+    expect(categorizeNarrative("JOCO PUBLIC LIBRARY", -6240, true)).toBe("unknown");
+    expect(categorizeNarrative("JOCO UTILITIES", -4100, true)).toBe("utilities/telecom");
+    expect(categorizeNarrative("JOCO UTILITY", -4100, true)).toBe("utilities/telecom");
+    expect(categorizeNarrative("JOCO WATERSEWER", -4100, true)).toBe("utilities/telecom");
     expect(categorizeNarrative("JOCO WATER SEWER", -4100, true)).toBe("utilities/telecom");
     expect(categorizeNarrative("CITY WATER DEPT", -3600, true)).toBe("utilities/telecom");
     expect(categorizeNarrative("FIJI WATER", -200, true)).toBe("unknown");
