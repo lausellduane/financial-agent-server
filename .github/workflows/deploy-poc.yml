@@ -1,0 +1,78 @@
+# Draft only. Do not merge until GitHub secrets are in place and Duane approves
+# enabling auto-deploy. Targets the existing POC Worker only.
+name: Deploy POC
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Never cancel a live deploy mid-upload. Pull-request checks may be replaced.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Tests
+        run: npm test
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+  deploy:
+    name: Deploy financial-agent-server-poc
+    needs: test
+    # Push or manual run on master only. A workflow_dispatch from another
+    # branch must not publish to the live POC Worker.
+    if: github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      # Uses the Wrangler version installed by npm ci (4.157.0 in the lockfile).
+      # --name retargets the top-level config (name: financial-agent-server) to
+      # the existing POC Worker. workers_dev and preview_urls stay false.
+      # Do not pass `secrets:` — wrangler-action would put/rotate Worker secrets.
+      # Existing ACCESS_AUD and ACCESS_TEAM_DOMAIN values are left untouched;
+      # wrangler deploy does not delete secrets.
+      # CLOUDFLARE_ACCOUNT_ID is an Actions variable. secrets.* does not read it.
+      - name: Deploy Worker
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          packageManager: npm
+          command: deploy --name financial-agent-server-poc
