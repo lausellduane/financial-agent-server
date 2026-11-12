@@ -24,7 +24,7 @@ export const CATEGORIES = [
 export type Category = (typeof CATEGORIES)[number];
 
 // Bump this when merchant rules change so a stored ledger is rechecked once.
-export const CATEGORY_RULES_VERSION = "12";
+export const CATEGORY_RULES_VERSION = "13";
 
 export function isCategory(value: string): value is Category {
   return (CATEGORIES as readonly string[]).includes(value);
@@ -305,8 +305,12 @@ const RULES: Rule[] = [
       "VISA DIRECT",
       "WIRE TRANSFER",
       "ACH TRANSFER",
+      "TRANSFERRED FROM",
+      "TRANSFERRED TO",
     ],
-    pattern: /(^|[^A-Z0-9])(TRANSFER|XFER|WIRE)([^A-Z0-9]|$)/,
+    // TRANSFERRED must be listed so "TRANSFERRED FROM" is not missed:
+    // TRANSFER plus a word-character boundary fails on the remaining "RED".
+    pattern: /(^|[^A-Z0-9])(TRANSFERRED|TRANSFER|XFER|WIRE)([^A-Z0-9]|$)/,
   },
 ];
 
@@ -575,41 +579,72 @@ function isBlankNarrative(text: string): boolean {
   );
 }
 
+function isStudentLoan(text: string): boolean {
+  // "PSTUDNTLOAN" is a truncated servicer descriptor, so do not require a
+  // word boundary before STUDNTLOAN.
+  return /STUDNTLOAN|STUDENTLOAN|STUDENT\s+LOANS?|STU\s+LOAN/.test(text);
+}
+
+function isCollegeSavings(text: string): boolean {
+  return /\b(MY)?529\b/.test(text);
+}
+
+function isRefundOrRebate(text: string): boolean {
+  return /\bDEBIT\s+CARD\s+RETURN\b/.test(text) || /\bFEE\s+REBATE\b/.test(text);
+}
+
+function isNonIncomeMovement(text: string): boolean {
+  if (isStudentLoan(text) || isCollegeSavings(text) || isRefundOrRebate(text)) {
+    return true;
+  }
+  const rule = RULES.find((entry) => entry.category === "transfers");
+  return rule ? matchesRule(text, rule) : false;
+}
+
 function hasIncomeKeyword(text: string): boolean {
-  return (
-    /\b(MOBILE|DIRECT|ATM|REMOTE|BRANCH|CHECK|CASH)\s+DEPOSITS?\b/.test(text) ||
-    text.includes("DIRECT DEPOSIT") ||
+  if (/\bDIVIDENDS?\b/.test(text)) return true;
+  if (/\bINTEREST\s+EARNED\b/.test(text)) return true;
+  // A generic "DIRECT DEPOSIT" prefix is not income. Payroll still matches
+  // through PAYROLL / INCPAYROLL below. Mobile and similar check deposits
+  // stay income so they are kept out of spending totals.
+  if (/\b(MOBILE|ATM|REMOTE|BRANCH|CHECK|CASH)\s+DEPOSITS?\b/.test(text)) {
+    return true;
+  }
+  if (
     text.includes("PAYROLL") ||
     text.includes("PAYCHECK") ||
     text.includes("PAY CHECK") ||
-    text.includes("DIR DEP") ||
-    /(^|[^A-Z0-9])SALARY([^A-Z0-9]|$)/.test(text) ||
-    text.includes("ACH CREDIT")
-  );
+    text.includes("DIR DEP")
+  ) {
+    return true;
+  }
+  return /(^|[^A-Z0-9])SALARY([^A-Z0-9]|$)/.test(text);
 }
 
 // Deterministic category, or "unknown" when only the model should decide.
 // A refund keeps the merchant's spending category so it can reduce that
-// total. A credit that matches no spending rule is income. Transfers stay
-// transfers on either sign.
+// total. Transfers, 529 contributions, student-loan payments, debit-card
+// returns, and fee rebates stay transfers on either sign and are never
+// income. An unmatched credit is not income.
 export function categorizeNarrative(
   narrative: string,
   amountCents: number,
   signedLedger: boolean,
 ): Category | "unknown" {
   const text = narrative.toUpperCase();
+  // Run before income keywords so "DIRECT DEPOSIT PAYPAL TRANSFER" is a
+  // transfer, not a paycheck.
+  if (isNonIncomeMovement(text)) return "transfers";
   if (hasIncomeKeyword(text)) return "income";
   // A mortgage payment to a bank is still a mortgage. The institution check
   // would otherwise call every outflow a transfer.
   if (isMortgagePayment(text)) return "housing/mortgage";
   if (isCreditCardPayment(text)) return "credit-cards";
   // A credit-union or bank line is not a Shell/Mobil station, even when the
-  // institution's name contains that brand. Credits are income. Money sent
-  // to the institution is a transfer, not fuel.
-  if (isFinancialInstitution(text)) {
-    if (amountCents < 0) return "transfers";
-    return "income";
-  }
+  // institution's name contains that brand. Money sent to or received from
+  // the institution is a transfer, not fuel and not income. Interest earned
+  // at a bank already matched above.
+  if (isFinancialInstitution(text)) return "transfers";
   if (isUtilityGas(text)) return "utilities/telecom";
   if (isBlankNarrative(text)) return "other";
   if (isEventTicket(text)) return "entertainment/events";
@@ -622,7 +657,6 @@ export function categorizeNarrative(
   if (isHealthInsurance(text)) return "insurance/health";
   const ruled = RULES.find((rule) => matchesRule(text, rule))?.category;
   if (ruled) return ruled;
-  if (signedLedger && amountCents > 0) return "income";
   if (!text.trim()) return "other";
   return "unknown";
 }
@@ -646,9 +680,9 @@ utilities/telecom = power, county or municipal water and sewer, natural gas, pho
 healthcare = doctors, dental, OBGYN, clinics, and pharmacies such as Walgreens, CVS, and Rite Aid. Not an insurance premium.
 insurance/health = health-insurance premiums such as Blue Cross, BCBS, Aetna, or Cigna. Not a doctor and not a pharmacy.
 insurance/auto = car insurance such as GEICO, Progressive, PROG PREMIER INS, State Farm, Allstate, Nationwide, Erie, or USAA. Not a store, not a doctor, and not a credit-card autopay.
-transfers = PayPal, Zelle, Venmo, wires.
+transfers = PayPal, Zelle, Venmo, wires, account-to-account transfers, 529 contributions, student-loan payments, debit-card returns, and fee rebates.
 credit-cards = payments to a credit-card issuer such as Chase, Amex, Synchrony, or Capital One, including CAUTOPAY, AUTOPAY, EPAYMENT, and BANKPAYMENT. Not a card purchase at a store and not car insurance.
-income = paychecks and direct deposits.
+income = paychecks, payroll direct deposits, dividends, and interest earned. Not a generic DIRECT DEPOSIT, a PayPal transfer, a 529 contribution, a student-loan payment, a refund, or a fee rebate.
 cloud/software = Amazon Web Services and other cloud hosts. Not Amazon retail.
 home = hardware stores and home repair. Not a mortgage payment and not a utility bill.
 housing/mortgage = the payment to a mortgage lender or home-loan servicer. Not Lowe's and not HVAC.

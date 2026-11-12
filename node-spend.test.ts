@@ -660,3 +660,50 @@ test("node mode keeps car insurance, medical insurance, and credit-card payments
   assert.doesNotMatch(cards, /GEICO|PROG|Blue Cross|Planet Home|ATT/i);
   setCompleteChatForTests(null);
 });
+
+test("node mode returns only payroll, dividends, and interest for an income question", async () => {
+  setCompleteChatForTests(async () => {
+    throw new Error("rules cover these merchants");
+  });
+  const uploaded = await upload(
+    csv([
+      "2026-10-01,DIVIDEND RECEIVED FIDELITY GOVERNMENT MONEY MARKET (SPAXX) (CASH),2.00",
+      "2026-10-02,INTEREST EARNED FDIC INSURED DEPOSIT AT JP MORGAN HS (QHZHQ) (CASH) HSA NOT COVERED BY SIPC,0.02",
+      "2026-10-03,INTEREST EARNED FDIC INSURED DEPOSIT AT US BANK NOT (QUSBQ),0.01",
+      "2026-10-04,INTEREST EARNED FDIC INSURED DEPOSIT AT WELLS FARGO (QPIQQ) BK NOT COVERED BY SIPC,2.16",
+      "2026-10-05,DIRECT DEPOSIT PAYPAL TRANSFER,505.00",
+      "2026-10-06,DIRECT DEPOSIT ELSEVIER INCPAYROLL,2785.11",
+      "2026-10-07,ADVS ED SERV PSTUDNTLOAN,138.33",
+      "2026-10-08,DEBIT CARD RETURN GROK XAI PALO ALTO,0.15",
+      "2026-10-09,ADJUST FEE CHARGED ATM FEE REBATE,3.00",
+      "2026-10-10,DIRECT DEPOSIT ELSEVIER INCPAYROLL,2785.12",
+      "2026-10-11,TRANSFERRED FROM VS X84-544623-1,185.00",
+      "2026-10-12,MY529 INVESTMENT,100.00",
+      "2026-10-13,DIRECT DEPOSIT ELSEVIER INCPAYROLL,2785.13",
+    ]),
+  );
+  assert.equal(uploaded.status, 200);
+  assert.equal(uploaded.body.uncategorized, 0);
+  const answer = await ask("How much was income?");
+  assert.match(answer, /Total: \$8359\.55/);
+  assert.match(answer, /2785\.11/);
+  assert.match(answer, /2785\.12/);
+  assert.match(answer, /2785\.13/);
+  assert.match(answer, /\$2\.00/);
+  assert.match(answer, /\$0\.02/);
+  assert.match(answer, /\$0\.01/);
+  assert.match(answer, /\$2\.16/);
+  assert.doesNotMatch(answer, /PAYPAL/);
+  assert.doesNotMatch(answer, /505\.00/);
+  assert.doesNotMatch(answer, /STUDNTLOAN/);
+  assert.doesNotMatch(answer, /138\.33/);
+  assert.doesNotMatch(answer, /DEBIT CARD RETURN/);
+  assert.doesNotMatch(answer, /0\.15/);
+  assert.doesNotMatch(answer, /FEE REBATE/);
+  assert.doesNotMatch(answer, /\$3\.00/);
+  assert.doesNotMatch(answer, /TRANSFERRED FROM/);
+  assert.doesNotMatch(answer, /185\.00/);
+  assert.doesNotMatch(answer, /MY529/);
+  assert.doesNotMatch(answer, /100\.00/);
+  setCompleteChatForTests(null);
+});

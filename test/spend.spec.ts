@@ -369,9 +369,11 @@ describe("categorizeNarrative", () => {
     expect(categorizeNarrative("COSTCO GASOLINE", -2500, true)).toBe("gas/auto");
     expect(categorizeNarrative("COSTCO WHSE", -8000, true)).toBe("groceries");
     expect(categorizeNarrative("SHELL FEDERAL CREDIT UNION DEPOSIT", 250000, true)).toBe(
-      "income",
+      "transfers",
     );
-    expect(categorizeNarrative("SHELL FEDERAL CREDIT UNION", 250000, true)).toBe("income");
+    expect(categorizeNarrative("SHELL FEDERAL CREDIT UNION", 250000, true)).toBe(
+      "transfers",
+    );
     expect(categorizeNarrative("SHELL OIL", 500, true)).toBe("gas/auto");
     expect(categorizeNarrative("CITY GAS BILL", -8000, true)).toBe("utilities/telecom");
     expect(categorizeNarrative("PIEDMONT NATURAL GAS", -4000, true)).toBe(
@@ -380,17 +382,67 @@ describe("categorizeNarrative", () => {
     expect(categorizeNarrative("pending", -5000, true)).toBe("other");
   });
 
-  it("keeps a merchant refund in its spending category and treats unmatched credits as income", () => {
+  it("keeps a merchant refund in its spending category and does not treat unmatched credits as income", () => {
     expect(categorizeNarrative("CHIPOTLE", 3304, true)).toBe("dining");
     expect(categorizeNarrative("AMAZON.COM", 500, true)).toBe("shopping");
     expect(categorizeNarrative("CHIPOTLE", 3304, false)).toBe("dining");
-    expect(categorizeNarrative("MYSTERY CREDIT 42", 500, true)).toBe("income");
+    expect(categorizeNarrative("MYSTERY CREDIT 42", 500, true)).toBe("unknown");
     expect(categorizeNarrative("DIRECT DEPOSIT ACME PAYROLL", 100, false)).toBe(
       "income",
     );
     expect(categorizeNarrative("PAYPAL *JANE VISA DIRECT", 5000, true)).toBe(
       "transfers",
     );
+  });
+
+  it("keeps payroll, dividends, and interest as income and excludes transfers and rebates", () => {
+    expect(
+      categorizeNarrative(
+        "DIVIDEND RECEIVED FIDELITY GOVERNMENT MONEY MARKET (SPAXX) (CASH)",
+        200,
+        true,
+      ),
+    ).toBe("income");
+    expect(
+      categorizeNarrative(
+        "INTEREST EARNED FDIC INSURED DEPOSIT AT JP MORGAN HS (QHZHQ) (CASH) HSA NOT COVERED BY SIPC",
+        2,
+        true,
+      ),
+    ).toBe("income");
+    expect(
+      categorizeNarrative(
+        "INTEREST EARNED FDIC INSURED DEPOSIT AT US BANK NOT (QUSBQ)",
+        1,
+        true,
+      ),
+    ).toBe("income");
+    expect(
+      categorizeNarrative(
+        "INTEREST EARNED FDIC INSURED DEPOSIT AT WELLS FARGO (QPIQQ) BK NOT COVERED BY SIPC",
+        216,
+        true,
+      ),
+    ).toBe("income");
+    expect(categorizeNarrative("DIRECT DEPOSIT ELSEVIER INCPAYROLL", 278511, true)).toBe(
+      "income",
+    );
+    expect(categorizeNarrative("DIRECT DEPOSIT PAYPAL TRANSFER", 50500, true)).toBe(
+      "transfers",
+    );
+    expect(categorizeNarrative("ADVS ED SERV PSTUDNTLOAN", 13833, true)).toBe(
+      "transfers",
+    );
+    expect(categorizeNarrative("DEBIT CARD RETURN GROK XAI PALO ALTO", 15, true)).toBe(
+      "transfers",
+    );
+    expect(categorizeNarrative("ADJUST FEE CHARGED ATM FEE REBATE", 300, true)).toBe(
+      "transfers",
+    );
+    expect(categorizeNarrative("TRANSFERRED FROM VS X84-544623-1", 18500, true)).toBe(
+      "transfers",
+    );
+    expect(categorizeNarrative("MY529 INVESTMENT", 10000, true)).toBe("transfers");
   });
 
   it("parses model category assignments and drops unknown labels", () => {
@@ -446,6 +498,25 @@ describe("intent validation and aggregation", () => {
         "How much I spent eating out?",
       ),
     ).toBeNull();
+  });
+
+  it("maps an income question only to the income category", () => {
+    const interpreted = interpretQuestion("How much was income?", null, []);
+    expect(interpreted?.confident).toBe(true);
+    expect(interpreted?.intent.categories).toEqual(["income"]);
+    expect(interpreted?.intent.op).toBe("sum");
+    const fromModel = intentFromModel(
+      JSON.stringify({
+        categories: ["income", "transfers", "dining"],
+        merchants: [],
+        excludeMerchants: [],
+        dateFrom: null,
+        dateTo: null,
+        op: "sum",
+      }),
+      "How much was income?",
+    );
+    expect(fromModel?.categories).toEqual(["income"]);
   });
 
   it("strips income the model added to a spending question", () => {
@@ -709,6 +780,32 @@ describe("ledger migration", () => {
     expect((await ada.loadIntent()).intent).toBeNull();
   });
 });
+
+function incomeStatementRows(): Array<[string, string, string]> {
+  return [
+    ["2026-10-01", "DIVIDEND RECEIVED FIDELITY GOVERNMENT MONEY MARKET (SPAXX) (CASH)", "2.00"],
+    [
+      "2026-10-02",
+      "INTEREST EARNED FDIC INSURED DEPOSIT AT JP MORGAN HS (QHZHQ) (CASH) HSA NOT COVERED BY SIPC",
+      "0.02",
+    ],
+    ["2026-10-03", "INTEREST EARNED FDIC INSURED DEPOSIT AT US BANK NOT (QUSBQ)", "0.01"],
+    [
+      "2026-10-04",
+      "INTEREST EARNED FDIC INSURED DEPOSIT AT WELLS FARGO (QPIQQ) BK NOT COVERED BY SIPC",
+      "2.16",
+    ],
+    ["2026-10-05", "DIRECT DEPOSIT PAYPAL TRANSFER", "505.00"],
+    ["2026-10-06", "DIRECT DEPOSIT ELSEVIER INCPAYROLL", "2785.11"],
+    ["2026-10-07", "ADVS ED SERV PSTUDNTLOAN", "138.33"],
+    ["2026-10-08", "DEBIT CARD RETURN GROK XAI PALO ALTO", "0.15"],
+    ["2026-10-09", "ADJUST FEE CHARGED ATM FEE REBATE", "3.00"],
+    ["2026-10-10", "DIRECT DEPOSIT ELSEVIER INCPAYROLL", "2785.12"],
+    ["2026-10-11", "TRANSFERRED FROM VS X84-544623-1", "185.00"],
+    ["2026-10-12", "MY529 INVESTMENT", "100.00"],
+    ["2026-10-13", "DIRECT DEPOSIT ELSEVIER INCPAYROLL", "2785.13"],
+  ];
+}
 
 function csvOf(rows: Array<[string, string, string]>): string {
   return ["Date,Description,Amount", ...rows.map((row) => row.join(","))].join("\n");
@@ -1739,7 +1836,7 @@ describe("/api spending queries", () => {
     expect(cards.answer).not.toContain("ATT");
   });
 
-  it("keeps a signed credit as income and rechecks a stale ledger once", async () => {
+  it("rechecks a stale ledger so payroll stays income and a PayPal transfer does not", async () => {
     const email = "signed-credit@example.com";
     vi.spyOn(env.AI, "run").mockImplementation(async () => {
       throw new Error("rules cover the credit");
@@ -1752,25 +1849,52 @@ describe("/api spending queries", () => {
           category: "dining",
         },
         {
-          payload: { Date: "2026-10-02", Description: "MYSTERY CREDIT 42", Amount: "5.00" },
+          payload: {
+            Date: "2026-10-02",
+            Description: "DIRECT DEPOSIT ELSEVIER INCPAYROLL",
+            Amount: "2785.11",
+          },
           category: "dining",
         },
+        {
+          payload: {
+            Date: "2026-10-03",
+            Description: "DIRECT DEPOSIT PAYPAL TRANSFER",
+            Amount: "505.00",
+          },
+          category: "income",
+        },
       ],
-      { startDate: "2026-10-01", endDate: "2026-10-02" },
+      { startDate: "2026-10-01", endDate: "2026-10-03" },
     );
     const spent = await query(email, "How much did I spend?");
     expect(spent.answer).toContain("CHIPOTLE");
     expect(spent.answer).toContain("Total: $10.00");
-    expect(spent.answer).not.toContain("5.00");
+    expect(spent.answer).not.toContain("2785.11");
+    expect(spent.answer).not.toContain("505.00");
     const once = await stub.load();
     expect(
-      once.records.find((row) => row.payload.Description === "MYSTERY CREDIT 42")?.category,
+      once.records.find(
+        (row) => row.payload.Description === "DIRECT DEPOSIT ELSEVIER INCPAYROLL",
+      )?.category,
     ).toBe("income");
+    expect(
+      once.records.find(
+        (row) => row.payload.Description === "DIRECT DEPOSIT PAYPAL TRANSFER",
+      )?.category,
+    ).toBe("transfers");
+    const income = await query(email, "How much was income?");
+    expect(income.answer).toContain("2785.11");
+    expect(income.answer).toContain("Total: $2785.11");
+    expect(income.answer).not.toContain("PAYPAL");
+    expect(income.answer).not.toContain("505.00");
     const again = await query(email, "How much did I spend?");
     expect(again.answer).toContain("Total: $10.00");
     const twice = await stub.load();
     expect(
-      twice.records.find((row) => row.payload.Description === "MYSTERY CREDIT 42")?.category,
+      twice.records.find(
+        (row) => row.payload.Description === "DIRECT DEPOSIT ELSEVIER INCPAYROLL",
+      )?.category,
     ).toBe("income");
     const stamp = await runInDurableObject(stub, async (_instance, state) => {
       return state.storage.sql
@@ -1780,6 +1904,39 @@ describe("/api spending queries", () => {
         .toArray()[0]?.value;
     });
     expect(stamp).toBe(CATEGORY_RULES_VERSION);
+  });
+
+  it("returns only payroll, dividends, and interest for an income question", async () => {
+    const email = "income-category@example.com";
+    const run = vi.spyOn(env.AI, "run").mockImplementation(async () => {
+      throw new Error("rules cover these merchants");
+    });
+    const uploaded = await upload(email, csvOf(incomeStatementRows()));
+    expect(uploaded.status).toBe(200);
+    expect(((await uploaded.json()) as { uncategorized?: number }).uncategorized).toBe(0);
+    expect(run).not.toHaveBeenCalled();
+
+    const body = await query(email, "How much was income?");
+    expect(body.answer).toContain("Total: $8359.55");
+    expect(body.answer).toContain("2785.11");
+    expect(body.answer).toContain("2785.12");
+    expect(body.answer).toContain("2785.13");
+    expect(body.answer).toContain("$2.00");
+    expect(body.answer).toContain("$0.02");
+    expect(body.answer).toContain("$0.01");
+    expect(body.answer).toContain("$2.16");
+    expect(body.answer).not.toContain("PAYPAL");
+    expect(body.answer).not.toContain("505.00");
+    expect(body.answer).not.toContain("STUDNTLOAN");
+    expect(body.answer).not.toContain("138.33");
+    expect(body.answer).not.toContain("DEBIT CARD RETURN");
+    expect(body.answer).not.toContain("0.15");
+    expect(body.answer).not.toContain("FEE REBATE");
+    expect(body.answer).not.toContain("$3.00");
+    expect(body.answer).not.toContain("TRANSFERRED FROM");
+    expect(body.answer).not.toContain("185.00");
+    expect(body.answer).not.toContain("MY529");
+    expect(body.answer).not.toContain("100.00");
   });
 
   // Skipped: workerd refuses a body read across requests, and the refused
