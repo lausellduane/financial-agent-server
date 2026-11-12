@@ -162,12 +162,17 @@ function ruledCategory(record: LedgerRecord, context: RuleContext): ReturnType<t
 
 // A merchant rule replaces a stored category that disagrees with it, including
 // one the model previously saved. "other" with no matching rule stays put.
+// Stale rows stored as income are re-resolved when the new rules no longer
+// call them income, including when the result is unknown (then the model).
 // The sign and columns come from the whole ledger, not from this subset.
 function recordsToResolve(records: LedgerRecord[], context: RuleContext, stale: boolean): LedgerRecord[] {
   return records.filter((record) => {
     if (!stale) return needsCategory(record.category);
     const ruled = ruledCategory(record, context);
     if (ruled !== "unknown") return ruled !== record.category;
+    // Old prefix and catch-all credits were stored as income. Send them
+    // through the normal unknown/AI path used for other rechecks.
+    if (record.category === "income") return true;
     return needsCategory(record.category);
   });
 }

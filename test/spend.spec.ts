@@ -443,6 +443,34 @@ describe("categorizeNarrative", () => {
       "transfers",
     );
     expect(categorizeNarrative("MY529 INVESTMENT", 10000, true)).toBe("transfers");
+    expect(categorizeNarrative("529 COLLEGE SAVINGS", 10000, true)).toBe("transfers");
+    expect(categorizeNarrative("529 PLAN CONTRIBUTION", 10000, true)).toBe("transfers");
+    expect(categorizeNarrative("529", 10000, true)).toBe("unknown");
+    expect(categorizeNarrative("CHECK 529", 10000, true)).toBe("unknown");
+    expect(categorizeNarrative("DEBIT CARD RETURN CHIPOTLE", 1000, true)).toBe("dining");
+    expect(categorizeNarrative("DEBIT CARD RETURN AMAZON.COM", 500, true)).toBe(
+      "shopping",
+    );
+    expect(categorizeNarrative("DEBIT CARD RETURN GROK XAI PALO ALTO", 15, true)).toBe(
+      "transfers",
+    );
+    expect(categorizeNarrative("ADJUST FEE CHARGED ATM FEE REBATE", 300, true)).toBe(
+      "transfers",
+    );
+    expect(categorizeNarrative("DIRECT DEPOSIT ACME", 50000, true)).toBe("unknown");
+    expect(categorizeNarrative("DIRECT DEPOSIT ACME INC", 50000, true)).toBe("unknown");
+    expect(categorizeNarrative("DIRECT DEPOSIT", 50000, true)).toBe("unknown");
+    expect(categorizeNarrative("DIR DEP ACME CORP", 50000, true)).toBe("income");
+    expect(categorizeNarrative("ACME CORP PAYROLL", 50000, true)).toBe("income");
+    expect(categorizeNarrative("DIR DEPT STORE", 50000, true)).toBe("unknown");
+    expect(categorizeNarrative("DIRECT DEPOSIT ELSEVIER INCPAYROLL", -13833, true)).toBe(
+      "unknown",
+    );
+    expect(categorizeNarrative("DIVIDEND REINVESTMENT", -200, true)).not.toBe("income");
+    expect(categorizeNarrative("INTEREST CHARGE", -1500, true)).not.toBe("income");
+    expect(categorizeNarrative("DIRECT DEPOSIT ELSEVIER INCPAYROLL", -13833, false)).toBe(
+      "income",
+    );
   });
 
   it("parses model category assignments and drops unknown labels", () => {
@@ -505,6 +533,12 @@ describe("intent validation and aggregation", () => {
     expect(interpreted?.confident).toBe(true);
     expect(interpreted?.intent.categories).toEqual(["income"]);
     expect(interpreted?.intent.op).toBe("sum");
+    const earned = interpretQuestion("How much did I earn?", null, []);
+    expect(earned?.confident).toBe(true);
+    expect(earned?.intent.categories).toEqual(["income"]);
+    const both = interpretQuestion("How much was income and transfers?", null, []);
+    expect(both?.confident).toBe(true);
+    expect(both?.intent.categories).toEqual(["transfers", "income"]);
     const fromModel = intentFromModel(
       JSON.stringify({
         categories: ["income", "transfers", "dining"],
@@ -517,6 +551,18 @@ describe("intent validation and aggregation", () => {
       "How much was income?",
     );
     expect(fromModel?.categories).toEqual(["income"]);
+    const bothFromModel = intentFromModel(
+      JSON.stringify({
+        categories: ["income"],
+        merchants: [],
+        excludeMerchants: [],
+        dateFrom: null,
+        dateTo: null,
+        op: "sum",
+      }),
+      "How much was income and transfers?",
+    );
+    expect(bothFromModel?.categories).toEqual(["transfers", "income"]);
   });
 
   it("strips income the model added to a spending question", () => {
@@ -1937,6 +1983,120 @@ describe("/api spending queries", () => {
     expect(body.answer).not.toContain("185.00");
     expect(body.answer).not.toContain("MY529");
     expect(body.answer).not.toContain("100.00");
+  });
+
+  it("rechecks stale stored income that the new rules no longer call income", async () => {
+    const email = "stale-bare-deposit@example.com";
+    vi.spyOn(env.AI, "run").mockImplementation(async () => {
+      throw new Error("model should only run after rules");
+    });
+    const stub = env.LEDGER.get(env.LEDGER.idFromName(ledgerName(email)));
+    await stub.replace(
+      [
+        {
+          payload: { Date: "2026-10-01", Description: "CHIPOTLE", Amount: "-10.00" },
+          category: "dining",
+        },
+        {
+          payload: {
+            Date: "2026-10-02",
+            Description: "DIRECT DEPOSIT ACME",
+            Amount: "500.00",
+          },
+          category: "income",
+        },
+        {
+          payload: {
+            Date: "2026-10-03",
+            Description: "MYSTERY CREDIT 42",
+            Amount: "5.00",
+          },
+          category: "income",
+        },
+      ],
+      { startDate: "2026-10-01", endDate: "2026-10-03" },
+    );
+    const income = await query(email, "How much was income?");
+    expect(income.answer).toMatch(/No matching charges/i);
+    expect(income.answer).not.toContain("ACME");
+    expect(income.answer).not.toContain("MYSTERY");
+    expect(income.answer).not.toContain("DIRECT DEPOSIT ACME:");
+    const once = await stub.load();
+    expect(
+      once.records.find((row) => row.payload.Description === "DIRECT DEPOSIT ACME")
+        ?.category,
+    ).not.toBe("income");
+    expect(
+      once.records.find((row) => row.payload.Description === "MYSTERY CREDIT 42")
+        ?.category,
+    ).not.toBe("income");
+    const spent = await query(email, "How much did I spend?");
+    expect(spent.answer).toContain("CHIPOTLE");
+    expect(spent.answer).toContain("Total: $10.00");
+    expect(spent.answer).not.toContain("500.00");
+  });
+
+  it("nets a debit-card return against dining and keeps income at $8359.55", async () => {
+    const email = "debit-return@example.com";
+    const run = vi.spyOn(env.AI, "run").mockImplementation(async () => {
+      throw new Error("rules cover these merchants");
+    });
+    const rows = [
+      ["2026-09-30", "CHIPOTLE", "-33.04"],
+      ["2026-09-30", "DEBIT CARD RETURN CHIPOTLE", "10.00"],
+      ...incomeStatementRows(),
+    ];
+    const uploaded = await upload(email, csvOf(rows));
+    expect(uploaded.status).toBe(200);
+    expect(((await uploaded.json()) as { uncategorized?: number }).uncategorized).toBe(0);
+    expect(run).not.toHaveBeenCalled();
+
+    const dining = await query(email, "How much I spent eating out?");
+    expect(dining.answer).toContain("CHIPOTLE");
+    expect(dining.answer).toContain("Total: $23.04");
+    expect(dining.answer).toContain("-$10.00");
+
+    const income = await query(email, "How much was income?");
+    expect(income.answer).toContain("Total: $8359.55");
+    expect(income.answer).not.toContain("CHIPOTLE");
+    expect(income.answer).not.toContain("PAYPAL");
+    expect(income.answer).not.toContain("GROK");
+    expect(income.answer).not.toContain("FEE REBATE");
+    expect(income.answer).not.toContain("MY529");
+    expect(income.answer).not.toContain("STUDNTLOAN");
+
+    const earned = await query(email, "How much did I earn?");
+    expect(earned.answer).toContain("Total: $8359.55");
+    expect(earned.answer).not.toContain("PAYPAL");
+
+    const both = await query(email, "How much was income and transfers?");
+    expect(both.answer).toContain("2785.11");
+    expect(both.answer).toContain("PAYPAL");
+    expect(both.answer).toContain("MY529");
+    expect(both.answer).toContain("STUDNTLOAN");
+    expect(both.answer).toContain("Total: $9291.03");
+    expect(both.answer).not.toContain("CHIPOTLE");
+  });
+
+  it("leaves a bare DIRECT DEPOSIT to the model on a new upload", async () => {
+    const email = "bare-deposit@example.com";
+    vi.spyOn(env.AI, "run").mockImplementation(async () => {
+      throw new Error("rules do not cover a bare direct deposit");
+    });
+    const uploaded = await upload(
+      email,
+      csvOf([
+        ["2026-10-01", "CHIPOTLE", "-10.00"],
+        ["2026-10-02", "DIRECT DEPOSIT ACME", "500.00"],
+        ["2026-10-03", "DIR DEP ACME CORP", "900.00"],
+      ]),
+    );
+    expect(uploaded.status).toBe(200);
+    expect(((await uploaded.json()) as { uncategorized?: number }).uncategorized).toBe(1);
+    const income = await query(email, "How much was income?");
+    expect(income.answer).toContain("Total: $900.00");
+    expect(income.answer).toContain("DIR DEP");
+    expect(income.answer).not.toContain("DIRECT DEPOSIT ACME");
   });
 
   // Skipped: workerd refuses a body read across requests, and the refused

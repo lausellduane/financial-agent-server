@@ -707,3 +707,71 @@ test("node mode returns only payroll, dividends, and interest for an income ques
   assert.doesNotMatch(answer, /100\.00/);
   setCompleteChatForTests(null);
 });
+
+test("node mode nets a debit-card return against dining and keeps income at $8359.55", async () => {
+  setCompleteChatForTests(async () => {
+    throw new Error("rules cover these merchants");
+  });
+  const uploaded = await upload(
+    csv([
+      "2026-09-30,CHIPOTLE,-33.04",
+      "2026-09-30,DEBIT CARD RETURN CHIPOTLE,10.00",
+      "2026-10-01,DIVIDEND RECEIVED FIDELITY GOVERNMENT MONEY MARKET (SPAXX) (CASH),2.00",
+      "2026-10-02,INTEREST EARNED FDIC INSURED DEPOSIT AT JP MORGAN HS (QHZHQ) (CASH) HSA NOT COVERED BY SIPC,0.02",
+      "2026-10-03,INTEREST EARNED FDIC INSURED DEPOSIT AT US BANK NOT (QUSBQ),0.01",
+      "2026-10-04,INTEREST EARNED FDIC INSURED DEPOSIT AT WELLS FARGO (QPIQQ) BK NOT COVERED BY SIPC,2.16",
+      "2026-10-05,DIRECT DEPOSIT PAYPAL TRANSFER,505.00",
+      "2026-10-06,DIRECT DEPOSIT ELSEVIER INCPAYROLL,2785.11",
+      "2026-10-07,ADVS ED SERV PSTUDNTLOAN,138.33",
+      "2026-10-08,DEBIT CARD RETURN GROK XAI PALO ALTO,0.15",
+      "2026-10-09,ADJUST FEE CHARGED ATM FEE REBATE,3.00",
+      "2026-10-10,DIRECT DEPOSIT ELSEVIER INCPAYROLL,2785.12",
+      "2026-10-11,TRANSFERRED FROM VS X84-544623-1,185.00",
+      "2026-10-12,MY529 INVESTMENT,100.00",
+      "2026-10-13,DIRECT DEPOSIT ELSEVIER INCPAYROLL,2785.13",
+    ]),
+  );
+  assert.equal(uploaded.status, 200);
+  assert.equal(uploaded.body.uncategorized, 0);
+  const dining = await ask("How much I spent eating out?");
+  assert.match(dining, /CHIPOTLE/);
+  assert.match(dining, /Total: \$23\.04/);
+  assert.match(dining, /-\$10\.00/);
+  const income = await ask("How much was income?");
+  assert.match(income, /Total: \$8359\.55/);
+  assert.doesNotMatch(income, /CHIPOTLE/);
+  assert.doesNotMatch(income, /PAYPAL/);
+  assert.doesNotMatch(income, /GROK/);
+  assert.doesNotMatch(income, /FEE REBATE/);
+  assert.doesNotMatch(income, /MY529/);
+  assert.doesNotMatch(income, /STUDNTLOAN/);
+  const earned = await ask("How much did I earn?");
+  assert.match(earned, /Total: \$8359\.55/);
+  assert.doesNotMatch(earned, /PAYPAL/);
+  const both = await ask("How much was income and transfers?");
+  assert.match(both, /2785\.11/);
+  assert.match(both, /PAYPAL/);
+  assert.match(both, /Total: \$9291\.03/);
+  assert.doesNotMatch(both, /CHIPOTLE/);
+  setCompleteChatForTests(null);
+});
+
+test("node mode leaves a bare DIRECT DEPOSIT to the model on a new upload", async () => {
+  setCompleteChatForTests(async () => {
+    throw new Error("rules do not cover a bare direct deposit");
+  });
+  const uploaded = await upload(
+    csv([
+      "2026-10-01,CHIPOTLE,-10.00",
+      "2026-10-02,DIRECT DEPOSIT ACME,500.00",
+      "2026-10-03,DIR DEP ACME CORP,900.00",
+    ]),
+  );
+  assert.equal(uploaded.status, 200);
+  assert.equal(uploaded.body.uncategorized, 1);
+  const income = await ask("How much was income?");
+  assert.match(income, /Total: \$900\.00/);
+  assert.match(income, /DIR DEP/);
+  assert.doesNotMatch(income, /DIRECT DEPOSIT ACME/);
+  setCompleteChatForTests(null);
+});

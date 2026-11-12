@@ -127,7 +127,7 @@ const CATEGORY_PATTERNS: { category: Category; pattern: RegExp }[] = [
   {
     category: "income",
     pattern:
-      /\b(income|paycheck|paychecks|payroll|salary|direct deposit|wages?)\b/i,
+      /\b(income|paycheck|paychecks|payroll|salary|direct deposit|wages?|earn(?:ed|ings)?)\b/i,
   },
   {
     category: "cloud/software",
@@ -237,7 +237,7 @@ export function intentFromModel(raw: string, question: string): QueryIntent | nu
 }
 
 function asksForIncome(topic: string): boolean {
-  return /\b(income|paycheck|paychecks|payroll|salary|direct deposit|wages?)\b/i.test(
+  return /\b(income|paycheck|paychecks|payroll|salary|direct deposit|wages?|earn(?:ed|ings)?)\b/i.test(
     topic,
   );
 }
@@ -693,7 +693,7 @@ categories must be chosen from: ${CATEGORIES.join(", ")}.
 op is sum, list, max, or count.
 dateFrom and dateTo are YYYY-MM-DD or null.
 combine is "or" when any category or merchant should match (gas and coffee). combine is "and" when a merchant narrows a category.
-Leave income, transfers, and credit-cards out of categories unless the user asked for income, paychecks, deposits, transfers, PayPal, Zelle, Venmo, or credit-card payments.
+Leave income, transfers, and credit-cards out of categories unless the user asked for income, paychecks, earnings, deposits, transfers, PayPal, Zelle, Venmo, or credit-card payments.
 A mortgage or housing question is housing/mortgage only. A bills question is utilities/telecom only. Health insurance is insurance/health only, not car insurance. Car insurance is insurance/auto only and does not include credit-card autopay. A credit-card payment question is credit-cards only. Do not answer those with healthcare, home, or another nearby category.
 If the user names a new category, replace the previous categories. Keep the previous categories only when the user is excluding or correcting a charge.
 If nothing in the list fits, return an empty categories array.
