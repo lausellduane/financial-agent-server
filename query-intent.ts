@@ -1,6 +1,7 @@
 import {
   CATEGORIES,
   isCategory,
+  isDebitCardReturn,
   tokenIn,
   type Category,
 } from "./categories.js";
@@ -127,7 +128,7 @@ const CATEGORY_PATTERNS: { category: Category; pattern: RegExp }[] = [
   {
     category: "income",
     pattern:
-      /\b(income|paycheck|paychecks|payroll|salary|direct deposit|wages?)\b/i,
+      /\b(income|paycheck|paychecks|payroll|salary|direct deposit|wages?|earn(?:ed|ings?)?)\b|\bhow much(?:\s+(?:did|do|have|had)\s+i)\s+(?:make|made)(?:\s+(?:in|for|during|this|last|from)\b|\s*$|\s*[?!.])/i,
   },
   {
     category: "cloud/software",
@@ -236,9 +237,18 @@ export function intentFromModel(raw: string, question: string): QueryIntent | nu
   return applyQuestionGuards(intent, question, true);
 }
 
-function asksForIncome(topic: string): boolean {
-  return /\b(income|paycheck|paychecks|payroll|salary|direct deposit|wages?)\b/i.test(
+function asksHowMuchMade(topic: string): boolean {
+  // "How much did I make?" is income. A bare "make" or "make a payment" is not.
+  return /\bhow much(?:\s+(?:did|do|have|had)\s+i)\s+(?:make|made)(?:\s+(?:in|for|during|this|last|from)\b|\s*$|\s*[?!.])/i.test(
     topic,
+  );
+}
+
+function asksForIncome(topic: string): boolean {
+  return (
+    /\b(income|paycheck|paychecks|payroll|salary|direct deposit|wages?|earn(?:ed|ings?)?)\b/i.test(
+      topic,
+    ) || asksHowMuchMade(topic)
   );
 }
 
@@ -252,6 +262,24 @@ function asksForCreditCards(topic: string): boolean {
 
 function isNonSpendingCategory(category: Category): boolean {
   return category === "income" || category === "transfers" || category === "credit-cards";
+}
+
+// A debit-card return at a known merchant is money-in, even on an unsigned
+// file or when the statement recorded the return as a negative.
+export function spendCentsFor(
+  narrative: string,
+  amountCents: number,
+  signedLedger: boolean,
+  category: Category | "unknown",
+): number {
+  if (
+    isDebitCardReturn(narrative) &&
+    category !== "unknown" &&
+    !isNonSpendingCategory(category)
+  ) {
+    return -Math.abs(amountCents);
+  }
+  return signedLedger ? -amountCents : Math.abs(amountCents);
 }
 
 export function applyQuestionGuards(
@@ -693,7 +721,7 @@ categories must be chosen from: ${CATEGORIES.join(", ")}.
 op is sum, list, max, or count.
 dateFrom and dateTo are YYYY-MM-DD or null.
 combine is "or" when any category or merchant should match (gas and coffee). combine is "and" when a merchant narrows a category.
-Leave income, transfers, and credit-cards out of categories unless the user asked for income, paychecks, deposits, transfers, PayPal, Zelle, Venmo, or credit-card payments.
+Leave income, transfers, and credit-cards out of categories unless the user asked for income, paychecks, earnings, deposits, transfers, PayPal, Zelle, Venmo, or credit-card payments.
 A mortgage or housing question is housing/mortgage only. A bills question is utilities/telecom only. Health insurance is insurance/health only, not car insurance. Car insurance is insurance/auto only and does not include credit-card autopay. A credit-card payment question is credit-cards only. Do not answer those with healthcare, home, or another nearby category.
 If the user names a new category, replace the previous categories. Keep the previous categories only when the user is excluding or correcting a charge.
 If nothing in the list fits, return an empty categories array.

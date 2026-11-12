@@ -24,7 +24,7 @@ export const CATEGORIES = [
 export type Category = (typeof CATEGORIES)[number];
 
 // Bump this when merchant rules change so a stored ledger is rechecked once.
-export const CATEGORY_RULES_VERSION = "12";
+export const CATEGORY_RULES_VERSION = "13";
 
 export function isCategory(value: string): value is Category {
   return (CATEGORIES as readonly string[]).includes(value);
@@ -305,8 +305,12 @@ const RULES: Rule[] = [
       "VISA DIRECT",
       "WIRE TRANSFER",
       "ACH TRANSFER",
+      "TRANSFERRED FROM",
+      "TRANSFERRED TO",
     ],
-    pattern: /(^|[^A-Z0-9])(TRANSFER|XFER|WIRE)([^A-Z0-9]|$)/,
+    // TRANSFERRED must be listed so "TRANSFERRED FROM" is not missed:
+    // TRANSFER plus a word-character boundary fails on the remaining "RED".
+    pattern: /(^|[^A-Z0-9])(TRANSFERRED|TRANSFER|XFER|WIRE)([^A-Z0-9]|$)/,
   },
 ];
 
@@ -575,41 +579,101 @@ function isBlankNarrative(text: string): boolean {
   );
 }
 
-function hasIncomeKeyword(text: string): boolean {
+function isStudentLoan(text: string): boolean {
+  // "PSTUDNTLOAN" is a truncated servicer descriptor, so do not require a
+  // word boundary before STUDNTLOAN.
+  return /STUDNTLOAN|STUDENTLOAN|STUDENT\s+LOANS?|STU\s+LOAN/.test(text);
+}
+
+function isCollegeSavings(text: string): boolean {
+  // Require a 529 product word so a bare check or street number is not a
+  // college-savings transfer.
   return (
-    /\b(MOBILE|DIRECT|ATM|REMOTE|BRANCH|CHECK|CASH)\s+DEPOSITS?\b/.test(text) ||
-    text.includes("DIRECT DEPOSIT") ||
-    text.includes("PAYROLL") ||
-    text.includes("PAYCHECK") ||
-    text.includes("PAY CHECK") ||
-    text.includes("DIR DEP") ||
-    /(^|[^A-Z0-9])SALARY([^A-Z0-9]|$)/.test(text) ||
-    text.includes("ACH CREDIT")
+    /\bMY529\b/.test(text) ||
+    /\b529\s+(PLAN|COLLEGE|INVESTMENT|CONTRIBUTION|SAVINGS|ACCOUNT)\b/.test(text) ||
+    /\b(PLAN|COLLEGE|INVESTMENT|CONTRIBUTION|SAVINGS)\s+529\b/.test(text)
   );
+}
+
+export function isDebitCardReturn(text: string): boolean {
+  return /\bDEBIT\s+CARD\s+RETURN\b/.test(text.toUpperCase());
+}
+
+function isFeeRebate(text: string): boolean {
+  return /\bFEE\s+REBATE\b/.test(text);
+}
+
+function isNonIncomeMovement(text: string): boolean {
+  // Fee rebates have no fees category, so they stay transfers (non-income,
+  // non-spending). Debit-card returns are classified later so a known
+  // merchant can still reduce that merchant's spending.
+  if (isStudentLoan(text) || isCollegeSavings(text) || isFeeRebate(text)) {
+    return true;
+  }
+  const rule = RULES.find((entry) => entry.category === "transfers");
+  return rule ? matchesRule(text, rule) : false;
+}
+
+function hasIncomeKeyword(text: string): boolean {
+  if (/\bDIVIDENDS?\b/.test(text)) return true;
+  if (/\bINTEREST\s+EARNED\b/.test(text)) return true;
+  // A generic "DIRECT DEPOSIT" prefix is not income. Payroll still matches
+  // through PAYROLL / INCPAYROLL below. Mobile and similar check deposits
+  // stay income so they are kept out of spending totals.
+  if (/\b(MOBILE|ATM|REMOTE|BRANCH|CHECK|CASH)\s+DEPOSITS?\b/.test(text)) {
+    return true;
+  }
+  // Word boundaries, with INCPAYROLL kept as a payroll form (ELSEVIER).
+  // "DIR DEP" and "DIR DEPOSIT" match; "DIR DEPT" does not.
+  if (
+    /(^|[^A-Z0-9])(INCPAYROLL|PAYROLL|PAYCHECK|PAY\s+CHECK)([^A-Z0-9]|$)/.test(text) ||
+    /(^|[^A-Z0-9])DIR\s+DEP(?:OSIT)?([^A-Z0-9]|$)/.test(text) ||
+    /(^|[^A-Z0-9])SALARY([^A-Z0-9]|$)/.test(text)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function isIncomeCredit(
+  text: string,
+  amountCents: number,
+  signedLedger: boolean,
+): boolean {
+  if (!hasIncomeKeyword(text)) return false;
+  // On a signed ledger, a payroll-tax debit or dividend reinvestment is
+  // not income. Unsigned statements store amounts as absolute values.
+  if (signedLedger && amountCents <= 0) return false;
+  return true;
 }
 
 // Deterministic category, or "unknown" when only the model should decide.
 // A refund keeps the merchant's spending category so it can reduce that
-// total. A credit that matches no spending rule is income. Transfers stay
-// transfers on either sign.
+// total, including a "DEBIT CARD RETURN" that names a known merchant.
+// Transfers, 529 contributions, student-loan payments, unrecognized
+// debit-card returns, and fee rebates stay transfers on either sign and
+// are never income. An unmatched credit is not income.
 export function categorizeNarrative(
   narrative: string,
   amountCents: number,
   signedLedger: boolean,
 ): Category | "unknown" {
   const text = narrative.toUpperCase();
-  if (hasIncomeKeyword(text)) return "income";
+  // Run before income keywords so "DIRECT DEPOSIT PAYPAL TRANSFER" is a
+  // transfer, not a paycheck.
+  if (isNonIncomeMovement(text)) return "transfers";
+  if (isIncomeCredit(text, amountCents, signedLedger) && !isDebitCardReturn(text)) {
+    return "income";
+  }
   // A mortgage payment to a bank is still a mortgage. The institution check
   // would otherwise call every outflow a transfer.
   if (isMortgagePayment(text)) return "housing/mortgage";
   if (isCreditCardPayment(text)) return "credit-cards";
   // A credit-union or bank line is not a Shell/Mobil station, even when the
-  // institution's name contains that brand. Credits are income. Money sent
-  // to the institution is a transfer, not fuel.
-  if (isFinancialInstitution(text)) {
-    if (amountCents < 0) return "transfers";
-    return "income";
-  }
+  // institution's name contains that brand. Money sent to or received from
+  // the institution is a transfer, not fuel and not income. Interest earned
+  // at a bank already matched above.
+  if (isFinancialInstitution(text)) return "transfers";
   if (isUtilityGas(text)) return "utilities/telecom";
   if (isBlankNarrative(text)) return "other";
   if (isEventTicket(text)) return "entertainment/events";
@@ -622,7 +686,8 @@ export function categorizeNarrative(
   if (isHealthInsurance(text)) return "insurance/health";
   const ruled = RULES.find((rule) => matchesRule(text, rule))?.category;
   if (ruled) return ruled;
-  if (signedLedger && amountCents > 0) return "income";
+  // No merchant rule matched. A debit-card return is still not income.
+  if (isDebitCardReturn(text)) return "transfers";
   if (!text.trim()) return "other";
   return "unknown";
 }
@@ -646,9 +711,9 @@ utilities/telecom = power, county or municipal water and sewer, natural gas, pho
 healthcare = doctors, dental, OBGYN, clinics, and pharmacies such as Walgreens, CVS, and Rite Aid. Not an insurance premium.
 insurance/health = health-insurance premiums such as Blue Cross, BCBS, Aetna, or Cigna. Not a doctor and not a pharmacy.
 insurance/auto = car insurance such as GEICO, Progressive, PROG PREMIER INS, State Farm, Allstate, Nationwide, Erie, or USAA. Not a store, not a doctor, and not a credit-card autopay.
-transfers = PayPal, Zelle, Venmo, wires.
+transfers = PayPal, Zelle, Venmo, wires, account-to-account transfers, 529 contributions, student-loan payments, fee rebates, and debit-card returns that do not name a known merchant. A debit-card return at a known merchant keeps that merchant's spending category.
 credit-cards = payments to a credit-card issuer such as Chase, Amex, Synchrony, or Capital One, including CAUTOPAY, AUTOPAY, EPAYMENT, and BANKPAYMENT. Not a card purchase at a store and not car insurance.
-income = paychecks and direct deposits.
+income = paychecks, payroll direct deposits, dividends, and interest earned. Not a generic DIRECT DEPOSIT, a PayPal transfer, a 529 contribution, a student-loan payment, a refund, or a fee rebate.
 cloud/software = Amazon Web Services and other cloud hosts. Not Amazon retail.
 home = hardware stores and home repair. Not a mortgage payment and not a utility bill.
 housing/mortgage = the payment to a mortgage lender or home-loan servicer. Not Lowe's and not HVAC.

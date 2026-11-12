@@ -28,6 +28,7 @@ import {
   intentFromModel,
   interpretQuestion,
   selectTransactions,
+  spendCentsFor,
   validateIntent,
   type QueryIntent,
   type TxView,
@@ -162,12 +163,17 @@ function ruledCategory(record: LedgerRecord, context: RuleContext): ReturnType<t
 
 // A merchant rule replaces a stored category that disagrees with it, including
 // one the model previously saved. "other" with no matching rule stays put.
+// Stale rows stored as income are re-resolved when the new rules no longer
+// call them income, including when the result is unknown (then the model).
 // The sign and columns come from the whole ledger, not from this subset.
 function recordsToResolve(records: LedgerRecord[], context: RuleContext, stale: boolean): LedgerRecord[] {
   return records.filter((record) => {
     if (!stale) return needsCategory(record.category);
     const ruled = ruledCategory(record, context);
     if (ruled !== "unknown") return ruled !== record.category;
+    // Old prefix and catch-all credits were stored as income. Send them
+    // through the normal unknown/AI path used for other rechecks.
+    if (record.category === "income") return true;
     return needsCategory(record.category);
   });
 }
@@ -388,11 +394,10 @@ function toViews(records: LedgerRecord[]): { views: TxView[]; omitted: OmittedRo
     const amountCents = parseAmountCents(
       fields.amount ? record.payload[fields.amount] : undefined,
     );
-    const spendCents = signed ? -amountCents : Math.abs(amountCents);
     if (needsCategory(record.category)) {
       if (amountCents !== 0) {
         omitted.unknownCount += 1;
-        omitted.unknownCents += Math.abs(spendCents);
+        omitted.unknownCents += Math.abs(amountCents);
       } else {
         omitted.zeroCount += 1;
       }
@@ -402,6 +407,12 @@ function toViews(records: LedgerRecord[]): { views: TxView[]; omitted: OmittedRo
       omitted.zeroCount += 1;
       continue;
     }
+    const spendCents = spendCentsFor(
+      narrative,
+      amountCents,
+      signed,
+      record.category as Category,
+    );
     let merchant = cleanMerchantName(narrative);
     // Only a placeholder description is renamed. "CHIPOTLE PENDING" keeps Chipotle.
     if (/^(pending|processing|process)$/i.test(rawDescription.trim())) {
