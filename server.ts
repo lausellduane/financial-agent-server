@@ -28,6 +28,7 @@ import {
   intentFromModel,
   interpretQuestion,
   selectTransactions,
+  spendCentsFor,
   validateIntent,
   type QueryIntent,
   type TxView,
@@ -393,11 +394,10 @@ function toViews(records: LedgerRecord[]): { views: TxView[]; omitted: OmittedRo
     const amountCents = parseAmountCents(
       fields.amount ? record.payload[fields.amount] : undefined,
     );
-    const spendCents = signed ? -amountCents : Math.abs(amountCents);
     if (needsCategory(record.category)) {
       if (amountCents !== 0) {
         omitted.unknownCount += 1;
-        omitted.unknownCents += Math.abs(spendCents);
+        omitted.unknownCents += Math.abs(amountCents);
       } else {
         omitted.zeroCount += 1;
       }
@@ -407,6 +407,12 @@ function toViews(records: LedgerRecord[]): { views: TxView[]; omitted: OmittedRo
       omitted.zeroCount += 1;
       continue;
     }
+    const spendCents = spendCentsFor(
+      narrative,
+      amountCents,
+      signed,
+      record.category as Category,
+    );
     let merchant = cleanMerchantName(narrative);
     // Only a placeholder description is renamed. "CHIPOTLE PENDING" keeps Chipotle.
     if (/^(pending|processing|process)$/i.test(rawDescription.trim())) {

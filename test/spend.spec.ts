@@ -14,6 +14,7 @@ import {
   intentFromModel,
   interpretQuestion,
   selectTransactions,
+  spendCentsFor,
   totalCents,
   validateIntent,
   type QueryIntent,
@@ -93,7 +94,12 @@ function view(description: string, amount: string, signed: boolean): TxView {
     merchant: cleanMerchantName(description),
     narrative: description.toUpperCase(),
     amountCents,
-    spendCents: signed ? -amountCents : Math.abs(amountCents),
+    spendCents: spendCentsFor(
+      description,
+      amountCents,
+      signed,
+      found === "unknown" ? "other" : found,
+    ),
     category: found === "unknown" ? "other" : found,
   };
 }
@@ -461,6 +467,7 @@ describe("categorizeNarrative", () => {
     expect(categorizeNarrative("DIRECT DEPOSIT ACME INC", 50000, true)).toBe("unknown");
     expect(categorizeNarrative("DIRECT DEPOSIT", 50000, true)).toBe("unknown");
     expect(categorizeNarrative("DIR DEP ACME CORP", 50000, true)).toBe("income");
+    expect(categorizeNarrative("DIR DEPOSIT ACME CORP", 50000, true)).toBe("income");
     expect(categorizeNarrative("ACME CORP PAYROLL", 50000, true)).toBe("income");
     expect(categorizeNarrative("DIR DEPT STORE", 50000, true)).toBe("unknown");
     expect(categorizeNarrative("DIRECT DEPOSIT ELSEVIER INCPAYROLL", -13833, true)).toBe(
@@ -536,6 +543,18 @@ describe("intent validation and aggregation", () => {
     const earned = interpretQuestion("How much did I earn?", null, []);
     expect(earned?.confident).toBe(true);
     expect(earned?.intent.categories).toEqual(["income"]);
+    const earning = interpretQuestion("What was my earning?", null, []);
+    expect(earning?.confident).toBe(true);
+    expect(earning?.intent.categories).toEqual(["income"]);
+    const made = interpretQuestion("How much did I make?", null, []);
+    expect(made?.confident).toBe(true);
+    expect(made?.intent.categories).toEqual(["income"]);
+    const madeIn = interpretQuestion("How much did I make in 2026?", null, []);
+    expect(madeIn?.intent.categories).toEqual(["income"]);
+    const payment = interpretQuestion("How much did I make a payment?", null, []);
+    expect(payment?.intent.categories ?? []).not.toContain("income");
+    const learning = interpretQuestion("How much did I spend on learning?", null, []);
+    expect(learning?.intent.categories ?? []).not.toContain("income");
     const both = interpretQuestion("How much was income and transfers?", null, []);
     expect(both?.confident).toBe(true);
     expect(both?.intent.categories).toEqual(["transfers", "income"]);
@@ -563,6 +582,31 @@ describe("intent validation and aggregation", () => {
       "How much was income and transfers?",
     );
     expect(bothFromModel?.categories).toEqual(["transfers", "income"]);
+  });
+
+  it("nets a debit-card return on unsigned and signed-negative amounts", () => {
+    const dining = interpretQuestion("How much I spent eating out?", null, []);
+    expect(dining?.intent.categories).toEqual(["dining"]);
+    const unsigned = [
+      view("CHIPOTLE", "33.04", false),
+      view("DEBIT CARD RETURN CHIPOTLE", "10.00", false),
+    ];
+    const unsignedAnswer = formatAnswer(
+      selectTransactions(unsigned, dining!.intent),
+      dining!.intent,
+    );
+    expect(unsignedAnswer).toContain("Total: $23.04");
+    expect(unsignedAnswer).not.toContain("$43.04");
+    const signedNeg = [
+      view("CHIPOTLE", "-33.04", true),
+      view("DEBIT CARD RETURN CHIPOTLE", "-10.00", true),
+    ];
+    const signedAnswer = formatAnswer(
+      selectTransactions(signedNeg, dining!.intent),
+      dining!.intent,
+    );
+    expect(signedAnswer).toContain("Total: $23.04");
+    expect(signedAnswer).not.toContain("$43.04");
   });
 
   it("strips income the model added to a spending question", () => {
@@ -2076,6 +2120,52 @@ describe("/api spending queries", () => {
     expect(both.answer).toContain("STUDNTLOAN");
     expect(both.answer).toContain("Total: $9291.03");
     expect(both.answer).not.toContain("CHIPOTLE");
+  });
+
+  it("nets an unsigned debit-card return against dining", async () => {
+    const email = "unsigned-return@example.com";
+    vi.spyOn(env.AI, "run").mockImplementation(async () => {
+      throw new Error("rules cover these merchants");
+    });
+    const uploaded = await upload(
+      email,
+      csvOf([
+        ["2026-09-30", "CHIPOTLE", "33.04"],
+        ["2026-09-30", "DEBIT CARD RETURN CHIPOTLE", "10.00"],
+        ...incomeStatementRows(),
+      ]),
+    );
+    expect(uploaded.status).toBe(200);
+    expect(((await uploaded.json()) as { uncategorized?: number }).uncategorized).toBe(0);
+    const dining = await query(email, "How much I spent eating out?");
+    expect(dining.answer).toContain("Total: $23.04");
+    expect(dining.answer).not.toContain("$43.04");
+    const income = await query(email, "How much was income?");
+    expect(income.answer).toContain("Total: $8359.55");
+    expect(income.answer).not.toContain("CHIPOTLE");
+  });
+
+  it("nets a signed-negative debit-card return against dining", async () => {
+    const email = "signed-neg-return@example.com";
+    vi.spyOn(env.AI, "run").mockImplementation(async () => {
+      throw new Error("rules cover these merchants");
+    });
+    const uploaded = await upload(
+      email,
+      csvOf([
+        ["2026-09-30", "CHIPOTLE", "-33.04"],
+        ["2026-09-30", "DEBIT CARD RETURN CHIPOTLE", "-10.00"],
+        ...incomeStatementRows(),
+      ]),
+    );
+    expect(uploaded.status).toBe(200);
+    expect(((await uploaded.json()) as { uncategorized?: number }).uncategorized).toBe(0);
+    const dining = await query(email, "How much I spent eating out?");
+    expect(dining.answer).toContain("Total: $23.04");
+    expect(dining.answer).not.toContain("$43.04");
+    const income = await query(email, "How much was income?");
+    expect(income.answer).toContain("Total: $8359.55");
+    expect(income.answer).not.toContain("CHIPOTLE");
   });
 
   it("leaves a bare DIRECT DEPOSIT to the model on a new upload", async () => {

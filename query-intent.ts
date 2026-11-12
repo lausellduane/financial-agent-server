@@ -1,6 +1,7 @@
 import {
   CATEGORIES,
   isCategory,
+  isDebitCardReturn,
   tokenIn,
   type Category,
 } from "./categories.js";
@@ -127,7 +128,7 @@ const CATEGORY_PATTERNS: { category: Category; pattern: RegExp }[] = [
   {
     category: "income",
     pattern:
-      /\b(income|paycheck|paychecks|payroll|salary|direct deposit|wages?|earn(?:ed|ings)?)\b/i,
+      /\b(income|paycheck|paychecks|payroll|salary|direct deposit|wages?|earn(?:ed|ings?)?)\b|\bhow much(?:\s+(?:did|do|have|had)\s+i)\s+(?:make|made)(?:\s+(?:in|for|during|this|last|from)\b|\s*$|\s*[?!.])/i,
   },
   {
     category: "cloud/software",
@@ -236,9 +237,18 @@ export function intentFromModel(raw: string, question: string): QueryIntent | nu
   return applyQuestionGuards(intent, question, true);
 }
 
-function asksForIncome(topic: string): boolean {
-  return /\b(income|paycheck|paychecks|payroll|salary|direct deposit|wages?|earn(?:ed|ings)?)\b/i.test(
+function asksHowMuchMade(topic: string): boolean {
+  // "How much did I make?" is income. A bare "make" or "make a payment" is not.
+  return /\bhow much(?:\s+(?:did|do|have|had)\s+i)\s+(?:make|made)(?:\s+(?:in|for|during|this|last|from)\b|\s*$|\s*[?!.])/i.test(
     topic,
+  );
+}
+
+function asksForIncome(topic: string): boolean {
+  return (
+    /\b(income|paycheck|paychecks|payroll|salary|direct deposit|wages?|earn(?:ed|ings?)?)\b/i.test(
+      topic,
+    ) || asksHowMuchMade(topic)
   );
 }
 
@@ -252,6 +262,24 @@ function asksForCreditCards(topic: string): boolean {
 
 function isNonSpendingCategory(category: Category): boolean {
   return category === "income" || category === "transfers" || category === "credit-cards";
+}
+
+// A debit-card return at a known merchant is money-in, even on an unsigned
+// file or when the statement recorded the return as a negative.
+export function spendCentsFor(
+  narrative: string,
+  amountCents: number,
+  signedLedger: boolean,
+  category: Category | "unknown",
+): number {
+  if (
+    isDebitCardReturn(narrative) &&
+    category !== "unknown" &&
+    !isNonSpendingCategory(category)
+  ) {
+    return -Math.abs(amountCents);
+  }
+  return signedLedger ? -amountCents : Math.abs(amountCents);
 }
 
 export function applyQuestionGuards(

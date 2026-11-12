@@ -595,8 +595,8 @@ function isCollegeSavings(text: string): boolean {
   );
 }
 
-function isDebitCardReturn(text: string): boolean {
-  return /\bDEBIT\s+CARD\s+RETURN\b/.test(text);
+export function isDebitCardReturn(text: string): boolean {
+  return /\bDEBIT\s+CARD\s+RETURN\b/.test(text.toUpperCase());
 }
 
 function isFeeRebate(text: string): boolean {
@@ -624,10 +624,10 @@ function hasIncomeKeyword(text: string): boolean {
     return true;
   }
   // Word boundaries, with INCPAYROLL kept as a payroll form (ELSEVIER).
-  // "DIR DEP" must not match "DIR DEPT".
+  // "DIR DEP" and "DIR DEPOSIT" match; "DIR DEPT" does not.
   if (
     /(^|[^A-Z0-9])(INCPAYROLL|PAYROLL|PAYCHECK|PAY\s+CHECK)([^A-Z0-9]|$)/.test(text) ||
-    /(^|[^A-Z0-9])DIR\s+DEP([^A-Z0-9]|$)/.test(text) ||
+    /(^|[^A-Z0-9])DIR\s+DEP(?:OSIT)?([^A-Z0-9]|$)/.test(text) ||
     /(^|[^A-Z0-9])SALARY([^A-Z0-9]|$)/.test(text)
   ) {
     return true;
