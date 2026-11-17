@@ -301,8 +301,8 @@ describe("/api with a valid Access JWT", () => {
     expect(stored.records[0]?.category).toBe("home");
   });
 
-  it("replaces the stored report when the same person uploads again", async () => {
-    const token = await tokenFor("replace-report@example.com");
+  it("adds to the stored report when the same person uploads again", async () => {
+    const token = await tokenFor("append-report@example.com");
     const firstForm = new FormData();
     firstForm.set("file", new File([csv], "statement.csv", { type: "text/csv" }));
     expect(
@@ -321,15 +321,16 @@ describe("/api with a valid Access JWT", () => {
     nextForm.set(
       "file",
       new File(
-        ["Date,Description,Amount\n2026-03-01,SHELL OIL,-20.00\n"],
+        [
+          "Date,Description,Amount\n2026-03-01,SHELL OIL,-20.00\n2026-01-03,PIEDMONT NATURAL GAS,-40.00\n",
+        ],
         "next.csv",
         { type: "text/csv" },
       ),
     );
-    expect(
-      (await authed("/api/upload", token, { method: "POST", body: nextForm }))
-        .status,
-    ).toBe(200);
+    const uploaded = await authed("/api/upload", token, { method: "POST", body: nextForm });
+    expect(uploaded.status).toBe(200);
+    expect(await uploaded.json()).toMatchObject({ count: 2, added: 1, duplicates: 1, total: 4 });
     const next = (await (await authed("/api/report", token)).json()) as {
       loaded: boolean;
       count: number;
@@ -339,8 +340,8 @@ describe("/api with a valid Access JWT", () => {
     };
     expect(next).toMatchObject({
       loaded: true,
-      count: 1,
-      startDate: "2026-03-01",
+      count: 4,
+      startDate: "2026-01-02",
       endDate: "2026-03-01",
     });
     expect(next.uploadedAt && first.uploadedAt < next.uploadedAt).toBe(true);
