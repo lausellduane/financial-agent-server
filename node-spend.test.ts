@@ -992,3 +992,40 @@ test("GET /api/report includes monthly spend-by-category without calling the mod
   assert.ok(november.categories.some((row) => row.name === "Eating out" && row.cents === 1850));
   assert.ok(november.categories.some((row) => row.name === "Groceries" && row.cents === 4000));
 });
+
+test("GET /api/report nets an unsigned Chipotle debit-card return in dining", async () => {
+  setCompleteChatForTests(async () => {
+    throw new Error("rules cover these merchants");
+  });
+  const uploaded = await upload(
+    csv([
+      "2026-11-02,CHIPOTLE,33.04",
+      "2026-11-03,DEBIT CARD RETURN CHIPOTLE,10.00",
+    ]),
+  );
+  assert.equal(uploaded.status, 200);
+  const response = await fetch(`${base}/api/report`);
+  assert.equal(response.status, 200);
+  const body = (await response.json()) as {
+    loaded: boolean;
+    count: number;
+    months: {
+      month: string;
+      diningCents: number;
+      totalCents: number;
+      categories: { name: string; cents: number }[];
+    }[];
+  };
+  assert.equal(body.loaded, true);
+  assert.equal(body.count, 2);
+  assert.equal(body.months.length, 1);
+  const november = body.months[0];
+  assert.ok(november);
+  assert.equal(november.month, "2026-11");
+  assert.equal(november.diningCents, 2304);
+  assert.equal(november.totalCents, 2304);
+  assert.ok(
+    november.categories.some((row) => row.name === "Eating out" && row.cents === 2304),
+  );
+  setCompleteChatForTests(null);
+});

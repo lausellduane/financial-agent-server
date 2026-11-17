@@ -31,7 +31,7 @@ test("month helpers", () => {
   assert.equal(displayCategory(""), "Other");
 });
 
-test("builds a month of net spend and drops income and transfers", () => {
+test("builds a month of net spend and drops income, transfers, and credit-card payments", () => {
   const months = buildMonthlySpend([
     event("2026-11-02", "Food Lion", 61200, "groceries"),
     event("2026-11-03", "Piedmont", 54000, "utilities/telecom"),
@@ -41,6 +41,7 @@ test("builds a month of net spend and drops income and transfers", () => {
     event("2026-11-07", "Venmo", 4000, "transfers"),
     event("2026-11-08", "Odd Shop", 41000, "unknown"),
     event("2026-11-09", "Random", 0, "shopping"),
+    event("2026-11-10", "Chase Credit Card", 20000, "credit-cards"),
   ]);
 
   assert.equal(months.length, 1);

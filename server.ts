@@ -33,6 +33,7 @@ import {
   type TxView,
 } from "./query-intent.js";
 import { buildMonthlySpend, type MonthSpend, type SpendEvent } from "./monthly-spend.js";
+import { spendCentsFor } from "./spend-cents.js";
 import {
   cleanMerchantName,
   columnStats,
@@ -549,18 +550,25 @@ function toSpendEvents(records: LedgerRecord[]): SpendEvent[] {
       fields.amount ? record.payload[fields.amount] : undefined,
     );
     if (!amountCents) continue;
-    const spendCents = signed ? -amountCents : Math.abs(amountCents);
+    const spendCategory: Category | "unknown" =
+      record.category && !needsCategory(record.category)
+        ? (record.category as Category)
+        : "unknown";
+    const spendCents = spendCentsFor(
+      narrative,
+      amountCents,
+      signed,
+      spendCategory,
+    );
     let merchant = cleanMerchantName(narrative);
     if (/^(pending|processing|process)$/i.test(rawDescription.trim())) {
       merchant = "Pending";
     }
-    const category =
-      record.category && !needsCategory(record.category) ? record.category : "other";
     events.push({
       date: normalizeDate(fields.date ? String(record.payload[fields.date] ?? "") : ""),
       merchant,
       spendCents,
-      category,
+      category: spendCategory === "unknown" ? "other" : spendCategory,
     });
   }
   return events;
