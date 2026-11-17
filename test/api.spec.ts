@@ -225,6 +225,7 @@ describe("/api with a valid Access JWT", () => {
       startDate: null,
       endDate: null,
       uploadedAt: null,
+      months: [],
     });
   });
 
@@ -249,6 +250,7 @@ describe("/api with a valid Access JWT", () => {
       startDate: string | null;
       endDate: string | null;
       uploadedAt: string | null;
+      months: unknown;
     };
     expect(body.loaded).toBe(true);
     expect(body.count).toBe(3);
@@ -256,6 +258,25 @@ describe("/api with a valid Access JWT", () => {
     expect(body.endDate).toBe("2026-01-04");
     expect(body.uploadedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
     expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(body.months).toEqual([
+      {
+        month: "2026-01",
+        label: "Jan 2026",
+        totalCents: 13870,
+        diningCents: 1250,
+        categories: [
+          { name: "Groceries", cents: 8620 },
+          { name: "Utilities", cents: 4000 },
+          { name: "Eating out", cents: 1250 },
+        ],
+        topMerchants: [
+          { name: "Costco", cents: 8620 },
+          { name: "Piedmont Natural Gas", cents: 4000 },
+          { name: "CHIPOTLE", cents: 1250 },
+        ],
+        biggestPurchase: { name: "Costco", cents: 8620 },
+      },
+    ]);
 
     const other = await tokenFor("other-report@example.com");
     const hidden = await authed("/api/report", other);
@@ -265,6 +286,7 @@ describe("/api with a valid Access JWT", () => {
       startDate: null,
       endDate: null,
       uploadedAt: null,
+      months: [],
     });
   });
 
@@ -293,6 +315,7 @@ describe("/api with a valid Access JWT", () => {
       count: 1,
       startDate: null,
       endDate: null,
+      months: [],
     });
     expect(run).toHaveBeenCalled();
     const stored = await env.LEDGER.get(

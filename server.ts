@@ -32,6 +32,7 @@ import {
   type QueryIntent,
   type TxView,
 } from "./query-intent.js";
+import { buildMonthlySpend, type MonthSpend, type SpendEvent } from "./monthly-spend.js";
 import {
   cleanMerchantName,
   columnStats,
@@ -61,6 +62,7 @@ export type ReportSummary = {
   startDate: string | null;
   endDate: string | null;
   uploadedAt: string | null;
+  months: MonthSpend[];
 };
 
 type DateRange = { startDate: string | null; endDate: string | null };
@@ -532,6 +534,38 @@ function toViews(records: LedgerRecord[]): { views: TxView[]; omitted: OmittedRo
   return { views, omitted };
 }
 
+// Chart and quick-question totals. Uncategorized charges are kept as "other"
+// so they can appear in the Other bar. Income, transfers, and credit-cards
+// stay in the event list and are dropped later by buildMonthlySpend.
+function toSpendEvents(records: LedgerRecord[]): SpendEvent[] {
+  if (!records.length) return [];
+  const fieldsFor = ruleContext(records);
+  const events: SpendEvent[] = [];
+  for (const record of records) {
+    const { fields, signed } = fieldsFor(record);
+    const rawDescription = String(record.payload[fields.description] ?? "");
+    const narrative = rowNarrative(record.payload, fields.description);
+    const amountCents = parseAmountCents(
+      fields.amount ? record.payload[fields.amount] : undefined,
+    );
+    if (!amountCents) continue;
+    const spendCents = signed ? -amountCents : Math.abs(amountCents);
+    let merchant = cleanMerchantName(narrative);
+    if (/^(pending|processing|process)$/i.test(rawDescription.trim())) {
+      merchant = "Pending";
+    }
+    const category =
+      record.category && !needsCategory(record.category) ? record.category : "other";
+    events.push({
+      date: normalizeDate(fields.date ? String(record.payload[fields.date] ?? "") : ""),
+      merchant,
+      spendCents,
+      category,
+    });
+  }
+  return events;
+}
+
 function omissionNote(omitted: OmittedRows): string {
   const lines: string[] = [];
   if (omitted.zeroCount) {
@@ -644,21 +678,42 @@ async function resolveIntent(
   return { intent: null, invalidDateRange: false, invalidCalendarDate: false };
 }
 
+function withMonths(
+  summary: {
+    loaded: boolean;
+    count: number;
+    startDate: string | null;
+    endDate: string | null;
+    uploadedAt: string | null;
+  },
+  records: LedgerRecord[],
+): ReportSummary {
+  return {
+    ...summary,
+    months: summary.loaded ? buildMonthlySpend(toSpendEvents(records)) : [],
+  };
+}
+
 async function reportFor(
   identity: AccessIdentity | undefined,
 ): Promise<ReportSummary> {
   if (!onWorkers()) {
     const count = memory.rows.length;
-    return {
-      loaded: count > 0,
-      count,
-      startDate: count > 0 ? memory.startDate : null,
-      endDate: count > 0 ? memory.endDate : null,
-      uploadedAt: count > 0 ? memory.uploadedAt : null,
-    };
+    return withMonths(
+      {
+        loaded: count > 0,
+        count,
+        startDate: count > 0 ? memory.startDate : null,
+        endDate: count > 0 ? memory.endDate : null,
+        uploadedAt: count > 0 ? memory.uploadedAt : null,
+      },
+      memory.rows,
+    );
   }
   if (!identity) throw new Error("Missing Access identity");
-  return (await ledgerStub(identity)).summary();
+  const stub = await ledgerStub(identity);
+  const [summary, loaded] = await Promise.all([stub.summary(), stub.load()]);
+  return withMonths(summary, loaded.records);
 }
 
 export function indexesInRange(indexes: unknown, length: number): number[] {
