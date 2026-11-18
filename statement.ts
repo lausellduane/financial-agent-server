@@ -1,5 +1,11 @@
 import csv from "csv-parser";
 import { Readable } from "node:stream";
+import {
+  isBareReturnPrefix,
+  isDebitCardReturn,
+  isNonSpendingNarrative,
+  isReturnNarrative,
+} from "./categories.js";
 
 export type DisplayFields = {
   date: string | undefined;
@@ -253,34 +259,38 @@ function pickMerchantField(rows: Record<string, string>[]): string {
   return best;
 }
 
+const DATE_HEADERS = [
+  "Date",
+  "Run Date",
+  "Transaction Date",
+  "Trans. Date",
+  "Trans Date",
+  "Posted Date",
+  "Post Date",
+  "Posting Date",
+];
+
+const AMOUNT_HEADERS = [
+  "Amount",
+  "Transaction Amount",
+  "Amt",
+  "Withdrawal",
+  "Withdrawal (-)",
+  "Withdrawal(-)",
+  "Debit",
+  "Debit Amount",
+  "Credit",
+  "Amount ($)",
+];
+
 export function pickDisplayFields(rows: Record<string, string>[]): DisplayFields {
   const keys = Object.keys(rows[0] ?? {});
   return {
     date:
-      findField(keys, [
-        "Date",
-        "Run Date",
-        "Transaction Date",
-        "Trans. Date",
-        "Trans Date",
-        "Posted Date",
-        "Post Date",
-        "Posting Date",
-      ]) ?? keys[0],
+      findField(keys, DATE_HEADERS) ?? keys[0],
     description: pickMerchantField(rows),
     amount:
-      findField(keys, [
-        "Amount",
-        "Transaction Amount",
-        "Amt",
-        "Withdrawal",
-        "Withdrawal (-)",
-        "Withdrawal(-)",
-        "Debit",
-        "Debit Amount",
-        "Credit",
-        "Amount ($)",
-      ]) ??
+      findField(keys, AMOUNT_HEADERS) ??
       keys.find((key) => /amount/i.test(key)) ??
       keys[2],
   };
@@ -332,10 +342,33 @@ const US_STATE_CODES = new Set([
   "WI", "WV", "WY",
 ]);
 
-export function cleanMerchantName(raw: string): string {
+export function cleanMerchantName(
+  raw: string,
+  amountCents = 0,
+  signedLedger = false,
+  purchaseMatch = false,
+): string {
   let text = String(raw ?? "").replace(/\s+/g, " ").trim();
   if (!text || isBlankMerchant(text)) return "Unknown merchant";
 
+  // Sign-aware RETURN handling runs before brand aliases. A refund drops its
+  // RETURN / DEBIT CARD RETURN prefix and then merges with the merchant. A
+  // line that only starts with RETURN (a fee, an income line, an unsigned
+  // RETURN with no matching purchase) keeps its full name and is never
+  // folded into a brand such as Costco or Target.
+  const refund = isReturnNarrative(text, amountCents, signedLedger, purchaseMatch);
+  if (refund) {
+    text = text.replace(/^(?:DEBIT\s+CARD\s+)?RETURN\s+/i, "");
+  }
+  const keepName = !refund && (isBareReturnPrefix(text) || isDebitCardReturn(text));
+  if (!keepName) {
+    const branded = brandAlias(text);
+    if (branded) return branded;
+  }
+  return genericMerchantName(text);
+}
+
+function brandAlias(text: string): string | null {
   const upper = text.toUpperCase();
   if (
     upper.includes("AMAZON WEB") ||
@@ -369,7 +402,11 @@ export function cleanMerchantName(raw: string): string {
   if (upper.includes("FOOD LION")) return "Food Lion";
   if (upper.includes("TARGET")) return "Target";
   if (upper.includes("PUBLIX")) return "Publix";
+  return null;
+}
 
+function genericMerchantName(input: string): string {
+  let text = input;
   text = text.replace(
     /^(DIRECT DEBIT|DEBIT CARD PURCHASE|ELECTRONIC WITHDRAWAL(?: REQUESTED BY YOU(?: TO)?)?|POS DEBIT|VISA DEBIT|PURCHASE AUTHORIZED ON \d{1,2}\/\d{1,2}|ACH (?:DEBIT|WITHDRAWAL)|CHECKCARD)\s+/i,
     "",
@@ -390,6 +427,48 @@ export function cleanMerchantName(raw: string): string {
   return cleaned || text || "Unknown merchant";
 }
 
+export type PurchaseRow = {
+  narrative: string;
+  amountCents: number;
+  signedLedger: boolean;
+};
+
+function merchantKey(name: string): string {
+  return name.toUpperCase().replace(/\s+/g, " ").trim();
+}
+
+// Cleaned merchant names of the ledger's purchases: charges that are not
+// returns, deposits, transfers or card payments. On a signed file only
+// money-out rows are purchases. An unsigned bare RETURN nets only against one
+// of these merchants.
+export function purchaseMerchants(rows: PurchaseRow[]): Set<string> {
+  const merchants = new Set<string>();
+  for (const row of rows) {
+    if (!row.amountCents) continue;
+    if (row.signedLedger && row.amountCents > 0) continue;
+    if (isBareReturnPrefix(row.narrative) || isDebitCardReturn(row.narrative)) continue;
+    if (isNonSpendingNarrative(row.narrative)) continue;
+    merchants.add(
+      merchantKey(cleanMerchantName(row.narrative, row.amountCents, row.signedLedger)),
+    );
+  }
+  return merchants;
+}
+
+// An unsigned "RETURN CHIPOTLE ..." whose merchant ("CHIPOTLE") matches a
+// purchase. Signed files decide by sign instead, so this is false for them.
+export function bareReturnMatchesPurchase(
+  narrative: string,
+  signedLedger: boolean,
+  purchases: Set<string>,
+): boolean {
+  if (signedLedger || !isBareReturnPrefix(narrative)) return false;
+  if (isNonSpendingNarrative(narrative)) return false;
+  const rest = narrative.replace(/^\s*RETURN\s+/i, "");
+  if (!rest.trim()) return false;
+  return purchases.has(merchantKey(cleanMerchantName(rest, 0, false)));
+}
+
 export function parseCsv(rawCsv: string): Promise<Record<string, string>[]> {
   const skipLines = countCsvSkipLines(rawCsv);
   const results: Record<string, string>[] = [];
@@ -405,4 +484,211 @@ export function parseCsv(rawCsv: string): Promise<Record<string, string>[]> {
       .on("end", () => resolve(results))
       .on("error", reject);
   });
+}
+
+export type ShapeFields = { fields: DisplayFields; signed: boolean };
+
+// The columns and sign convention one upload was read with. It is saved with
+// the upload, so a later file from another bank (even with the same header
+// row) cannot change how these rows read.
+export type UploadLayout = ShapeFields;
+
+export function uploadLayout(rows: Record<string, string>[]): UploadLayout {
+  const fields = pickDisplayFields(rows);
+  return { fields, signed: usesSignedCents(rows, fields.amount) };
+}
+
+export function parseLayout(raw: string | null | undefined): UploadLayout | null {
+  if (!raw) return null;
+  try {
+    const value = JSON.parse(raw) as Partial<UploadLayout> | null;
+    const fields = value?.fields;
+    if (!fields || typeof fields.description !== "string") return null;
+    return {
+      fields: {
+        date: typeof fields.date === "string" ? fields.date : undefined,
+        description: fields.description,
+        amount: typeof fields.amount === "string" ? fields.amount : undefined,
+      },
+      signed: value.signed === true,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function headerShape(row: Record<string, string>): string {
+  return Object.keys(row).join("\u001f");
+}
+
+// Only for rows saved before layouts were stored with each upload. Those came
+// from one replace-only upload, so a header row stands in for the file.
+export function shapeFields(
+  rows: Record<string, string>[],
+): (row: Record<string, string>) => ShapeFields {
+  const groups = new Map<string, Record<string, string>[]>();
+  for (const row of rows) {
+    const shape = headerShape(row);
+    const group = groups.get(shape);
+    if (group) group.push(row);
+    else groups.set(shape, [row]);
+  }
+  const resolved = new Map<string, ShapeFields>();
+  for (const [shape, group] of groups) resolved.set(shape, uploadLayout(group));
+  return (row) => {
+    const shape = headerShape(row);
+    const found = resolved.get(shape);
+    if (found) return found;
+    const fallback = uploadLayout([row]);
+    resolved.set(shape, fallback);
+    return fallback;
+  };
+}
+
+const MONEY_COLUMN = /amount|amt|debit|credit|withdrawal|deposit/i;
+const NOT_TEXT_COLUMN =
+  /date|amount|amt|debit|credit|withdrawal|deposit|balance|qty|quantity|price|commission|fees?|account|symbol|type|status|settlement|check ?(number|no)|category/i;
+
+// Header names, in order, for the text part of the duplicate key. Picked from
+// the header row only, never from row contents, so a partial re-export or an
+// extra Memo column in a later export keys the same charge the same way.
+const KEY_TEXT_HEADERS = [
+  "Action",
+  "Description",
+  "Transaction Description",
+  "Original Description",
+  "Merchant",
+  "Merchant Name",
+  "Payee",
+  "Name",
+  "Details",
+  "Transaction",
+  "Memo",
+];
+
+export type KeyFields = {
+  date: string | undefined;
+  text: string | undefined;
+  amount: string | undefined;
+};
+
+export function keyFields(keys: string[]): KeyFields {
+  const display = pickHeaderFields(keys);
+  const exact = new Map(keys.map((key) => [key.toLowerCase(), key]));
+  let text: string | undefined;
+  for (const name of KEY_TEXT_HEADERS) {
+    text = exact.get(name.toLowerCase());
+    if (text) break;
+  }
+  text ??= keys.find(
+    (key) =>
+      /desc|action|payee|merchant|name|details|transaction|memo/i.test(key) &&
+      !NOT_TEXT_COLUMN.test(key),
+  );
+  text ??= keys.find(
+    (key) => key !== display.date && key !== display.amount && !NOT_TEXT_COLUMN.test(key),
+  );
+  return { date: display.date, text, amount: display.amount };
+}
+
+// Date and amount columns are already chosen from header names alone.
+function pickHeaderFields(keys: string[]): { date: string | undefined; amount: string | undefined } {
+  return {
+    date: findField(keys, DATE_HEADERS) ?? keys[0],
+    amount: findField(keys, AMOUNT_HEADERS) ?? keys.find((key) => /amount/i.test(key)) ?? keys[2],
+  };
+}
+
+// One charge's identity: calendar date, the header-picked text column, and
+// cents. Parsed values are compared, so "1,541.42" and "1541.42", or 3/1/2026
+// and 2026-03-01, match. Two identical charges in one file share this key;
+// the ledger keeps as many of them as the fullest upload had (see append).
+export function dedupeKey(row: Record<string, string>, fields: KeyFields): string {
+  const rawDate = fields.date ? String(row[fields.date] ?? "") : "";
+  const date = normalizeDate(rawDate) || rawDate.trim().toUpperCase();
+  const text = (fields.text ? String(row[fields.text] ?? "") : "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toUpperCase();
+  const amount = parseAmountCents(fields.amount ? row[fields.amount] : undefined);
+  // Split debit/credit exports leave the picked column blank on the other
+  // side. Only nonzero values count, so an added empty column changes nothing.
+  const otherMoney = Object.keys(row)
+    .filter((key) => key !== fields.amount && MONEY_COLUMN.test(key) && !/balance/i.test(key))
+    .map((key) => parseAmountCents(row[key]))
+    .filter((cents) => cents !== 0)
+    .sort((a, b) => a - b);
+  return JSON.stringify([date, text, amount, ...otherMoney]);
+}
+
+// Each row's key depends only on that row's own headers and values.
+export function dedupeKeys(rows: Record<string, string>[]): string[] {
+  const byShape = new Map<string, KeyFields>();
+  return rows.map((row) => {
+    const shape = headerShape(row);
+    let fields = byShape.get(shape);
+    if (!fields) {
+      fields = keyFields(Object.keys(row));
+      byShape.set(shape, fields);
+    }
+    return dedupeKey(row, fields);
+  });
+}
+
+// Each row's copy number of its key within the file: the first row with a
+// key is copy 1, the next row with the same key is copy 2, and so on.
+export function copyNumbers(keys: string[]): number[] {
+  const seen = new Map<string, number>();
+  return keys.map((key) => {
+    const copy = (seen.get(key) ?? 0) + 1;
+    seen.set(key, copy);
+    return copy;
+  });
+}
+
+// Which entries (by index) are new. Copy n of a key is new only when the
+// ledger holds fewer than n rows with that key. Callers that send only part
+// of a file pass each row's copy number from the whole file, so the second
+// fare in a file still counts as copy 2 when the first was already stored.
+// An entry without a valid copy number is numbered by its place in this list.
+// A copy number already used earlier in this list is not stored twice.
+export function freshByCopy(
+  entries: { key: string; copy?: number | undefined }[],
+  storedCount: (key: string) => number,
+): number[] {
+  const fallback = copyNumbers(entries.map((entry) => entry.key));
+  const stored = new Map<string, number>();
+  const used = new Map<string, Set<number>>();
+  const fresh: number[] = [];
+  entries.forEach((entry, index) => {
+    const given = entry.copy;
+    const copy =
+      typeof given === "number" && Number.isInteger(given) && given >= 1
+        ? given
+        : (fallback[index] ?? 1);
+    let taken = used.get(entry.key);
+    if (!taken) {
+      taken = new Set();
+      used.set(entry.key, taken);
+    }
+    if (taken.has(copy)) return;
+    taken.add(copy);
+    let have = stored.get(entry.key);
+    if (have === undefined) {
+      have = storedCount(entry.key);
+      stored.set(entry.key, have);
+    }
+    if (copy > have) fresh.push(index);
+  });
+  return fresh;
+}
+
+// Which rows of a whole file are new (see freshByCopy). Two real $2.75 fares
+// on one day both store; uploading that file again adds nothing; a shorter
+// export with one copy adds nothing and deletes nothing.
+export function freshByOccurrence(
+  keys: string[],
+  storedCount: (key: string) => number,
+): number[] {
+  return freshByCopy(keys.map((key) => ({ key })), storedCount);
 }

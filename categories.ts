@@ -24,7 +24,7 @@ export const CATEGORIES = [
 export type Category = (typeof CATEGORIES)[number];
 
 // Bump this when merchant rules change so a stored ledger is rechecked once.
-export const CATEGORY_RULES_VERSION = "13";
+export const CATEGORY_RULES_VERSION = "14";
 
 export function isCategory(value: string): value is Category {
   return (CATEGORIES as readonly string[]).includes(value);
@@ -595,6 +595,7 @@ function isCollegeSavings(text: string): boolean {
   );
 }
 
+/** Unambiguous debit-card return phrase, on any sign or ledger type. */
 export function isDebitCardReturn(text: string): boolean {
   return /\bDEBIT\s+CARD\s+RETURN\b/.test(text.toUpperCase());
 }
@@ -610,8 +611,9 @@ function isNonIncomeMovement(text: string): boolean {
   if (isStudentLoan(text) || isCollegeSavings(text) || isFeeRebate(text)) {
     return true;
   }
-  const rule = RULES.find((entry) => entry.category === "transfers");
-  return rule ? matchesRule(text, rule) : false;
+  return RULES.some(
+    (rule) => rule.category === "transfers" && matchesRule(text, rule),
+  );
 }
 
 function hasIncomeKeyword(text: string): boolean {
@@ -647,12 +649,52 @@ function isIncomeCredit(
   return true;
 }
 
+/** Description starts with "RETURN " but not RETURNED or RETURNS. */
+export function isBareReturnPrefix(text: string): boolean {
+  return /^RETURN\s/.test(text.toUpperCase().trim());
+}
+
+// Income, credit-card payment, bank or credit-union, and transfer lines. These
+// rules run before any return netting, so "RETURN DIRECT DEPOSIT ACME PAYROLL"
+// or "DEBIT CARD RETURN PAYROLL CARD" is never a spending refund, whatever
+// category the model later gives it.
+export function isNonSpendingNarrative(narrative: string): boolean {
+  const text = narrative.toUpperCase();
+  if (hasIncomeKeyword(text)) return true;
+  // 529 contributions, student-loan payments, fee rebates, and transfer
+  // lines are categorized as transfers, so they are never refunds either.
+  if (isNonIncomeMovement(text)) return true;
+  if (isMortgagePayment(text)) return false;
+  if (isCreditCardPayment(text)) return true;
+  return isFinancialInstitution(text);
+}
+
+// Whether a row is a refund that nets against spending.
+// - Income, transfer, credit-card and bank lines never are.
+// - DEBIT CARD RETURN always is, on any sign or ledger type.
+// - A bare "RETURN " on a signed file is a refund only when it is money-in.
+// - A bare "RETURN " on an unsigned file is a refund only when its merchant
+//   matches a purchase in the ledger (purchaseMatch). Otherwise it may be a
+//   fee or a merchant name ("RETURN ITEM FEE", "RETURN OF THE MAC CAFE").
+export function isReturnNarrative(
+  narrative: string,
+  amountCents: number,
+  signedLedger: boolean,
+  purchaseMatch = false,
+): boolean {
+  if (isNonSpendingNarrative(narrative)) return false;
+  if (isDebitCardReturn(narrative)) return true;
+  if (!isBareReturnPrefix(narrative)) return false;
+  return signedLedger ? amountCents > 0 : purchaseMatch;
+}
+
 // Deterministic category, or "unknown" when only the model should decide.
 // A refund keeps the merchant's spending category so it can reduce that
 // total, including a "DEBIT CARD RETURN" that names a known merchant.
-// Transfers, 529 contributions, student-loan payments, unrecognized
-// debit-card returns, and fee rebates stay transfers on either sign and
-// are never income. An unmatched credit is not income.
+// Transfers, 529 contributions, student-loan payments, and fee rebates stay
+// transfers on either sign and are never income. A debit-card return with no
+// merchant rule is left to the model (Other) so it still nets against spend.
+// An unmatched credit is not income.
 export function categorizeNarrative(
   narrative: string,
   amountCents: number,
@@ -662,9 +704,10 @@ export function categorizeNarrative(
   // Run before income keywords so "DIRECT DEPOSIT PAYPAL TRANSFER" is a
   // transfer, not a paycheck.
   if (isNonIncomeMovement(text)) return "transfers";
-  if (isIncomeCredit(text, amountCents, signedLedger) && !isDebitCardReturn(text)) {
-    return "income";
-  }
+  // Income, credit-card and bank rules run before return netting, so a
+  // "RETURN DIRECT DEPOSIT ... PAYROLL" or "DEBIT CARD RETURN PAYROLL CARD"
+  // line is income, not a spending refund.
+  if (isIncomeCredit(text, amountCents, signedLedger)) return "income";
   // A mortgage payment to a bank is still a mortgage. The institution check
   // would otherwise call every outflow a transfer.
   if (isMortgagePayment(text)) return "housing/mortgage";
@@ -686,8 +729,9 @@ export function categorizeNarrative(
   if (isHealthInsurance(text)) return "insurance/health";
   const ruled = RULES.find((rule) => matchesRule(text, rule))?.category;
   if (ruled) return ruled;
-  // No merchant rule matched. A debit-card return is still not income.
-  if (isDebitCardReturn(text)) return "transfers";
+  // No merchant rule matched. An unmatched credit is not income, and a
+  // refund (DEBIT CARD RETURN, or a signed money-in bare RETURN) falls through
+  // to Other/unknown so it can net against spend.
   if (!text.trim()) return "other";
   return "unknown";
 }
@@ -711,7 +755,7 @@ utilities/telecom = power, county or municipal water and sewer, natural gas, pho
 healthcare = doctors, dental, OBGYN, clinics, and pharmacies such as Walgreens, CVS, and Rite Aid. Not an insurance premium.
 insurance/health = health-insurance premiums such as Blue Cross, BCBS, Aetna, or Cigna. Not a doctor and not a pharmacy.
 insurance/auto = car insurance such as GEICO, Progressive, PROG PREMIER INS, State Farm, Allstate, Nationwide, Erie, or USAA. Not a store, not a doctor, and not a credit-card autopay.
-transfers = PayPal, Zelle, Venmo, wires, account-to-account transfers, 529 contributions, student-loan payments, fee rebates, and debit-card returns that do not name a known merchant. A debit-card return at a known merchant keeps that merchant's spending category.
+transfers = PayPal, Zelle, Venmo, wires, account-to-account transfers, 529 contributions, student-loan payments, and fee rebates. A debit-card return or refund is not a transfer: it keeps that merchant's spending category, or other when the merchant is unknown.
 credit-cards = payments to a credit-card issuer such as Chase, Amex, Synchrony, or Capital One, including CAUTOPAY, AUTOPAY, EPAYMENT, and BANKPAYMENT. Not a card purchase at a store and not car insurance.
 income = paychecks, payroll direct deposits, dividends, and interest earned. Not a generic DIRECT DEPOSIT, a PayPal transfer, a 529 contribution, a student-loan payment, a refund, or a fee rebate.
 cloud/software = Amazon Web Services and other cloud hosts. Not Amazon retail.

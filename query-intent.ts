@@ -1,7 +1,6 @@
 import {
   CATEGORIES,
   isCategory,
-  isDebitCardReturn,
   tokenIn,
   type Category,
 } from "./categories.js";
@@ -41,6 +40,8 @@ export type Interpreted = {
   unrecognized: boolean;
   invalidDateRange: boolean;
   invalidCalendarDate: boolean;
+  // The question says "since" but code could not place the date.
+  unplacedSince?: boolean;
 };
 
 const OPS = new Set<QueryOp>(["sum", "list", "max", "count"]);
@@ -71,6 +72,7 @@ const STOP_WORDS = new Set([
   "of", "to", "in", "on", "it", "at", "or", "just", "only", "also", "them",
   "those", "these", "is", "isn", "wasn", "aren", "don", "exclude", "except",
   "without", "remove", "include", "located", "matching", "your", "i",
+  "since",
 ]);
 
 const MERCHANT_TOKEN_SKIP = new Set([
@@ -262,24 +264,6 @@ function asksForCreditCards(topic: string): boolean {
 
 function isNonSpendingCategory(category: Category): boolean {
   return category === "income" || category === "transfers" || category === "credit-cards";
-}
-
-// A debit-card return at a known merchant is money-in, even on an unsigned
-// file or when the statement recorded the return as a negative.
-export function spendCentsFor(
-  narrative: string,
-  amountCents: number,
-  signedLedger: boolean,
-  category: Category | "unknown",
-): number {
-  if (
-    isDebitCardReturn(narrative) &&
-    category !== "unknown" &&
-    !isNonSpendingCategory(category)
-  ) {
-    return -Math.abs(amountCents);
-  }
-  return signedLedger ? -amountCents : Math.abs(amountCents);
 }
 
 export function applyQuestionGuards(
@@ -524,7 +508,39 @@ function monthRange(question: string): { from: string; to: string } | null {
   };
 }
 
-function dateRange(question: string): {
+// "since March", "since March 15", "since March 2026", "since March 15, 2026",
+// or "since 2026-03-01" is open-ended. A month (and day) without a year is the
+// latest such date on or before the ledger's last date. Without a ledger date,
+// or with a day that is not on the calendar, it is left to the model.
+function sinceDate(question: string, latestDate: string | null): string | null {
+  const iso = question.match(/\bsince\s+(\d{4}-\d{2}-\d{2})\b/i);
+  if (iso?.[1]) return iso[1];
+  const named = question.match(
+    new RegExp(
+      `\\bsince\\s+(${MONTHS.join("|")})(?:\\s+(\\d{1,2})(?:st|nd|rd|th)?)?(?:,?\\s+(20\\d{2}))?\\b`,
+      "i",
+    ),
+  );
+  if (!named?.[1]) return null;
+  const month = MONTHS.indexOf(named[1].toLowerCase()) + 1;
+  if (!month) return null;
+  const day = named[2] ? Number(named[2]) : 1;
+  const mmdd = `${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+  let year: number;
+  if (named[3]) {
+    year = Number(named[3]);
+  } else {
+    const latest = latestDate?.match(/^(\d{4})-\d{2}-\d{2}$/);
+    if (!latest?.[1] || !latestDate) return null;
+    year = Number(latest[1]);
+    if (`${year}-${mmdd}` > latestDate) year -= 1;
+  }
+  if (!Number.isInteger(year)) return null;
+  const value = `${year}-${mmdd}`;
+  return isIsoDate(value) ? value : null;
+}
+
+function dateRange(question: string, latestDate: string | null = null): {
   from: string | null;
   to: string | null;
   invalid: boolean;
@@ -539,6 +555,8 @@ function dateRange(question: string): {
   if (tokens.some((token) => !isIsoDate(token))) {
     return { from: null, to: null, invalid: true, calendar: true };
   }
+  const since = tokens.length <= 1 ? sinceDate(question, latestDate) : null;
+  if (since) return { from: since, to: null, invalid: false, calendar: false };
   if (tokens.length >= 2) {
     const from = tokens[0] ?? null;
     const to = tokens[tokens.length - 1] ?? null;
@@ -577,7 +595,13 @@ function unrecognizedTopic(question: string, consumedTokens: string[]): boolean 
   for (const entry of CATEGORY_PATTERNS) text = stripPattern(text, entry.pattern);
   text = stripPattern(text, /\b(gas|gasoline|fuel|coffee|starbucks|dunkin|paypal|aws|netflix)\b/i);
   text = stripPattern(text, /\b20\d{2}-\d{2}-\d{2}\b/);
-  text = stripPattern(text, new RegExp(`\\b(${MONTHS.join("|")})\\b`, "i"));
+  text = stripPattern(
+    text,
+    new RegExp(
+      `\\b(${MONTHS.join("|")})(\\s+\\d{1,2}(st|nd|rd|th)?)?(,?\\s+20\\d{2})?\\b`,
+      "i",
+    ),
+  );
   text = text.replace(/\$[\d,.]+/g, " ");
   for (const token of consumedTokens) text = stripPattern(text, new RegExp(`\\b${escapeReg(token)}\\b`, "i"));
   const words = text.split(/[^a-z0-9]+/).filter((word) => word.length > 2);
@@ -601,11 +625,12 @@ export function interpretQuestion(
   question: string,
   previous: QueryIntent | null,
   knownMerchants: string[],
+  latestDate: string | null = null,
 ): Interpreted | null {
   const asked = question.trim();
   if (!asked) return null;
 
-  const dates = dateRange(asked);
+  const dates = dateRange(asked, latestDate);
   if (dates.invalid) {
     return {
       intent: blankIntent("sum"),
@@ -684,7 +709,9 @@ export function interpretQuestion(
     asked,
     true,
   );
-  const unrecognized = unrecognizedTopic(asked, merchants);
+  // "since" with no date we could place must not quietly mean the whole ledger.
+  const unplacedSince = /\bsince\b/i.test(asked) && !dates.from;
+  const unrecognized = unplacedSince || unrecognizedTopic(asked, merchants);
   const confident = !unrecognized && (!!op || hasFilter);
   return {
     intent,
@@ -693,6 +720,7 @@ export function interpretQuestion(
     unrecognized,
     invalidDateRange: false,
     invalidCalendarDate: false,
+    unplacedSince,
   };
 }
 

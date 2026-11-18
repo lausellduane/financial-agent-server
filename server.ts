@@ -28,23 +28,33 @@ import {
   intentFromModel,
   interpretQuestion,
   selectTransactions,
-  spendCentsFor,
   validateIntent,
   type QueryIntent,
   type TxView,
 } from "./query-intent.js";
+import { buildMonthlySpend, type MonthSpend, type SpendEvent } from "./monthly-spend.js";
+import { spendCentsFor } from "./spend-cents.js";
 import {
+  bareReturnMatchesPurchase,
   cleanMerchantName,
+  purchaseMerchants,
   columnStats,
+  dedupeKeys,
   formatSignedCents,
+  copyNumbers,
+  freshByCopy,
+  freshByOccurrence,
   normalizeDate,
   parseAmountCents,
   parseCsv,
   pickDisplayFields,
   rowNarrative,
+  shapeFields,
   statementDateRange,
   uniqueMerchants,
-  usesSignedCents,
+  uploadLayout,
+  type ShapeFields,
+  type UploadLayout,
 } from "./statement.js";
 
 export { parseCsv } from "./statement.js";
@@ -55,6 +65,7 @@ export type ReportSummary = {
   startDate: string | null;
   endDate: string | null;
   uploadedAt: string | null;
+  months: MonthSpend[];
 };
 
 type DateRange = { startDate: string | null; endDate: string | null };
@@ -63,10 +74,14 @@ type LedgerRecord = {
   id: number;
   payload: Record<string, string>;
   category: string | null;
+  // Columns and sign saved with the row's upload. Null only for a legacy row.
+  layout: UploadLayout | null;
 };
 
+type MemoryRecord = LedgerRecord & { key: string };
+
 type MemoryLedger = {
-  rows: LedgerRecord[];
+  rows: MemoryRecord[];
   intent: string | null;
   version: number;
   uploadedAt: string | null;
@@ -76,18 +91,28 @@ type MemoryLedger = {
   rulesVersion: string | null;
 };
 
-// Node dev keeps one statement for the whole process. It is not split by
-// identity. Workers keep one Durable Object per Access identity.
-let memory: MemoryLedger = {
-  rows: [],
-  intent: null,
-  version: 0,
-  uploadedAt: null,
-  startDate: null,
-  endDate: null,
-  nextId: 1,
-  rulesVersion: null,
-};
+// Node dev keeps one ledger for the whole process. It is not split by
+// identity. Workers keep one Durable Object per Access identity. Both append
+// uploads and skip rows the ledger already holds (see freshByOccurrence).
+function emptyMemory(): MemoryLedger {
+  return {
+    rows: [],
+    intent: null,
+    version: 0,
+    uploadedAt: null,
+    startDate: null,
+    endDate: null,
+    nextId: 1,
+    rulesVersion: null,
+  };
+}
+
+let memory: MemoryLedger = emptyMemory();
+
+// Node tests share one process. Each test starts from an empty ledger.
+export function resetMemoryLedgerForTests(): void {
+  memory = emptyMemory();
+}
 
 const moduleUrl = import.meta.url;
 const __filename =
@@ -142,37 +167,48 @@ function needsCategory(category: string | null): boolean {
   return category === null || category === "unknown";
 }
 
-type RuleContext = {
-  fields: ReturnType<typeof pickDisplayFields>;
-  signed: boolean;
-};
+type RuleContext = (record: LedgerRecord) => ShapeFields;
 
+// Columns and sign come from the layout saved with each upload, so two banks'
+// exports can share one ledger, even with the same header row, and a later
+// upload never changes how earlier rows read. Only a row with no saved layout
+// falls back to its header row among the other such rows.
 function ruleContext(records: LedgerRecord[]): RuleContext {
-  const payloads = records.map((record) => record.payload);
-  const fields = pickDisplayFields(payloads);
-  return { fields, signed: usesSignedCents(payloads, fields.amount) };
+  let legacy: ((payload: Record<string, string>) => ShapeFields) | null = null;
+  return (record) => {
+    if (record.layout) return record.layout;
+    legacy ??= shapeFields(
+      records.filter((item) => !item.layout).map((item) => item.payload),
+    );
+    return legacy(record.payload);
+  };
 }
 
 function ruledCategory(record: LedgerRecord, context: RuleContext): ReturnType<typeof categorizeNarrative> {
-  const narrative = rowNarrative(record.payload, context.fields.description);
+  const { fields, signed } = context(record);
+  const narrative = rowNarrative(record.payload, fields.description);
   const cents = parseAmountCents(
-    context.fields.amount ? record.payload[context.fields.amount] : undefined,
+    fields.amount ? record.payload[fields.amount] : undefined,
   );
-  return categorizeNarrative(narrative, cents, context.signed);
+  return categorizeNarrative(narrative, cents, signed);
 }
 
 // A merchant rule replaces a stored category that disagrees with it, including
 // one the model previously saved. "other" with no matching rule stays put.
-// Stale rows stored as income are re-resolved when the new rules no longer
-// call them income, including when the result is unknown (then the model).
-// The sign and columns come from the whole ledger, not from this subset.
+// The sign and columns come from each row's saved upload layout.
+// After a rules bump, a row stored as income is resolved again whenever the
+// new rules no longer call it income, including when the result is unknown
+// (then the model decides). That covers old prefix and catch-all credits
+// (a generic DIRECT DEPOSIT, an unmatched money-in) and refund rows that an
+// older rule version stored as income (a signed money-in RETURN or DEBIT
+// CARD RETURN with no merchant rule), so old ledgers pick up return netting.
 function recordsToResolve(records: LedgerRecord[], context: RuleContext, stale: boolean): LedgerRecord[] {
   return records.filter((record) => {
     if (!stale) return needsCategory(record.category);
     const ruled = ruledCategory(record, context);
     if (ruled !== "unknown") return ruled !== record.category;
-    // Old prefix and catch-all credits were stored as income. Send them
-    // through the normal unknown/AI path used for other rechecks.
+    // Stored income that the rules no longer call income, refunds included,
+    // goes through the normal unknown/AI path used for other rechecks.
     if (record.category === "income") return true;
     return needsCategory(record.category);
   });
@@ -204,7 +240,7 @@ async function resolveCategories(
   if (!records.length) return [];
   const draft = records.map((record) => ({
     record,
-    narrative: rowNarrative(record.payload, context.fields.description),
+    narrative: rowNarrative(record.payload, context(record).fields.description),
     ruled: ruledCategory(record, context),
   }));
   const pending = [
@@ -238,30 +274,111 @@ async function readLedger(
   return (await ledgerStub(identity)).load();
 }
 
-async function writeLedger(
-  rows: { payload: Record<string, string>; category: string }[],
+type AppendOutcome =
+  | { ok: true; added: number; duplicates: number; total: number; version: number }
+  | { ok: false; total: number };
+
+function mergeEarlier(a: string | null, b: string | null): string | null {
+  if (!a) return b;
+  if (!b) return a;
+  return a < b ? a : b;
+}
+
+function mergeLater(a: string | null, b: string | null): string | null {
+  if (!a) return b;
+  if (!b) return a;
+  return a > b ? a : b;
+}
+
+// File rows (by index) the ledger does not hold yet, and the stored count, so
+// the upload only categorizes rows it will keep and checks the row limit
+// before any model call.
+async function planUpload(
+  keys: string[],
+  identity: AccessIdentity | undefined,
+): Promise<{ fresh: number[]; stored: number }> {
+  if (!onWorkers()) {
+    const counts = memoryKeyCounts();
+    return {
+      fresh: freshByOccurrence(keys, (key) => counts.get(key) ?? 0),
+      stored: memory.rows.length,
+    };
+  }
+  if (!identity) throw new Error("Missing Access identity");
+  return (await ledgerStub(identity)).plan(keys);
+}
+
+function memoryKeyCounts(): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const row of memory.rows) counts.set(row.key, (counts.get(row.key) ?? 0) + 1);
+  return counts;
+}
+
+// Adds the file's new rows to the ledger. The Durable Object repeats the
+// duplicate and row-limit checks in its own transaction, so two uploads
+// racing cannot store a row twice or pass the limit. An upload that adds no
+// rows leaves the version and the saved question alone.
+async function appendLedger(
+  rows: { payload: Record<string, string>; category: string; key: string; copy: number }[],
   identity: AccessIdentity | undefined,
   range: DateRange,
-): Promise<number> {
-  const uploadedAt = rows.length ? new Date().toISOString() : null;
+  layout: UploadLayout,
+): Promise<AppendOutcome> {
   if (!onWorkers()) {
+    const counts = memoryKeyCounts();
+    const fresh = freshByCopy(
+      rows.map((row) => ({ key: row.key, copy: row.copy })),
+      (key) => counts.get(key) ?? 0,
+    ).map((index) => rows[index] as (typeof rows)[number]);
+    const before = memory.rows.length;
+    const total = before + fresh.length;
+    if (total > MAX_LEDGER_ROWS) return { ok: false, total };
+    if (!fresh.length) {
+      return { ok: true, added: 0, duplicates: rows.length, total, version: memory.version };
+    }
+    const hadRows = before > 0;
     memory.version += 1;
     memory.intent = null;
-    memory.uploadedAt = uploadedAt;
-    memory.startDate = rows.length ? range.startDate : null;
-    memory.endDate = rows.length ? range.endDate : null;
-    memory.rows = rows.map((row) => ({
-      id: memory.nextId++,
-      payload: row.payload,
-      category: row.category,
-    }));
-    memory.rulesVersion = CATEGORY_RULES_VERSION;
-    return memory.version;
+    memory.uploadedAt = new Date().toISOString();
+    memory.startDate = hadRows ? mergeEarlier(memory.startDate, range.startDate) : range.startDate;
+    memory.endDate = hadRows ? mergeLater(memory.endDate, range.endDate) : range.endDate;
+    memory.rows = [
+      ...memory.rows,
+      ...fresh.map((row) => ({
+        id: memory.nextId++,
+        payload: row.payload,
+        category: row.category,
+        key: row.key,
+        layout,
+      })),
+    ];
+    if (!hadRows) memory.rulesVersion = CATEGORY_RULES_VERSION;
+    return {
+      ok: true,
+      added: fresh.length,
+      duplicates: rows.length - fresh.length,
+      total,
+      version: memory.version,
+    };
   }
   if (!identity) throw new Error("Missing Access identity");
   const stub = await ledgerStub(identity);
-  const saved = await stub.replace(rows, range, CATEGORY_RULES_VERSION);
-  return saved.version;
+  return stub.append(rows, range, CATEGORY_RULES_VERSION, MAX_LEDGER_ROWS, layout);
+}
+
+// Removes every stored row for this identity and bumps the version, so work
+// in flight gets 409 and the saved question is gone.
+async function clearLedger(
+  identity: AccessIdentity | undefined,
+): Promise<{ removed: number }> {
+  if (!onWorkers()) {
+    const removed = memory.rows.length;
+    memory = { ...emptyMemory(), version: memory.version + 1, nextId: memory.nextId };
+    return { removed };
+  }
+  if (!identity) throw new Error("Missing Access identity");
+  const cleared = await (await ledgerStub(identity)).clear();
+  return { removed: cleared.removed };
 }
 
 async function updateCategories(
@@ -375,6 +492,24 @@ async function hydrate(
   };
 }
 
+// Purchase merchants across the whole ledger, so an unsigned bare RETURN can
+// net against a purchase uploaded in the same or an earlier file. Report and
+// query both use this, so they agree.
+function ledgerPurchases(records: LedgerRecord[], fieldsFor: RuleContext): Set<string> {
+  return purchaseMerchants(
+    records.map((record) => {
+      const { fields, signed } = fieldsFor(record);
+      return {
+        narrative: rowNarrative(record.payload, fields.description),
+        amountCents: parseAmountCents(
+          fields.amount ? record.payload[fields.amount] : undefined,
+        ),
+        signedLedger: signed,
+      };
+    }),
+  );
+}
+
 type OmittedRows = {
   zeroCount: number;
   unknownCount: number;
@@ -384,15 +519,27 @@ type OmittedRows = {
 function toViews(records: LedgerRecord[]): { views: TxView[]; omitted: OmittedRows } {
   const omitted: OmittedRows = { zeroCount: 0, unknownCount: 0, unknownCents: 0 };
   if (!records.length) return { views: [], omitted };
-  const payloads = records.map((record) => record.payload);
-  const fields = pickDisplayFields(payloads);
-  const signed = usesSignedCents(payloads, fields.amount);
+  const fieldsFor = ruleContext(records);
+  const purchases = ledgerPurchases(records, fieldsFor);
   const views: TxView[] = [];
   for (const record of records) {
+    const { fields, signed } = fieldsFor(record);
     const rawDescription = String(record.payload[fields.description] ?? "");
     const narrative = rowNarrative(record.payload, fields.description);
     const amountCents = parseAmountCents(
       fields.amount ? record.payload[fields.amount] : undefined,
+    );
+    const spendCategory: Category | "unknown" =
+      record.category && !needsCategory(record.category)
+        ? (record.category as Category)
+        : "unknown";
+    const purchaseMatch = bareReturnMatchesPurchase(narrative, signed, purchases);
+    const spendCents = spendCentsFor(
+      narrative,
+      amountCents,
+      signed,
+      spendCategory,
+      purchaseMatch,
     );
     if (needsCategory(record.category)) {
       if (amountCents !== 0) {
@@ -407,13 +554,7 @@ function toViews(records: LedgerRecord[]): { views: TxView[]; omitted: OmittedRo
       omitted.zeroCount += 1;
       continue;
     }
-    const spendCents = spendCentsFor(
-      narrative,
-      amountCents,
-      signed,
-      record.category as Category,
-    );
-    let merchant = cleanMerchantName(narrative);
+    let merchant = cleanMerchantName(narrative, amountCents, signed, purchaseMatch);
     // Only a placeholder description is renamed. "CHIPOTLE PENDING" keeps Chipotle.
     if (/^(pending|processing|process)$/i.test(rawDescription.trim())) {
       merchant = "Pending";
@@ -433,6 +574,48 @@ function toViews(records: LedgerRecord[]): { views: TxView[]; omitted: OmittedRo
     console.log("Rows left out of the total:", omitted);
   }
   return { views, omitted };
+}
+
+// Chart and quick-question totals. Uncategorized charges are kept as "other"
+// so they can appear in the Other bar. Income, transfers, and credit-cards
+// stay in the event list and are dropped later by buildMonthlySpend.
+function toSpendEvents(records: LedgerRecord[]): SpendEvent[] {
+  if (!records.length) return [];
+  const fieldsFor = ruleContext(records);
+  const purchases = ledgerPurchases(records, fieldsFor);
+  const events: SpendEvent[] = [];
+  for (const record of records) {
+    const { fields, signed } = fieldsFor(record);
+    const rawDescription = String(record.payload[fields.description] ?? "");
+    const narrative = rowNarrative(record.payload, fields.description);
+    const amountCents = parseAmountCents(
+      fields.amount ? record.payload[fields.amount] : undefined,
+    );
+    if (!amountCents) continue;
+    const spendCategory: Category | "unknown" =
+      record.category && !needsCategory(record.category)
+        ? (record.category as Category)
+        : "unknown";
+    const purchaseMatch = bareReturnMatchesPurchase(narrative, signed, purchases);
+    const spendCents = spendCentsFor(
+      narrative,
+      amountCents,
+      signed,
+      spendCategory,
+      purchaseMatch,
+    );
+    let merchant = cleanMerchantName(narrative, amountCents, signed, purchaseMatch);
+    if (/^(pending|processing|process)$/i.test(rawDescription.trim())) {
+      merchant = "Pending";
+    }
+    events.push({
+      date: normalizeDate(fields.date ? String(record.payload[fields.date] ?? "") : ""),
+      merchant,
+      spendCents,
+      category: spendCategory === "unknown" ? "other" : spendCategory,
+    });
+  }
+  return events;
 }
 
 function omissionNote(omitted: OmittedRows): string {
@@ -477,14 +660,17 @@ type IntentResolution = {
   intent: QueryIntent | null;
   invalidDateRange: boolean;
   invalidCalendarDate: boolean;
+  // "since ..." that neither code nor the model could place on a calendar.
+  unplacedDate?: boolean;
 };
 
 async function resolveIntent(
   question: string,
   previous: QueryIntent | null,
   known: string[],
+  latestDate: string | null,
 ): Promise<IntentResolution> {
-  const interpreted = interpretQuestion(question, previous, known);
+  const interpreted = interpretQuestion(question, previous, known, latestDate);
   if (interpreted?.invalidCalendarDate) {
     return { intent: null, invalidDateRange: false, invalidCalendarDate: true };
   }
@@ -516,6 +702,16 @@ async function resolveIntent(
   ) {
     modelIntent = null;
   }
+  // An unplaced "since" must not fall back to every row: without a start
+  // date the answer would quietly cover the whole ledger.
+  if (interpreted?.unplacedSince && !modelIntent?.dateFrom) {
+    return {
+      intent: null,
+      invalidDateRange: false,
+      invalidCalendarDate: false,
+      unplacedDate: true,
+    };
+  }
   if (modelIntent) {
     return { intent: modelIntent, invalidDateRange: false, invalidCalendarDate: false };
   }
@@ -534,21 +730,42 @@ async function resolveIntent(
   return { intent: null, invalidDateRange: false, invalidCalendarDate: false };
 }
 
+function withMonths(
+  summary: {
+    loaded: boolean;
+    count: number;
+    startDate: string | null;
+    endDate: string | null;
+    uploadedAt: string | null;
+  },
+  records: LedgerRecord[],
+): ReportSummary {
+  return {
+    ...summary,
+    months: summary.loaded ? buildMonthlySpend(toSpendEvents(records)) : [],
+  };
+}
+
 async function reportFor(
   identity: AccessIdentity | undefined,
 ): Promise<ReportSummary> {
   if (!onWorkers()) {
     const count = memory.rows.length;
-    return {
-      loaded: count > 0,
-      count,
-      startDate: count > 0 ? memory.startDate : null,
-      endDate: count > 0 ? memory.endDate : null,
-      uploadedAt: count > 0 ? memory.uploadedAt : null,
-    };
+    return withMonths(
+      {
+        loaded: count > 0,
+        count,
+        startDate: count > 0 ? memory.startDate : null,
+        endDate: count > 0 ? memory.endDate : null,
+        uploadedAt: count > 0 ? memory.uploadedAt : null,
+      },
+      memory.rows,
+    );
   }
   if (!identity) throw new Error("Missing Access identity");
-  return (await ledgerStub(identity)).summary();
+  const stub = await ledgerStub(identity);
+  const [summary, loaded] = await Promise.all([stub.summary(), stub.load()]);
+  return withMonths(summary, loaded.records);
 }
 
 export function indexesInRange(indexes: unknown, length: number): number[] {
@@ -595,17 +812,53 @@ app.post(
         });
         return;
       }
-      const uploadedRows = rows.map((payload) => ({ id: 0, payload, category: null }));
-      const categorized = await resolveCategories(uploadedRows, ruleContext(uploadedRows));
+      // A row the ledger already holds is skipped. Two identical rows in one
+      // file are both kept unless the ledger already has both.
+      const keys = dedupeKeys(rows);
+      const plan = await planUpload(keys, res.locals.access);
+      if (plan.stored + plan.fresh.length > MAX_LEDGER_ROWS) {
+        res.status(413).json({
+          error: `This upload would bring the ledger to ${plan.stored + plan.fresh.length} rows. The limit is ${MAX_LEDGER_ROWS}.`,
+        });
+        return;
+      }
+      // Columns and sign come from the whole file, duplicates included, and
+      // are saved with this upload.
+      const layout = uploadLayout(rows);
+      // Each new row keeps its copy number from the whole file, so the append
+      // compares copy 2 of a fare with the one copy already stored instead of
+      // treating it as copy 1 of a shorter list.
+      const copies = copyNumbers(keys);
+      const pending = plan.fresh.map((index) => ({
+        payload: rows[index] ?? {},
+        key: keys[index] ?? "",
+        copy: copies[index] ?? 1,
+      }));
+      const uploadedRows: LedgerRecord[] = pending.map((row) => ({
+        id: 0,
+        payload: row.payload,
+        category: null,
+        layout,
+      }));
+      const categorized = await resolveCategories(uploadedRows, () => layout);
       const range = rows.length ? statementDateRange(rows) : { startDate: null, endDate: null };
-      await writeLedger(
-        categorized.map((record) => ({
+      const saved = await appendLedger(
+        categorized.map((record, index) => ({
           payload: record.payload,
           category: record.category ?? "unknown",
+          key: pending[index]?.key ?? "",
+          copy: pending[index]?.copy ?? 1,
         })),
         res.locals.access,
         range,
+        layout,
       );
+      if (!saved.ok) {
+        res.status(413).json({
+          error: `This upload would bring the ledger to ${saved.total} rows. The limit is ${MAX_LEDGER_ROWS}.`,
+        });
+        return;
+      }
       const fields = rows[0] ? Object.keys(rows[0]) : [];
       const displayFields = rows.length ? pickDisplayFields(rows) : null;
       const columns = fields.map((field) => columnStats(rows, field));
@@ -625,6 +878,9 @@ app.post(
       res.json({
         message: "Data ingested successfully!",
         count: rows.length,
+        added: saved.added,
+        duplicates: rows.length - saved.added,
+        total: saved.total,
         uncategorized,
         fields,
         mappedFields: displayFields,
@@ -674,8 +930,15 @@ app.post("/api/query", async (req: Request, res: Response): Promise<void> => {
     }
     const { views, omitted } = toViews(hydrated.records);
     const known = views.flatMap((view) => [view.narrative, view.merchant]);
+    // The stored summary covers every row, uncategorized and zero rows too.
+    const latestDate =
+      (await reportFor(res.locals.access)).endDate ??
+      views.reduce<string | null>(
+        (latest, view) => (view.date && (!latest || view.date > latest) ? view.date : latest),
+        null,
+      );
     const previous = await readIntent(res.locals.access, hydrated.version);
-    const resolved = await resolveIntent(question, previous, known);
+    const resolved = await resolveIntent(question, previous, known, latestDate);
     if (!(await isCurrent(res.locals.access, hydrated.version))) {
       statementConflict(res);
       return;
@@ -686,6 +949,13 @@ app.post("/api/query", async (req: Request, res: Response): Promise<void> => {
     }
     if (resolved.invalidDateRange) {
       res.status(400).json({ error: "The start date is after the end date." });
+      return;
+    }
+    if (resolved.unplacedDate) {
+      res.json({
+        answer:
+          "I couldn't place that date. Try a month and year or a full date, like since March 2026 or since 2026-03-15.",
+      });
       return;
     }
     const intent = resolved.intent;
@@ -714,6 +984,19 @@ app.post("/api/query", async (req: Request, res: Response): Promise<void> => {
     }
     console.error("Agent Execution Bug: ", error);
     res.status(500).json({ error: "Failed to process financial array accurately." });
+  }
+});
+
+// Deletes the caller's whole ledger so a bad upload can be removed and a full
+// ledger can start over. Same Access check as every /api route.
+app.delete("/api/ledger", async (_req: Request, res: Response) => {
+  res.set("Cache-Control", "no-store");
+  try {
+    const cleared = await clearLedger(res.locals.access);
+    res.json({ ok: true, removed: cleared.removed, total: 0 });
+  } catch (error) {
+    console.error("Ledger clear failed:", error);
+    res.status(500).json({ error: "Internal server error." });
   }
 });
 
