@@ -2477,3 +2477,112 @@ describe("/api spending queries", () => {
     expect(current.answer).not.toContain("9.50");
   });
 });
+
+describe("RETURN netting", () => {
+  it("runs income, transfer and card rules before return netting", () => {
+    expect(categorizeNarrative("RETURN DIRECT DEPOSIT ACME PAYROLL", 200000, true)).toBe(
+      "income",
+    );
+    expect(categorizeNarrative("DEBIT CARD RETURN PAYROLL CARD", 2500, true)).toBe("income");
+    expect(categorizeNarrative("RETURN ZELLE PAYMENT FROM JANE", 5000, true)).toBe("transfers");
+    expect(categorizeNarrative("RETURN CHASE CREDIT CRD AUTOPAY", 5000, true)).toBe(
+      "credit-cards",
+    );
+    expect(categorizeNarrative("RETURN CHIPOTLE", 1000, false)).toBe("dining");
+    expect(CATEGORY_RULES_VERSION).toBe("13");
+  });
+
+  it("keeps sign-aware RETURN handling ahead of brand aliases", () => {
+    expect(cleanMerchantName("RETURN COSTCO WHSE #123", 2000, false)).toBe("RETURN COSTCO WHSE");
+    expect(cleanMerchantName("RETURN COSTCO WHSE #123", 2000, false, true)).toBe("Costco");
+    expect(cleanMerchantName("RETURN TARGET T-1234", 1500, false)).toBe("RETURN TARGET T-1234");
+    expect(cleanMerchantName("RETURN TARGET T-1234", 1500, true)).toBe("Target");
+  });
+
+  it("nets an unsigned bare RETURN that matches a purchase in report and query", async () => {
+    const email = "unsigned-return@example.com";
+    vi.spyOn(env.AI, "run").mockImplementation(async () => {
+      throw new Error("rules cover these merchants");
+    });
+    const uploaded = await upload(
+      email,
+      csvOf([
+        ["2026-11-02", "DEBIT CARD PURCHASE CHIPOTLE 2210 RALEIGH NC", "33.04"],
+        ["2026-11-03", "RETURN CHIPOTLE 2210 RALEIGH NC", "10.00"],
+        ["2026-11-04", "RETURN ITEM FEE", "12.00"],
+      ]),
+    );
+    expect(uploaded.status).toBe(200);
+    const token = await tokenFor(email);
+    const report = (await (await authed("/api/report", token)).json()) as {
+      months: { totalCents: number; diningCents: number; topMerchants: { name: string; cents: number }[] }[];
+    };
+    expect(report.months[0]?.diningCents).toBe(2304);
+    expect(report.months[0]?.topMerchants).toEqual(
+      expect.arrayContaining([{ name: "CHIPOTLE", cents: 2304 }]),
+    );
+    expect(report.months[0]?.topMerchants.some((row) => row.name === "RETURN CHIPOTLE")).toBe(
+      false,
+    );
+    const chipotle = await query(email, "How much did I spend at Chipotle?");
+    expect(chipotle.answer).toContain("Total: $23.04");
+  });
+
+  it("re-resolves a stale ledger so old refund and payroll labels pick up the fix", async () => {
+    const email = "stale-return@example.com";
+    vi.spyOn(env.AI, "run").mockImplementation(async (_model, input) => {
+      const messages = (input as { messages?: { content?: string }[] }).messages ?? [];
+      const blob = messages.map((message) => message.content ?? "").join("\n");
+      if (!blob.includes("You assign exactly one category")) {
+        throw new Error("no live intent model in tests");
+      }
+      const names = (messages[1]?.content ?? "")
+        .split("\n")
+        .slice(1)
+        .map((line) => line.replace(/^\d+\.\s/, ""));
+      return {
+        response: JSON.stringify({
+          items: names.map((merchant) => ({ merchant, category: "other" })),
+        }),
+      };
+    });
+    const stub = env.LEDGER.get(env.LEDGER.idFromName(ledgerName(email)));
+    await seed(
+      stub,
+      [
+        {
+          payload: { Date: "2026-06-06", Description: "ZOOPLEX GADGETS 99", Amount: "-50.00" },
+          category: "other",
+        },
+        {
+          payload: { Date: "2026-06-07", Description: "RETURN ZOOPLEX GADGETS 99", Amount: "20.00" },
+          category: "income",
+        },
+        {
+          payload: {
+            Date: "2026-06-08",
+            Description: "RETURN DIRECT DEPOSIT ACME PAYROLL",
+            Amount: "2000.00",
+          },
+          category: "other",
+        },
+      ],
+      { startDate: "2026-06-06", endDate: "2026-06-08" },
+    );
+    await restampCategories(stub, (description) =>
+      description.startsWith("RETURN ZOOPLEX")
+        ? "income"
+        : description.includes("PAYROLL")
+          ? "other"
+          : "other",
+    );
+    const spent = await query(email, "What did I spend in total?");
+    expect(spent.answer).toContain("Total: $30.00");
+    expect(spent.answer).not.toContain("PAYROLL");
+    const loaded = await stub.load();
+    const byName = (name: string) =>
+      loaded.records.find((row) => row.payload.Description === name)?.category;
+    expect(byName("RETURN ZOOPLEX GADGETS 99")).toBe("other");
+    expect(byName("RETURN DIRECT DEPOSIT ACME PAYROLL")).toBe("income");
+  });
+});

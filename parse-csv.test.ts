@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { MAX_LEDGER_ROWS } from "./constants.ts";
 import { parseCsv } from "./server.ts";
-import { cleanMerchantName } from "./statement.ts";
+import {
+  bareReturnMatchesPurchase,
+  cleanMerchantName,
+  purchaseMerchants,
+} from "./statement.ts";
 
 const statement = `Bank export
 Account number,123
@@ -68,4 +72,49 @@ test("cleanMerchantName strips DEBIT CARD RETURN always, and bare RETURN only wh
 test("cleanMerchantName does not strip RETURNED or RETURNS as a bare RETURN", () => {
   assert.equal(cleanMerchantName("RETURNED CHECK FEE"), "RETURNED CHECK FEE");
   assert.equal(cleanMerchantName("RETURNS INC RALEIGH NC"), "RETURNS INC RALEIGH");
+});
+
+test("cleanMerchantName: an unsigned bare RETURN merges only with a matching purchase", () => {
+  assert.equal(
+    cleanMerchantName("RETURN CHIPOTLE 2210 RALEIGH NC", 1000, false, true),
+    "CHIPOTLE",
+  );
+  assert.equal(cleanMerchantName("RETURN COSTCO WHSE #123", 2000, false, true), "Costco");
+  // Sign-aware RETURN handling runs before brand aliases.
+  assert.equal(cleanMerchantName("RETURN COSTCO WHSE #123", 2000, false), "RETURN COSTCO WHSE");
+  assert.equal(cleanMerchantName("RETURN TARGET T-1234", 1500, false), "RETURN TARGET T-1234");
+  assert.equal(cleanMerchantName("RETURN COSTCO WHSE #123", -2000, true), "RETURN COSTCO WHSE");
+  assert.equal(cleanMerchantName("RETURN COSTCO WHSE #123", 2000, true), "Costco");
+  assert.equal(cleanMerchantName("DEBIT CARD RETURN TARGET T-1234", 1500, false), "Target");
+});
+
+test("cleanMerchantName keeps RETURN on income lines so the income list is distinguishable", () => {
+  assert.equal(
+    cleanMerchantName("RETURN DIRECT DEPOSIT ACME PAYROLL", 200000, true),
+    "RETURN DIRECT DEPOSIT ACME PAYROLL",
+  );
+  assert.equal(
+    cleanMerchantName("DEBIT CARD RETURN PAYROLL CARD", 2500, true),
+    "DEBIT CARD RETURN PAYROLL CARD",
+  );
+});
+
+test("purchase matching uses cleaned merchants and skips returns and deposits", () => {
+  const purchases = purchaseMerchants([
+    { narrative: "DEBIT CARD PURCHASE CHIPOTLE 2210 RALEIGH NC", amountCents: 3304, signedLedger: false },
+    { narrative: "COSTCO WHSE #123", amountCents: 8620, signedLedger: false },
+    { narrative: "RETURN ITEM FEE", amountCents: 1200, signedLedger: false },
+    { narrative: "DIRECT DEPOSIT ACME PAYROLL", amountCents: 200000, signedLedger: false },
+    { narrative: "TARGET T-1234", amountCents: 5000, signedLedger: true },
+  ]);
+  assert.equal(bareReturnMatchesPurchase("RETURN CHIPOTLE 2210 RALEIGH NC", false, purchases), true);
+  assert.equal(bareReturnMatchesPurchase("RETURN COSTCO WHSE #999", false, purchases), true);
+  assert.equal(bareReturnMatchesPurchase("RETURN ITEM FEE", false, purchases), false);
+  assert.equal(bareReturnMatchesPurchase("RETURN OF THE MAC CAFE", false, purchases), false);
+  assert.equal(bareReturnMatchesPurchase("RETURN DIRECT DEPOSIT ACME PAYROLL", false, purchases), false);
+  // A signed money-in TARGET row is not a purchase.
+  assert.equal(bareReturnMatchesPurchase("RETURN TARGET T-1234", false, purchases), false);
+  // Signed files never use purchase matching.
+  assert.equal(bareReturnMatchesPurchase("RETURN CHIPOTLE", true, purchases), false);
+  assert.equal(bareReturnMatchesPurchase("RETURNS INC STORE", false, purchases), false);
 });

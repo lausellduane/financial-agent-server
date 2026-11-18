@@ -1,5 +1,4 @@
 import { extractJson } from "./json-text.js";
-import { isReturnNarrative } from "./spend-cents.js";
 import type { ChatTurn } from "./llm.js";
 
 export const CATEGORIES = [
@@ -25,7 +24,7 @@ export const CATEGORIES = [
 export type Category = (typeof CATEGORIES)[number];
 
 // Bump this when merchant rules change so a stored ledger is rechecked once.
-export const CATEGORY_RULES_VERSION = "12";
+export const CATEGORY_RULES_VERSION = "13";
 
 export function isCategory(value: string): value is Category {
   return (CATEGORIES as readonly string[]).includes(value);
@@ -589,6 +588,50 @@ function hasIncomeKeyword(text: string): boolean {
   );
 }
 
+/** Unambiguous debit-card return phrase, on any sign or ledger type. */
+export function isDebitCardReturn(text: string): boolean {
+  return /\bDEBIT\s+CARD\s+RETURN\b/.test(text.toUpperCase());
+}
+
+/** Description starts with "RETURN " but not RETURNED or RETURNS. */
+export function isBareReturnPrefix(text: string): boolean {
+  return /^RETURN\s/.test(text.toUpperCase().trim());
+}
+
+// Income, credit-card payment, bank or credit-union, and transfer lines. These
+// rules run before any return netting, so "RETURN DIRECT DEPOSIT ACME PAYROLL"
+// or "DEBIT CARD RETURN PAYROLL CARD" is never a spending refund, whatever
+// category the model later gives it.
+export function isNonSpendingNarrative(narrative: string): boolean {
+  const text = narrative.toUpperCase();
+  if (hasIncomeKeyword(text)) return true;
+  if (isMortgagePayment(text)) return false;
+  if (isCreditCardPayment(text)) return true;
+  if (isFinancialInstitution(text)) return true;
+  return RULES.some(
+    (rule) => rule.category === "transfers" && matchesRule(text, rule),
+  );
+}
+
+// Whether a row is a refund that nets against spending.
+// - Income, transfer, credit-card and bank lines never are.
+// - DEBIT CARD RETURN always is, on any sign or ledger type.
+// - A bare "RETURN " on a signed file is a refund only when it is money-in.
+// - A bare "RETURN " on an unsigned file is a refund only when its merchant
+//   matches a purchase in the ledger (purchaseMatch). Otherwise it may be a
+//   fee or a merchant name ("RETURN ITEM FEE", "RETURN OF THE MAC CAFE").
+export function isReturnNarrative(
+  narrative: string,
+  amountCents: number,
+  signedLedger: boolean,
+  purchaseMatch = false,
+): boolean {
+  if (isNonSpendingNarrative(narrative)) return false;
+  if (isDebitCardReturn(narrative)) return true;
+  if (!isBareReturnPrefix(narrative)) return false;
+  return signedLedger ? amountCents > 0 : purchaseMatch;
+}
+
 // Deterministic category, or "unknown" when only the model should decide.
 // A refund keeps the merchant's spending category so it can reduce that
 // total. A credit that matches no spending rule is income. Transfers stay
@@ -599,11 +642,9 @@ export function categorizeNarrative(
   signedLedger: boolean,
 ): Category | "unknown" {
   const text = narrative.toUpperCase();
-  // Run the return check before income so a DEBIT CARD RETURN (or a signed
-  // money-in bare RETURN) never counts as income. It keeps a spending-merchant
-  // rule, or falls through to Other/unknown so it can net against spend.
-  const refund = isReturnNarrative(narrative, amountCents, signedLedger);
-  if (!refund && hasIncomeKeyword(text)) return "income";
+  // Income, credit-card and bank rules run before return netting, so a
+  // "RETURN DIRECT DEPOSIT ..." line is income, not a spending refund.
+  if (hasIncomeKeyword(text)) return "income";
   // A mortgage payment to a bank is still a mortgage. The institution check
   // would otherwise call every outflow a transfer.
   if (isMortgagePayment(text)) return "housing/mortgage";
@@ -613,7 +654,7 @@ export function categorizeNarrative(
   // to the institution is a transfer, not fuel.
   if (isFinancialInstitution(text)) {
     if (amountCents < 0) return "transfers";
-    if (!refund) return "income";
+    return "income";
   }
   if (isUtilityGas(text)) return "utilities/telecom";
   if (isBlankNarrative(text)) return "other";
@@ -627,6 +668,9 @@ export function categorizeNarrative(
   if (isHealthInsurance(text)) return "insurance/health";
   const ruled = RULES.find((rule) => matchesRule(text, rule))?.category;
   if (ruled) return ruled;
+  // A refund (DEBIT CARD RETURN, or a signed money-in bare RETURN) with no
+  // merchant rule falls through to Other/unknown so it can net against spend.
+  const refund = isReturnNarrative(narrative, amountCents, signedLedger);
   if (!refund && signedLedger && amountCents > 0) return "income";
   if (!text.trim()) return "other";
   return "unknown";

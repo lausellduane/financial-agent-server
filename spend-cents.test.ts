@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { categorizeNarrative } from "./categories.ts";
 import {
   isBareReturnPrefix,
   isDebitCardReturn,
+  isNonSpendingNarrative,
   isReturnNarrative,
   spendCentsFor,
 } from "./spend-cents.ts";
@@ -92,4 +94,31 @@ test("a bare RETURN is a refund only on a signed money-in row", () => {
   assert.equal(isReturnNarrative("DEBIT CARD RETURN CHIPOTLE", 1000, false), true);
   assert.equal(isReturnNarrative("DEBIT CARD RETURN CHIPOTLE", -1000, true), true);
   assert.equal(spendCentsFor("RETURNED CHECK FEE", 3500, false, "other"), 3500);
+});
+
+test("an unsigned bare RETURN is a refund only when it matches a purchase", () => {
+  assert.equal(isReturnNarrative("RETURN CHIPOTLE", 1000, false, true), true);
+  assert.equal(spendCentsFor("RETURN CHIPOTLE", 1000, false, "dining", true), -1000);
+  assert.equal(spendCentsFor("RETURN CHIPOTLE", 1000, false, "dining", false), 1000);
+  // A signed file still decides by sign, whatever the purchase match says.
+  assert.equal(isReturnNarrative("RETURN ITEM FEE", -1200, true, true), false);
+});
+
+test("income, transfer, card-payment and bank lines are never refunds", () => {
+  assert.equal(isNonSpendingNarrative("RETURN DIRECT DEPOSIT ACME PAYROLL"), true);
+  assert.equal(isReturnNarrative("RETURN DIRECT DEPOSIT ACME PAYROLL", 200000, true), false);
+  assert.equal(isReturnNarrative("DEBIT CARD RETURN PAYROLL CARD", 2500, true), false);
+  assert.equal(isReturnNarrative("RETURN ZELLE PAYMENT FROM JANE", 5000, true), false);
+  assert.equal(isReturnNarrative("RETURN CHASE CREDIT CRD AUTOPAY", 5000, true), false);
+  assert.equal(isReturnNarrative("RETURN STATE EMPLOYEES CREDIT UNION", 5000, true), false);
+  // The income rule runs first, so the model never gets to call these Other.
+  assert.equal(categorizeNarrative("RETURN DIRECT DEPOSIT ACME PAYROLL", 200000, true), "income");
+  assert.equal(categorizeNarrative("RETURN DIRECT DEPOSIT ACME PAYROLL", 200000, false), "income");
+  assert.equal(categorizeNarrative("DEBIT CARD RETURN PAYROLL CARD", 2500, true), "income");
+  assert.equal(categorizeNarrative("RETURN ZELLE PAYMENT FROM JANE", 5000, true), "transfers");
+  // Not a refund, so a stored income/Other label is never flipped to -spend
+  // by the return rule (abs on an unsigned file).
+  assert.equal(spendCentsFor("DEBIT CARD RETURN PAYROLL CARD", 2500, false, "other"), 2500);
+  assert.equal(isNonSpendingNarrative("RETURN CHIPOTLE"), false);
+  assert.equal(isNonSpendingNarrative("PLANET HOME LENDING MTG PMT"), false);
 });

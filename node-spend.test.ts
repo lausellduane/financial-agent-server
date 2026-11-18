@@ -1127,7 +1127,42 @@ test("POST /api/query nets a signed return at an Other merchant", async () => {
   setCompleteChatForTests(null);
 });
 
-test("an unsigned bare RETURN is not a refund and keeps its name", async () => {
+type ReportMonth = {
+  month: string;
+  totalCents: number;
+  diningCents: number;
+  categories: { name: string; cents: number }[];
+  topMerchants: { name: string; cents: number }[];
+};
+
+async function reportMonths(): Promise<ReportMonth[]> {
+  const report = await fetch(`${base}/api/report`);
+  assert.equal(report.status, 200);
+  return ((await report.json()) as { months: ReportMonth[] }).months;
+}
+
+function categoryStub(assignments: Record<string, string>) {
+  return async (messages: ChatTurn[]) => {
+    const blob = messages.map((message) => message.content).join("\n");
+    if (!blob.includes("You assign exactly one category")) {
+      throw new Error("no live model in tests");
+    }
+    const names = (messages[1]?.content ?? "")
+      .split("\n")
+      .slice(1)
+      .map((line) => line.replace(/^\d+\.\s/, ""));
+    return JSON.stringify({
+      items: names.map((merchant) => ({
+        merchant,
+        category:
+          Object.entries(assignments).find(([key]) => merchant.includes(key))?.[1] ??
+          "other",
+      })),
+    });
+  };
+}
+
+test("an unsigned bare RETURN with a matching purchase nets into one merchant row", async () => {
   setCompleteChatForTests(async () => {
     throw new Error("rules cover these merchants");
   });
@@ -1138,18 +1173,148 @@ test("an unsigned bare RETURN is not a refund and keeps its name", async () => {
     ]),
   );
   assert.equal(uploaded.status, 200);
-  const report = await fetch(`${base}/api/report`);
-  assert.equal(report.status, 200);
-  const body = (await report.json()) as {
-    months: { diningCents: number; topMerchants: { name: string; cents: number }[] }[];
-  };
-  assert.equal(body.months[0]?.diningCents, 4304);
-  assert.deepEqual(body.months[0]?.topMerchants, [
-    { name: "CHIPOTLE", cents: 3304 },
-    { name: "RETURN CHIPOTLE", cents: 1000 },
-  ]);
+  const [november] = await reportMonths();
+  assert.ok(november);
+  assert.equal(november.totalCents, 2304);
+  assert.equal(november.diningCents, 2304);
+  assert.deepEqual(november.topMerchants, [{ name: "CHIPOTLE", cents: 2304 }]);
   const chipotle = await ask("How much did I spend at Chipotle?");
-  assert.match(chipotle, /Total: \$43\.04/);
+  assert.match(chipotle, /CHIPOTLE: -\$10\.00/);
+  assert.match(chipotle, /Total: \$23\.04/);
+  assert.doesNotMatch(chipotle, /RETURN CHIPOTLE/);
+  const total = await ask("What did I spend in total?");
+  assert.match(total, /Total: \$23\.04/);
+  setCompleteChatForTests(null);
+});
+
+test("an unsigned bare RETURN nets against a purchase from an earlier upload", async () => {
+  setCompleteChatForTests(async () => {
+    throw new Error("rules cover these merchants");
+  });
+  assert.equal(
+    (await upload(csv(["2026-11-02,CHIPOTLE 2210 RALEIGH NC,33.04"]))).status,
+    200,
+  );
+  assert.equal(
+    (await upload(csv(["2026-11-03,RETURN CHIPOTLE 2210 RALEIGH NC,10.00"]))).status,
+    200,
+  );
+  const [november] = await reportMonths();
+  assert.deepEqual(november?.topMerchants, [{ name: "CHIPOTLE", cents: 2304 }]);
+  const chipotle = await ask("How much did I spend at Chipotle?");
+  assert.match(chipotle, /Total: \$23\.04/);
+  setCompleteChatForTests(null);
+});
+
+test("unsigned RETURN-named charges with no matching purchase stay charges with full names", async () => {
+  setCompleteChatForTests(
+    categoryStub({
+      "RETURN ITEM FEE": "other",
+      "MAC CAFE": "dining",
+      "RETURNED CHECK FEE": "other",
+      "RETURNS INC": "shopping",
+    }),
+  );
+  const uploaded = await upload(
+    csv([
+      "2026-02-01,RETURN ITEM FEE,12.00",
+      "2026-02-02,RETURN OF THE MAC CAFE,18.00",
+      "2026-02-03,COSTCO WHSE #123,40.00",
+      "2026-02-04,RETURNS INC STORE,45.00",
+      "2026-02-05,RETURNED CHECK FEE,35.00",
+    ]),
+  );
+  assert.equal(uploaded.status, 200);
+  const [february] = await reportMonths();
+  assert.ok(february);
+  assert.equal(february.totalCents, 15000);
+  assert.equal(february.diningCents, 1800);
+  assert.deepEqual(february.topMerchants, [
+    { name: "RETURNS INC STORE", cents: 4500 },
+    { name: "Costco", cents: 4000 },
+    { name: "RETURNED CHECK FEE", cents: 3500 },
+    { name: "RETURN OF THE MAC CAFE", cents: 1800 },
+    { name: "RETURN ITEM FEE", cents: 1200 },
+  ]);
+  const total = await ask("What did I spend in total?");
+  assert.match(total, /RETURN ITEM FEE: \$12\.00/);
+  assert.match(total, /RETURN OF THE MAC CAFE: \$18\.00/);
+  assert.match(total, /Total: \$150\.00/);
+  setCompleteChatForTests(null);
+});
+
+test("unsigned RETURN COSTCO nets only with a Costco purchase; RETURN TARGET alone stays a charge", async () => {
+  setCompleteChatForTests(async () => {
+    throw new Error("rules cover these merchants");
+  });
+  const uploaded = await upload(
+    csv([
+      "2026-03-01,COSTCO WHSE #123,86.20",
+      "2026-03-02,RETURN COSTCO WHSE #123,20.00",
+      "2026-03-03,RETURN TARGET T-1234,15.00",
+    ]),
+  );
+  assert.equal(uploaded.status, 200);
+  const [march] = await reportMonths();
+  assert.ok(march);
+  assert.equal(march.totalCents, 6620 + 1500);
+  assert.deepEqual(march.topMerchants, [
+    { name: "Costco", cents: 6620 },
+    { name: "RETURN TARGET T-1234", cents: 1500 },
+  ]);
+  const total = await ask("What did I spend in total?");
+  assert.match(total, /Costco: -\$20\.00/);
+  assert.match(total, /RETURN TARGET T-1234: \$15\.00/);
+  assert.match(total, /Total: \$81\.20/);
+  setCompleteChatForTests(null);
+});
+
+for (const label of ["other", null] as const) {
+  test(`signed RETURN DIRECT DEPOSIT stays income when the model says ${label ?? "nothing"}`, async () => {
+    setCompleteChatForTests(
+      label
+        ? categoryStub({ PAYROLL: label })
+        : async () => {
+            throw new Error("model unavailable");
+          },
+    );
+    const uploaded = await upload(
+      csv([
+        "2026-03-01,DIRECT DEPOSIT ACME PAYROLL,2000.00",
+        "2026-03-02,RETURN DIRECT DEPOSIT ACME PAYROLL,2000.00",
+        "2026-03-04,DEBIT CARD RETURN PAYROLL CARD,25.00",
+        "2026-03-07,COSTCO WHSE #123,-60.00",
+      ]),
+    );
+    assert.equal(uploaded.status, 200);
+    const [march] = await reportMonths();
+    assert.ok(march);
+    assert.equal(march.totalCents, 6000);
+    assert.deepEqual(march.topMerchants, [{ name: "Costco", cents: 6000 }]);
+    assert.equal(
+      march.categories.some((row) => row.cents < 0),
+      false,
+    );
+    const total = await ask("What did I spend in total?");
+    assert.match(total, /Total: \$60\.00/);
+    assert.doesNotMatch(total, /-\$2000\.00|PAYROLL/);
+    setCompleteChatForTests(null);
+  });
+}
+
+test("the income list tells a deposit apart from its RETURN line", async () => {
+  setCompleteChatForTests(categoryStub({ PAYROLL: "income" }));
+  const uploaded = await upload(
+    csv([
+      "2026-03-01,DIRECT DEPOSIT ACME PAYROLL,2000.00",
+      "2026-03-02,RETURN DIRECT DEPOSIT ACME PAYROLL,2000.00",
+      "2026-03-07,COSTCO WHSE #123,-60.00",
+    ]),
+  );
+  assert.equal(uploaded.status, 200);
+  const income = await ask("How much income did I get?");
+  assert.match(income, /^DIRECT DEPOSIT ACME PAYROLL: \$2000\.00$/m);
+  assert.match(income, /^RETURN DIRECT DEPOSIT ACME PAYROLL: \$2000\.00$/m);
   setCompleteChatForTests(null);
 });
 

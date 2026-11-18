@@ -1,6 +1,11 @@
 import csv from "csv-parser";
 import { Readable } from "node:stream";
-import { isReturnNarrative } from "./spend-cents.js";
+import {
+  isBareReturnPrefix,
+  isDebitCardReturn,
+  isNonSpendingNarrative,
+  isReturnNarrative,
+} from "./categories.js";
 
 export type DisplayFields = {
   date: string | undefined;
@@ -341,10 +346,29 @@ export function cleanMerchantName(
   raw: string,
   amountCents = 0,
   signedLedger = false,
+  purchaseMatch = false,
 ): string {
   let text = String(raw ?? "").replace(/\s+/g, " ").trim();
   if (!text || isBlankMerchant(text)) return "Unknown merchant";
 
+  // Sign-aware RETURN handling runs before brand aliases. A refund drops its
+  // RETURN / DEBIT CARD RETURN prefix and then merges with the merchant. A
+  // line that only starts with RETURN (a fee, an income line, an unsigned
+  // RETURN with no matching purchase) keeps its full name and is never
+  // folded into a brand such as Costco or Target.
+  const refund = isReturnNarrative(text, amountCents, signedLedger, purchaseMatch);
+  if (refund) {
+    text = text.replace(/^(?:DEBIT\s+CARD\s+)?RETURN\s+/i, "");
+  }
+  const keepName = !refund && (isBareReturnPrefix(text) || isDebitCardReturn(text));
+  if (!keepName) {
+    const branded = brandAlias(text);
+    if (branded) return branded;
+  }
+  return genericMerchantName(text);
+}
+
+function brandAlias(text: string): string | null {
   const upper = text.toUpperCase();
   if (
     upper.includes("AMAZON WEB") ||
@@ -378,16 +402,15 @@ export function cleanMerchantName(
   if (upper.includes("FOOD LION")) return "Food Lion";
   if (upper.includes("TARGET")) return "Target";
   if (upper.includes("PUBLIX")) return "Publix";
+  return null;
+}
 
-  // Always strip DEBIT CARD RETURN. Strip a bare RETURN prefix only when
-  // the row is a signed money-in refund — the same rule as isReturnNarrative.
+function genericMerchantName(input: string): string {
+  let text = input;
   text = text.replace(
-    /^(DIRECT DEBIT|DEBIT CARD PURCHASE|DEBIT CARD RETURN|ELECTRONIC WITHDRAWAL(?: REQUESTED BY YOU(?: TO)?)?|POS DEBIT|VISA DEBIT|PURCHASE AUTHORIZED ON \d{1,2}\/\d{1,2}|ACH (?:DEBIT|WITHDRAWAL)|CHECKCARD)\s+/i,
+    /^(DIRECT DEBIT|DEBIT CARD PURCHASE|ELECTRONIC WITHDRAWAL(?: REQUESTED BY YOU(?: TO)?)?|POS DEBIT|VISA DEBIT|PURCHASE AUTHORIZED ON \d{1,2}\/\d{1,2}|ACH (?:DEBIT|WITHDRAWAL)|CHECKCARD)\s+/i,
     "",
   );
-  if (isReturnNarrative(raw, amountCents, signedLedger)) {
-    text = text.replace(/^RETURN\s+/i, "");
-  }
   text = text.replace(/\s*AUTHID:\S+/gi, "");
   text = text.replace(/\s*\([^)]*\)\s*$/g, "");
 
@@ -402,6 +425,48 @@ export function cleanMerchantName(
 
   const cleaned = kept.join(" ").replace(/\s+/g, " ").trim();
   return cleaned || text || "Unknown merchant";
+}
+
+export type PurchaseRow = {
+  narrative: string;
+  amountCents: number;
+  signedLedger: boolean;
+};
+
+function merchantKey(name: string): string {
+  return name.toUpperCase().replace(/\s+/g, " ").trim();
+}
+
+// Cleaned merchant names of the ledger's purchases: charges that are not
+// returns, deposits, transfers or card payments. On a signed file only
+// money-out rows are purchases. An unsigned bare RETURN nets only against one
+// of these merchants.
+export function purchaseMerchants(rows: PurchaseRow[]): Set<string> {
+  const merchants = new Set<string>();
+  for (const row of rows) {
+    if (!row.amountCents) continue;
+    if (row.signedLedger && row.amountCents > 0) continue;
+    if (isBareReturnPrefix(row.narrative) || isDebitCardReturn(row.narrative)) continue;
+    if (isNonSpendingNarrative(row.narrative)) continue;
+    merchants.add(
+      merchantKey(cleanMerchantName(row.narrative, row.amountCents, row.signedLedger)),
+    );
+  }
+  return merchants;
+}
+
+// An unsigned "RETURN CHIPOTLE ..." whose merchant ("CHIPOTLE") matches a
+// purchase. Signed files decide by sign instead, so this is false for them.
+export function bareReturnMatchesPurchase(
+  narrative: string,
+  signedLedger: boolean,
+  purchases: Set<string>,
+): boolean {
+  if (signedLedger || !isBareReturnPrefix(narrative)) return false;
+  if (isNonSpendingNarrative(narrative)) return false;
+  const rest = narrative.replace(/^\s*RETURN\s+/i, "");
+  if (!rest.trim()) return false;
+  return purchases.has(merchantKey(cleanMerchantName(rest, 0, false)));
 }
 
 export function parseCsv(rawCsv: string): Promise<Record<string, string>[]> {
