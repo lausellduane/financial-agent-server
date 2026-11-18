@@ -19,15 +19,26 @@ test("debit-card returns in a spending category are money-in on any sign", () =>
   );
 });
 
-test("uncategorized and non-spending returns keep the ledger sign", () => {
+test("debit-card returns at uncategorized or Other merchants are money-in", () => {
   assert.equal(
-    spendCentsFor("DEBIT CARD RETURN GROK XAI", 15, false, "unknown"),
-    15,
+    spendCentsFor("DEBIT CARD RETURN ZOOPLEX GADGETS", 2000, false, "unknown"),
+    -2000,
   );
   assert.equal(
-    spendCentsFor("DEBIT CARD RETURN GROK XAI", 15, true, "unknown"),
-    -15,
+    spendCentsFor("DEBIT CARD RETURN ZOOPLEX GADGETS", 2000, true, "unknown"),
+    -2000,
   );
+  assert.equal(
+    spendCentsFor("DEBIT CARD RETURN ZOOPLEX GADGETS", -2000, true, "unknown"),
+    -2000,
+  );
+  assert.equal(
+    spendCentsFor("DEBIT CARD RETURN ZOOPLEX GADGETS", 2000, false, "other"),
+    -2000,
+  );
+});
+
+test("income, transfers, and credit-card payments stay excluded", () => {
   assert.equal(
     spendCentsFor("CREDIT CARD PAYMENT", 20000, false, "credit-cards"),
     20000,
@@ -35,5 +46,13 @@ test("uncategorized and non-spending returns keep the ledger sign", () => {
   assert.equal(
     spendCentsFor("DEBIT CARD RETURN", 500, false, "credit-cards"),
     500,
+  );
+  assert.equal(
+    spendCentsFor("DEBIT CARD RETURN PAYPAL TRANSFER", 1500, false, "transfers"),
+    1500,
+  );
+  assert.equal(
+    spendCentsFor("DEBIT CARD RETURN PAYROLL", 800, false, "income"),
+    800,
   );
 });

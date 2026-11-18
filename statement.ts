@@ -375,7 +375,7 @@ export function cleanMerchantName(raw: string): string {
   if (upper.includes("PUBLIX")) return "Publix";
 
   text = text.replace(
-    /^(DIRECT DEBIT|DEBIT CARD PURCHASE|ELECTRONIC WITHDRAWAL(?: REQUESTED BY YOU(?: TO)?)?|POS DEBIT|VISA DEBIT|PURCHASE AUTHORIZED ON \d{1,2}\/\d{1,2}|ACH (?:DEBIT|WITHDRAWAL)|CHECKCARD)\s+/i,
+    /^(DIRECT DEBIT|DEBIT CARD PURCHASE|DEBIT CARD RETURN|RETURN|ELECTRONIC WITHDRAWAL(?: REQUESTED BY YOU(?: TO)?)?|POS DEBIT|VISA DEBIT|PURCHASE AUTHORIZED ON \d{1,2}\/\d{1,2}|ACH (?:DEBIT|WITHDRAWAL)|CHECKCARD)\s+/i,
     "",
   );
   text = text.replace(/\s*AUTHID:\S+/gi, "");

@@ -1029,3 +1029,50 @@ test("GET /api/report nets an unsigned Chipotle debit-card return in dining", as
   );
   setCompleteChatForTests(null);
 });
+
+test("GET /api/report merges Chipotle returns and nets an uncategorized Zooplex return", async () => {
+  setCompleteChatForTests(async () => {
+    throw new Error("rules cover these merchants");
+  });
+  const uploaded = await upload(
+    csv([
+      "2026-11-02,DEBIT CARD PURCHASE CHIPOTLE 2210 RALEIGH NC,33.04",
+      "2026-11-03,DEBIT CARD RETURN CHIPOTLE 2210 RALEIGH NC,10.00",
+      "2026-11-04,ZOOPLEX GADGETS 99,50.00",
+      "2026-11-05,DEBIT CARD RETURN ZOOPLEX GADGETS 99,20.00",
+    ]),
+  );
+  assert.equal(uploaded.status, 200);
+  const response = await fetch(`${base}/api/report`);
+  assert.equal(response.status, 200);
+  const body = (await response.json()) as {
+    loaded: boolean;
+    count: number;
+    months: {
+      month: string;
+      diningCents: number;
+      totalCents: number;
+      categories: { name: string; cents: number }[];
+      topMerchants: { name: string; cents: number }[];
+    }[];
+  };
+  assert.equal(body.loaded, true);
+  assert.equal(body.count, 4);
+  assert.equal(body.months.length, 1);
+  const november = body.months[0];
+  assert.ok(november);
+  assert.equal(november.month, "2026-11");
+  assert.equal(november.diningCents, 2304);
+  assert.equal(november.totalCents, 5304);
+  assert.ok(
+    november.categories.some((row) => row.name === "Eating out" && row.cents === 2304),
+  );
+  assert.ok(
+    november.categories.some((row) => row.name === "Other" && row.cents === 3000),
+  );
+  assert.deepEqual(november.topMerchants, [
+    { name: "ZOOPLEX GADGETS", cents: 3000 },
+    { name: "CHIPOTLE", cents: 2304 },
+  ]);
+  setCompleteChatForTests(null);
+});

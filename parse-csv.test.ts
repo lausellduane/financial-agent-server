@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { MAX_LEDGER_ROWS } from "./constants.ts";
 import { parseCsv } from "./server.ts";
+import { cleanMerchantName } from "./statement.ts";
 
 const statement = `Bank export
 Account number,123
@@ -25,4 +26,17 @@ test("parseCsv strips a UTF-8 BOM from the header", async () => {
   assert.equal(rows.length, 1);
   assert.equal(rows[0]?.Description, "PIEDMONT NATURAL GAS");
   assert.equal(Object.keys(rows[0] ?? {})[0], "Date");
+});
+
+test("cleanMerchantName strips return prefixes so a purchase and return merge", () => {
+  const purchase = cleanMerchantName(
+    "DEBIT CARD PURCHASE CHIPOTLE 2210 RALEIGH NC",
+  );
+  const debitReturn = cleanMerchantName(
+    "DEBIT CARD RETURN CHIPOTLE 2210 RALEIGH NC",
+  );
+  const bareReturn = cleanMerchantName("RETURN CHIPOTLE 2210 RALEIGH NC");
+  assert.equal(purchase, "CHIPOTLE");
+  assert.equal(debitReturn, "CHIPOTLE");
+  assert.equal(bareReturn, "CHIPOTLE");
 });
