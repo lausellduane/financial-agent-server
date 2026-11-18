@@ -1538,9 +1538,11 @@ test("node mode nets a debit-card return against dining and keeps income at $835
   setCompleteChatForTests(null);
 });
 
-test("node mode leaves a bare DIRECT DEPOSIT to the model on a new upload", async () => {
-  setCompleteChatForTests(async () => {
-    throw new Error("rules do not cover a bare direct deposit");
+test("node mode keeps a bare DIRECT DEPOSIT out of the model, income, and spending", async () => {
+  let categoryCalls = 0;
+  setCompleteChatForTests(async (messages: ChatTurn[]) => {
+    if (messages[0]?.content.includes("You assign exactly one category")) categoryCalls += 1;
+    throw new Error("rules cover every row here");
   });
   const uploaded = await upload(
     csv([
@@ -1550,7 +1552,11 @@ test("node mode leaves a bare DIRECT DEPOSIT to the model on a new upload", asyn
     ]),
   );
   assert.equal(uploaded.status, 200);
-  assert.equal(uploaded.body.uncategorized, 1);
+  assert.equal(uploaded.body.uncategorized, 0);
+  assert.equal(categoryCalls, 0);
+  const spent = await ask("What did I spend in total?");
+  assert.match(spent, /Total: \$10\.00/);
+  assert.doesNotMatch(spent, /DIRECT DEPOSIT/);
   const income = await ask("How much was income?");
   assert.match(income, /Total: \$900\.00/);
   assert.match(income, /DIR DEP/);
@@ -1622,5 +1628,294 @@ test("node mode nets a signed-negative debit-card return against dining", async 
   const made = await ask("How much did I make?");
   assert.match(made, /Total: \$8359\.55/);
   assert.doesNotMatch(made, /PAYPAL/);
+  setCompleteChatForTests(null);
+});
+
+// ---- QA repros for PR #9 (/workspace/qa-pr9: h9, harness, harness3, harness4) ----
+
+type QaStub = {
+  categoryNames: string[];
+  intentCalls: number;
+};
+
+// Category calls answer from `rules` (else `fallback`); intent calls fail, so
+// a question only answers when code understands it. Records what the
+// category model was asked about.
+function qaStub(fallback: string, rules: [RegExp, string][] = []): QaStub {
+  const seen: QaStub = { categoryNames: [], intentCalls: 0 };
+  setCompleteChatForTests(async (messages: ChatTurn[]) => {
+    if (!messages[0]?.content.includes("You assign exactly one category")) {
+      seen.intentCalls += 1;
+      throw new Error("no live model in tests");
+    }
+    const names = (messages[1]?.content ?? "")
+      .split("\n")
+      .slice(1)
+      .map((line) => line.replace(/^\d+\.\s/, ""));
+    seen.categoryNames.push(...names);
+    return JSON.stringify({
+      items: names.map((merchant) => ({
+        merchant,
+        category: rules.find(([pattern]) => pattern.test(merchant))?.[1] ?? fallback,
+      })),
+    });
+  });
+  return seen;
+}
+
+const QA_SIGNED_DEPOSITS = [
+  "2026-10-01,DIRECT DEPOSIT ACME,1500.00",
+  "2026-10-02,ACME CORP DIR DEP,1000.00",
+  "2026-10-03,ACME PAYROLL,900.00",
+  "2026-10-04,GUSTO PAYROLL XFER,800.00",
+  "2026-10-05,STATE EMPLOYEES CREDIT UNION DEPOSIT,200.00",
+  "2026-10-06,SHELL FEDERAL CREDIT UNION,50.00",
+  "2026-10-07,DEPOSIT TRUIST BANK,70.00",
+  "2026-10-08,MOBILE DEPOSIT,30.00",
+  "2026-10-09,IRS TREAS 310 TAX REF,500.00",
+  "2026-10-10,SSA TREAS 310 XXSOC SEC,1200.00",
+  "2026-10-11,ACH CREDIT ACME INC,400.00",
+  "2026-10-12,ACME PAYROLL TAX,-90.00",
+  "2026-10-15,COSTCO WHSE #123,-40.00",
+];
+
+for (const fallback of ["other", "income", "transfers"]) {
+  test(`QA C4/C6: signed deposits never reach the model or spending (model says ${fallback})`, async () => {
+    const seen = qaStub(fallback);
+    const uploaded = await upload(csv(QA_SIGNED_DEPOSITS));
+    assert.equal(uploaded.status, 200);
+    assert.equal(uploaded.body.uncategorized, 0);
+    // Every row is decided by rules; no deposit goes to the model.
+    assert.deepEqual(seen.categoryNames, []);
+
+    const [october] = await reportMonths();
+    assert.equal(october?.totalCents, 4000);
+    assert.deepEqual(october?.categories, [{ name: "Groceries", cents: 4000 }]);
+
+    const spent = await ask("What did I spend in total?");
+    assert.match(spent, /^Costco: \$40\.00$/m);
+    assert.match(spent, /Total: \$40\.00/);
+    assert.doesNotMatch(spent, /DEPOSIT|IRS|SSA|ACH CREDIT|PAYROLL/);
+
+    // Income is payroll only, net of the payroll tax. GUSTO PAYROLL XFER is
+    // income; the generic deposit, IRS, SSA, ACH credit and mobile deposit
+    // are not.
+    const income = await ask("How much was income?");
+    assert.match(income, /^GUSTO PAYROLL XFER: \$800\.00$/m);
+    assert.match(income, /^ACME PAYROLL TAX: -\$90\.00$/m);
+    assert.match(income, /Total: \$2610\.00/);
+    assert.doesNotMatch(income, /DIRECT DEPOSIT ACME|IRS|SSA|ACH CREDIT|MOBILE/);
+
+    const transfers = await ask("How much did I transfer?");
+    assert.match(transfers, /Total: \$320\.00/);
+    assert.doesNotMatch(transfers, /GUSTO|IRS|SSA|ACH CREDIT|DIRECT DEPOSIT ACME/);
+    setCompleteChatForTests(null);
+  });
+}
+
+test("QA C4u: unsigned deposit lines are money in, not spending or income", async () => {
+  const seen = qaStub("other");
+  const uploaded = await upload(
+    csv([
+      "2026-10-01,DIRECT DEPOSIT ACME,1500.00",
+      "2026-10-02,ACME CORP DIR DEP,1000.00",
+      "2026-10-03,ACME PAYROLL,900.00",
+      "2026-10-05,STATE EMPLOYEES CREDIT UNION DEPOSIT,200.00",
+      "2026-10-06,SHELL FEDERAL CREDIT UNION,50.00",
+      "2026-10-09,IRS TREAS 310 TAX REF,500.00",
+      "2026-10-10,SSA TREAS 310 XXSOC SEC,1200.00",
+      "2026-10-11,ACH CREDIT ACME INC,400.00",
+      "2026-10-15,COSTCO WHSE #123,40.00",
+    ]),
+  );
+  assert.equal(uploaded.status, 200);
+  assert.deepEqual(seen.categoryNames, []);
+  const [october] = await reportMonths();
+  assert.equal(october?.totalCents, 4000);
+  const spent = await ask("What did I spend in total?");
+  assert.match(spent, /Total: \$40\.00/);
+  assert.doesNotMatch(spent, /DIRECT DEPOSIT|IRS|SSA|ACH CREDIT/);
+  const income = await ask("How much was income?");
+  assert.match(income, /Total: \$1900\.00/);
+  assert.doesNotMatch(income, /DIRECT DEPOSIT ACME|IRS|SSA|ACH CREDIT/);
+  const moneyIn = await ask("How much were my deposits?");
+  assert.match(moneyIn, /^DIRECT DEPOSIT ACME: \$1500\.00$/m);
+  assert.match(moneyIn, /Total: \$3600\.00/);
+  setCompleteChatForTests(null);
+});
+
+test("QA T1: signed tax refunds are not negative spending", async () => {
+  const seen = qaStub("other");
+  const uploaded = await upload(
+    csv([
+      "2026-04-01,IRS TREAS 310 TAX REF,500.00",
+      "2026-04-02,TAX REFUND STATE OF NC,120.00",
+      "2026-04-05,COSTCO WHSE #123,-60.00",
+    ]),
+  );
+  assert.equal(uploaded.status, 200);
+  assert.deepEqual(seen.categoryNames, []);
+  const [april] = await reportMonths();
+  assert.equal(april?.totalCents, 6000);
+  const spent = await ask("What did I spend in total?");
+  assert.match(spent, /Total: \$60\.00/);
+  assert.doesNotMatch(spent, /IRS|TAX REFUND/);
+  setCompleteChatForTests(null);
+});
+
+test("QA harness3: a signed DIRECT DEPOSIT next to a refund stays out of spending", async () => {
+  const seen = qaStub("other");
+  const uploaded = await upload(
+    csv([
+      "2026-11-02,DEBIT CARD PURCHASE CHIPOTLE 2210 RALEIGH NC,-33.04",
+      "2026-11-03,DIRECT DEPOSIT ACME,100.00",
+      "2026-11-04,DEBIT CARD RETURN CHIPOTLE 2210 RALEIGH NC,10.00",
+    ]),
+  );
+  assert.equal(uploaded.status, 200);
+  assert.deepEqual(seen.categoryNames, []);
+  const [november] = await reportMonths();
+  assert.equal(november?.totalCents, 2304);
+  const spent = await ask("What did I spend in total?");
+  assert.match(spent, /Total: \$23\.04/);
+  assert.doesNotMatch(spent, /DIRECT DEPOSIT/);
+  setCompleteChatForTests(null);
+});
+
+for (const signed of [true, false]) {
+  test(`QA S2: a PayPal-routed card purchase is spending and its return nets (${signed ? "signed" : "unsigned"})`, async () => {
+    qaStub("other");
+    const sign = signed ? "-" : "";
+    const uploaded = await upload(
+      csv([
+        `2026-03-01,DEBIT CARD PURCHASE PAYPAL *ETSY SELLER,${sign}40.00`,
+        "2026-03-02,DEBIT CARD RETURN PAYPAL *ETSY SELLER,15.00",
+        `2026-03-07,COSTCO WHSE #123,${sign}60.00`,
+      ]),
+    );
+    assert.equal(uploaded.status, 200);
+    const [march] = await reportMonths();
+    assert.equal(march?.totalCents, 8500);
+    assert.ok(march?.categories.some((row) => row.name === "Shopping" && row.cents === 2500));
+    const transfers = await ask("How much did I transfer?");
+    assert.doesNotMatch(transfers, /ETSY/);
+    const spent = await ask("What did I spend in total?");
+    assert.match(spent, /Total: \$85\.00/);
+    const shopping = await ask("How much did I spend on shopping?");
+    assert.match(shopping, /Total: \$25\.00/);
+    setCompleteChatForTests(null);
+  });
+}
+
+test("QA S2: person-to-person PayPal lines stay transfers", async () => {
+  qaStub("other");
+  const uploaded = await upload(
+    csv([
+      "2026-03-01,DIRECT DEPOSIT PAYPAL TRANSFER,505.00",
+      "2026-03-02,PAYPAL *JANE VISA DIRECT,-100.00",
+      "2026-03-07,COSTCO WHSE #123,-60.00",
+    ]),
+  );
+  assert.equal(uploaded.status, 200);
+  const transfers = await ask("How much did I transfer?");
+  assert.match(transfers, /DIRECT DEPOSIT PAYPAL TRANSFER: \$505\.00/);
+  assert.match(transfers, /Total: \$605\.00/);
+  const income = await ask("How much was income?");
+  assert.doesNotMatch(income, /PAYPAL/);
+  const spent = await ask("What did I spend in total?");
+  assert.match(spent, /Total: \$60\.00/);
+  setCompleteChatForTests(null);
+});
+
+test("QA C3/C5: a payroll adjustment lowers income and is never spending", async () => {
+  qaStub("other", [[/CHIPOTLE/, "dining"]]);
+  const uploaded = await upload(
+    csv([
+      "2026-05-01,DIRECT DEPOSIT ACME PAYROLL,2000.00",
+      "2026-05-02,RETURN ACME PAYROLL ADJ,-150.00",
+      "2026-05-03,ZELLE PAYMENT TO JOHN,-100.00",
+      "2026-05-04,RETURN ZELLE PAYMENT TO JOHN,100.00",
+      "2026-05-05,CHASE CREDIT CRD AUTOPAY,-500.00",
+      "2026-05-06,RETURN CHASE CREDIT CRD AUTOPAY,500.00",
+      "2026-05-07,DEBIT CARD PURCHASE CHIPOTLE 1 NC,-33.04",
+      "2026-05-08,DEBIT CARD RETURN CHIPOTLE 1 NC,10.00",
+      "2026-05-09,COSTCO WHSE #123,-86.20",
+      "2026-05-10,INTEREST PAYMENT,1.23",
+    ]),
+  );
+  assert.equal(uploaded.status, 200);
+  const made = await ask("How much did I make?");
+  assert.match(made, /^RETURN ACME PAYROLL ADJ: -\$150\.00$/m);
+  assert.match(made, /Total: \$1850\.00/);
+  const spent = await ask("What did I spend in total?");
+  assert.doesNotMatch(spent, /PAYROLL|INTEREST/);
+  assert.match(spent, /Total: \$109\.24/);
+  const biggest = await ask("What was my biggest charge?");
+  assert.match(biggest, /Costco: \$86\.20/);
+  const [may] = await reportMonths();
+  assert.equal(may?.totalCents, 10924);
+  setCompleteChatForTests(null);
+});
+
+test("QA h9: 'made so far' is income and 'made from dining' is dining", async () => {
+  const seen = qaStub("other");
+  const uploaded = await upload(
+    csv([
+      "2026-10-01,DIVIDEND RECEIVED FIDELITY GOVERNMENT MONEY MARKET (SPAXX) (CASH),2.00",
+      "2026-10-05,DIRECT DEPOSIT PAYPAL TRANSFER,505.00",
+      "2026-10-06,DIRECT DEPOSIT ELSEVIER INCPAYROLL,2785.11",
+      "2026-10-14,CHIPOTLE,-33.04",
+      "2026-10-14,DEBIT CARD RETURN CHIPOTLE,10.00",
+      "2026-10-15,COSTCO WHSE #123,-40.00",
+    ]),
+  );
+  assert.equal(uploaded.status, 200);
+  const sofar = await ask("How much have I made so far?");
+  assert.match(sofar, /Total: \$2787\.11/);
+  assert.doesNotMatch(sofar, /PAYPAL|CHIPOTLE/);
+  const dining = await ask("How much did I make from dining?");
+  assert.match(dining, /Total: \$23\.04/);
+  assert.doesNotMatch(dining, /ELSEVIER|DIVIDEND/);
+  // Both answered by code, not the intent model.
+  assert.equal(seen.intentCalls, 0);
+  setCompleteChatForTests(null);
+});
+
+test("QA harness C4: a signed credit from a merchant with a purchase still nets", async () => {
+  qaStub("other", [[/RETURNS INC/, "shopping"]]);
+  const uploaded = await upload(
+    csv([
+      "2026-04-01,RETURNS INC STORE 22,-45.00",
+      "2026-04-03,RETURNS INC STORE 22,15.00",
+    ]),
+  );
+  assert.equal(uploaded.status, 200);
+  const [april] = await reportMonths();
+  assert.equal(april?.totalCents, 3000);
+  setCompleteChatForTests(null);
+});
+
+test("the model cannot make an unsigned row income or a refund non-spending", async () => {
+  const seen = qaStub("income", [
+    [/^DEBIT CARD RETURN/, "income"],
+    [/ZOOPLEX/, "other"],
+  ]);
+  const uploaded = await upload(
+    csv([
+      "2026-06-01,ZOOPLEX GADGETS 99,50.00",
+      "2026-06-02,DEBIT CARD RETURN ZOOPLEX GADGETS 99,20.00",
+      "2026-06-03,ACME CORP,1000.00",
+    ]),
+  );
+  assert.equal(uploaded.status, 200);
+  assert.ok(seen.categoryNames.includes("ACME CORP"));
+  const income = await ask("How much was income?");
+  assert.doesNotMatch(income, /ACME|ZOOPLEX/);
+  const [june] = await reportMonths();
+  // The refund the model called income falls back to Other and nets; ACME
+  // CORP, which the model called income, is kept out of spending and income.
+  assert.equal(june?.totalCents, 3000);
+  const deposits = await ask("How much were my deposits?");
+  assert.match(deposits, /^ACME CORP: \$1000\.00$/m);
   setCompleteChatForTests(null);
 });

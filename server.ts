@@ -16,6 +16,8 @@ import {
   buildCategoryMessages,
   CATEGORY_RULES_VERSION,
   categorizeNarrative,
+  clampModelCategory,
+  incomeCentsFor,
   isCategory,
   parseCategoryAssignments,
   type Category,
@@ -38,6 +40,7 @@ import {
   bareReturnMatchesPurchase,
   cleanMerchantName,
   purchaseMerchants,
+  signedCreditMatchesPurchase,
   columnStats,
   dedupeKeys,
   formatSignedCents,
@@ -184,13 +187,27 @@ function ruleContext(records: LedgerRecord[]): RuleContext {
   };
 }
 
-function ruledCategory(record: LedgerRecord, context: RuleContext): ReturnType<typeof categorizeNarrative> {
+function creditMatch(record: LedgerRecord, context: RuleContext, purchases: Set<string>): boolean {
+  const { fields, signed } = context(record);
+  return signedCreditMatchesPurchase(
+    rowNarrative(record.payload, fields.description),
+    parseAmountCents(fields.amount ? record.payload[fields.amount] : undefined),
+    signed,
+    purchases,
+  );
+}
+
+function ruledCategory(
+  record: LedgerRecord,
+  context: RuleContext,
+  purchases: Set<string>,
+): ReturnType<typeof categorizeNarrative> {
   const { fields, signed } = context(record);
   const narrative = rowNarrative(record.payload, fields.description);
   const cents = parseAmountCents(
     fields.amount ? record.payload[fields.amount] : undefined,
   );
-  return categorizeNarrative(narrative, cents, signed);
+  return categorizeNarrative(narrative, cents, signed, creditMatch(record, context, purchases));
 }
 
 // A merchant rule replaces a stored category that disagrees with it, including
@@ -202,10 +219,15 @@ function ruledCategory(record: LedgerRecord, context: RuleContext): ReturnType<t
 // (a generic DIRECT DEPOSIT, an unmatched money-in) and refund rows that an
 // older rule version stored as income (a signed money-in RETURN or DEBIT
 // CARD RETURN with no merchant rule), so old ledgers pick up return netting.
-function recordsToResolve(records: LedgerRecord[], context: RuleContext, stale: boolean): LedgerRecord[] {
+function recordsToResolve(
+  records: LedgerRecord[],
+  context: RuleContext,
+  stale: boolean,
+  purchases: Set<string>,
+): LedgerRecord[] {
   return records.filter((record) => {
     if (!stale) return needsCategory(record.category);
-    const ruled = ruledCategory(record, context);
+    const ruled = ruledCategory(record, context, purchases);
     if (ruled !== "unknown") return ruled !== record.category;
     // Stored income that the rules no longer call income, refunds included,
     // goes through the normal unknown/AI path used for other rechecks.
@@ -233,16 +255,25 @@ async function classifyUnknown(narratives: string[]): Promise<Map<string, Catego
   return assigned;
 }
 
+// `purchases` are the purchase merchants of the ledger (or the uploaded file),
+// so a signed credit from one of them nets as a merchant credit.
 async function resolveCategories(
   records: LedgerRecord[],
   context: RuleContext,
+  purchases: Set<string>,
 ): Promise<LedgerRecord[]> {
   if (!records.length) return [];
-  const draft = records.map((record) => ({
-    record,
-    narrative: rowNarrative(record.payload, context(record).fields.description),
-    ruled: ruledCategory(record, context),
-  }));
+  const draft = records.map((record) => {
+    const { fields, signed } = context(record);
+    return {
+      record,
+      narrative: rowNarrative(record.payload, fields.description),
+      amountCents: parseAmountCents(fields.amount ? record.payload[fields.amount] : undefined),
+      signed,
+      creditMatch: creditMatch(record, context, purchases),
+      ruled: ruledCategory(record, context, purchases),
+    };
+  });
   const pending = [
     ...new Set(
       draft
@@ -256,7 +287,18 @@ async function resolveCategories(
       return { ...item.record, category: item.ruled };
     }
     const fromModel = assigned.get(item.narrative);
-    return { ...item.record, category: fromModel ?? "unknown" };
+    // The model never decides income or deposits, and never turns a refund
+    // into a non-spending row.
+    const category = fromModel
+      ? clampModelCategory(
+          fromModel,
+          item.narrative,
+          item.amountCents,
+          item.signed,
+          item.creditMatch,
+        )
+      : "unknown";
+    return { ...item.record, category };
   });
 }
 
@@ -462,10 +504,11 @@ async function hydrate(
   }
   const context = ruleContext(loaded.records);
   const stale = loaded.rulesVersion !== CATEGORY_RULES_VERSION;
-  const pending = recordsToResolve(loaded.records, context, stale);
+  const purchases = ledgerPurchases(loaded.records, context);
+  const pending = recordsToResolve(loaded.records, context, stale, purchases);
   let records = loaded.records;
   if (pending.length) {
-    const resolved = await resolveCategories(pending, context);
+    const resolved = await resolveCategories(pending, context, purchases);
     const updates = resolved
       .filter((record) => record.category !== null)
       .map((record) => ({ id: record.id, category: record.category ?? "unknown" }));
@@ -567,6 +610,7 @@ function toViews(records: LedgerRecord[]): { views: TxView[]; omitted: OmittedRo
       narrative: narrative || rawDescription.toUpperCase(),
       amountCents,
       spendCents,
+      incomeCents: incomeCentsFor(narrative, amountCents, signed),
       category: record.category as Category,
     });
   }
@@ -840,7 +884,13 @@ app.post(
         category: null,
         layout,
       }));
-      const categorized = await resolveCategories(uploadedRows, () => layout);
+      // Purchases from the whole file, rows already stored included, so a
+      // merchant credit nets even when its purchase was uploaded before.
+      const filePurchases = ledgerPurchases(
+        rows.map((payload) => ({ id: 0, payload, category: null, layout })),
+        () => layout,
+      );
+      const categorized = await resolveCategories(uploadedRows, () => layout, filePurchases);
       const range = rows.length ? statementDateRange(rows) : { startDate: null, endDate: null };
       const saved = await appendLedger(
         categorized.map((record, index) => ({

@@ -469,6 +469,20 @@ export function bareReturnMatchesPurchase(
   return purchases.has(merchantKey(cleanMerchantName(rest, 0, false)));
 }
 
+// A signed money-in row from a merchant the ledger also shows as a purchase
+// ("RETURNS INC STORE 22" -45 then +15) is a merchant credit, so it can net
+// against that spending. Any other unmatched signed credit is a deposit.
+export function signedCreditMatchesPurchase(
+  narrative: string,
+  amountCents: number,
+  signedLedger: boolean,
+  purchases: Set<string>,
+): boolean {
+  if (!signedLedger || amountCents <= 0) return false;
+  if (isNonSpendingNarrative(narrative)) return false;
+  return purchases.has(merchantKey(cleanMerchantName(narrative, -amountCents, true)));
+}
+
 export function parseCsv(rawCsv: string): Promise<Record<string, string>[]> {
   const skipLines = countCsvSkipLines(rawCsv);
   const results: Record<string, string>[] = [];

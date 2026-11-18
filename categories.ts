@@ -18,13 +18,20 @@ export const CATEGORIES = [
   "cloud/software",
   "home",
   "housing/mortgage",
+  "money-in",
   "other",
 ] as const;
 
 export type Category = (typeof CATEGORIES)[number];
 
 // Bump this when merchant rules change so a stored ledger is rechecked once.
-export const CATEGORY_RULES_VERSION = "14";
+export const CATEGORY_RULES_VERSION = "15";
+
+// "money-in" holds deposits that are neither income nor a refund: a generic
+// direct deposit, an ACH credit, a tax refund, Social Security, a check
+// deposit, or any other unmatched credit on a signed file. It is never
+// spending and never income. Only rules assign it; the model never sees it.
+export const MODEL_CATEGORIES = CATEGORIES.filter((category) => category !== "money-in");
 
 export function isCategory(value: string): value is Category {
   return (CATEGORIES as readonly string[]).includes(value);
@@ -604,6 +611,38 @@ function isFeeRebate(text: string): boolean {
   return /\bFEE\s+REBATE\b/.test(text);
 }
 
+const TRANSFER_RULE = RULES.find((rule) => rule.category === "transfers") as Rule;
+
+function stripPayPal(text: string): string {
+  return text.replace(/\bPAYPAL\b\s*\*?/g, " ").replace(/\s+/g, " ").trim();
+}
+
+// A card purchase or return paid through PayPal ("DEBIT CARD PURCHASE PAYPAL
+// *ETSY SELLER", "PAYPAL *ETSY SELLER") is that merchant's spending. Only a
+// line that still reads as a transfer without the PayPal word ("DIRECT
+// DEPOSIT PAYPAL TRANSFER", "PAYPAL *JANE VISA DIRECT", "PAYPAL INST XFER"),
+// or one with no card or merchant context, stays a person-to-person transfer.
+export function isPayPalMerchantPurchase(narrative: string): boolean {
+  const text = narrative.toUpperCase();
+  if (!/\bPAYPAL\b/.test(text)) return false;
+  const rest = stripPayPal(text);
+  if (!rest || matchesRule(rest, TRANSFER_RULE)) return false;
+  if (/\b(DEBIT|CREDIT|CHECK)\s+CARD\s+(PURCHASE|RETURN|REFUND)\b|\bCARD\s+PURCHASE\b|\bPOS\s+(PURCHASE|DEBIT|RETURN)\b|\bPURCHASE\b/.test(rest)) {
+    return true;
+  }
+  return RULES.some((rule) => rule.category !== "transfers" && matchesRule(rest, rule));
+}
+
+// Text used for merchant rules: the PayPal routing word is dropped from a
+// PayPal card purchase so the merchant behind it decides the category.
+function merchantText(text: string): string {
+  return isPayPalMerchantPurchase(text) ? stripPayPal(text) : text;
+}
+
+function isPeerToPeer(text: string): boolean {
+  return /\b(PAYPAL|ZELLE|VENMO|CASH\s*APP|VISA\s+DIRECT)\b/.test(text);
+}
+
 function isNonIncomeMovement(text: string): boolean {
   // Fee rebates have no fees category, so they stay transfers (non-income,
   // non-spending). Debit-card returns are classified later so a known
@@ -611,30 +650,52 @@ function isNonIncomeMovement(text: string): boolean {
   if (isStudentLoan(text) || isCollegeSavings(text) || isFeeRebate(text)) {
     return true;
   }
-  return RULES.some(
-    (rule) => rule.category === "transfers" && matchesRule(text, rule),
-  );
+  return matchesRule(merchantText(text), TRANSFER_RULE);
 }
 
-function hasIncomeKeyword(text: string): boolean {
-  if (/\bDIVIDENDS?\b/.test(text)) return true;
-  if (/\bINTEREST\s+EARNED\b/.test(text)) return true;
-  // A generic "DIRECT DEPOSIT" prefix is not income. Payroll still matches
-  // through PAYROLL / INCPAYROLL below. Mobile and similar check deposits
-  // stay income so they are kept out of spending totals.
-  if (/\b(MOBILE|ATM|REMOTE|BRANCH|CHECK|CASH)\s+DEPOSITS?\b/.test(text)) {
-    return true;
-  }
-  // Word boundaries, with INCPAYROLL kept as a payroll form (ELSEVIER).
-  // "DIR DEP" and "DIR DEPOSIT" match; "DIR DEPT" does not.
-  if (
+// Payroll on any sign. A payroll deposit is income; a payroll tax, clawback,
+// adjustment, or reversal lowers income and is never spending. "GUSTO
+// PAYROLL XFER" is payroll, but a PayPal/Zelle/Venmo line is a transfer.
+// "DIR DEP" and "DIR DEPOSIT" match; "DIR DEPT" does not.
+function isPayrollLine(text: string): boolean {
+  return (
     /(^|[^A-Z0-9])(INCPAYROLL|PAYROLL|PAYCHECK|PAY\s+CHECK)([^A-Z0-9]|$)/.test(text) ||
     /(^|[^A-Z0-9])DIR\s+DEP(?:OSIT)?([^A-Z0-9]|$)/.test(text) ||
     /(^|[^A-Z0-9])SALARY([^A-Z0-9]|$)/.test(text)
-  ) {
-    return true;
-  }
-  return false;
+  );
+}
+
+function isPayrollIncome(text: string): boolean {
+  if (!isPayrollLine(text) || isPeerToPeer(text)) return false;
+  return !(isStudentLoan(text) || isCollegeSavings(text) || isFeeRebate(text));
+}
+
+// Dividends and interest earned are income only as money-in on a signed file.
+function hasInvestmentIncomeKeyword(text: string): boolean {
+  return /\bDIVIDENDS?\b/.test(text) || /\bINTEREST\s+EARNED\b/.test(text);
+}
+
+// Deposit wording that is neither payroll nor a refund. A generic "DIRECT
+// DEPOSIT" prefix is not income (payroll still matches above). On an
+// unsigned file these words alone mark money-in; on a signed file only a
+// credit counts, so an IRS or SSA payment out stays a charge.
+function hasDepositKeyword(text: string): boolean {
+  return (
+    /\bDIRECT\s+DEPOSITS?\b/.test(text) ||
+    /\bACH\s+CREDIT\b/.test(text) ||
+    /\bTAX\s+REF/.test(text) ||
+    /(^|[^A-Z0-9])(TREAS|IRS|SSA)([^A-Z0-9]|$)/.test(text) ||
+    /\b(MOBILE|ATM|REMOTE|BRANCH|CHECK|CASH)\s+DEPOSITS?\b/.test(text)
+  );
+}
+
+function isDepositCredit(text: string, amountCents: number, signedLedger: boolean): boolean {
+  if (!hasDepositKeyword(text)) return false;
+  return signedLedger ? amountCents > 0 : true;
+}
+
+function hasIncomeKeyword(text: string): boolean {
+  return isPayrollLine(text) || hasInvestmentIncomeKeyword(text);
 }
 
 function isIncomeCredit(
@@ -642,11 +703,33 @@ function isIncomeCredit(
   amountCents: number,
   signedLedger: boolean,
 ): boolean {
-  if (!hasIncomeKeyword(text)) return false;
-  // On a signed ledger, a payroll-tax debit or dividend reinvestment is
-  // not income. Unsigned statements store amounts as absolute values.
+  if (!hasInvestmentIncomeKeyword(text)) return false;
+  // On a signed ledger, a dividend reinvestment debit is not income.
+  // Unsigned statements store amounts as absolute values.
   if (signedLedger && amountCents <= 0) return false;
   return true;
+}
+
+// A payroll line that takes money back: tax, withholding, clawback,
+// reversal, or a RETURN. Used only when the file has no signs.
+function isPayrollDeduction(text: string): boolean {
+  return /\b(TAX|TAXES|WITHHOLDING|WITHHELD|CLAWBACK|REVERSAL|REVERSED|RETURN|DEDUCTION)\b/.test(text);
+}
+
+/**
+ * How much an income row adds to "how much did I make". A signed file uses
+ * the sign, so a payroll tax or adjustment debit lowers income. An unsigned
+ * file treats payroll tax, clawback, reversal, or RETURN lines as negative.
+ */
+export function incomeCentsFor(
+  narrative: string,
+  amountCents: number,
+  signedLedger: boolean,
+): number {
+  if (signedLedger) return amountCents;
+  const magnitude = Math.abs(amountCents);
+  const text = narrative.toUpperCase();
+  return isPayrollLine(text) && isPayrollDeduction(text) ? -magnitude : magnitude;
 }
 
 /** Description starts with "RETURN " but not RETURNED or RETURNS. */
@@ -661,6 +744,9 @@ export function isBareReturnPrefix(text: string): boolean {
 export function isNonSpendingNarrative(narrative: string): boolean {
   const text = narrative.toUpperCase();
   if (hasIncomeKeyword(text)) return true;
+  // Deposit wording (DIRECT DEPOSIT, ACH CREDIT, IRS/SSA TREAS, TAX REF,
+  // MOBILE DEPOSIT) is money-in, never a spending refund.
+  if (hasDepositKeyword(text)) return true;
   // 529 contributions, student-loan payments, fee rebates, and transfer
   // lines are categorized as transfers, so they are never refunds either.
   if (isNonIncomeMovement(text)) return true;
@@ -694,15 +780,21 @@ export function isReturnNarrative(
 // Transfers, 529 contributions, student-loan payments, and fee rebates stay
 // transfers on either sign and are never income. A debit-card return with no
 // merchant rule is left to the model (Other) so it still nets against spend.
-// An unmatched credit is not income.
+// Deposits are never spending and never go to the model: deposit wording, or
+// any other credit on a signed file that is not a refund and matches no
+// merchant rule, is "money-in".
 export function categorizeNarrative(
   narrative: string,
   amountCents: number,
   signedLedger: boolean,
+  creditMatchesPurchase = false,
 ): Category | "unknown" {
   const text = narrative.toUpperCase();
-  // Run before income keywords so "DIRECT DEPOSIT PAYPAL TRANSFER" is a
-  // transfer, not a paycheck.
+  // Payroll on either sign, before transfer words, so "GUSTO PAYROLL XFER"
+  // is income and "ACME PAYROLL TAX" lowers income instead of being spend.
+  if (isPayrollIncome(text)) return "income";
+  // Run before other income keywords so "DIRECT DEPOSIT PAYPAL TRANSFER" is
+  // a transfer, not a paycheck.
   if (isNonIncomeMovement(text)) return "transfers";
   // Income, credit-card and bank rules run before return netting, so a
   // "RETURN DIRECT DEPOSIT ... PAYROLL" or "DEBIT CARD RETURN PAYROLL CARD"
@@ -717,6 +809,30 @@ export function categorizeNarrative(
   // the institution is a transfer, not fuel and not income. Interest earned
   // at a bank already matched above.
   if (isFinancialInstitution(text)) return "transfers";
+  // DIRECT DEPOSIT ACME, ACH CREDIT, IRS TREAS TAX REF, SSA TREAS, MOBILE
+  // DEPOSIT: money in, never spending and never income.
+  if (isDepositCredit(text, amountCents, signedLedger)) return "money-in";
+  const merchant = merchantText(text);
+  const ruled = merchantCategory(merchant);
+  if (ruled) return ruled;
+  // No merchant rule matched. On a signed file a credit that is not a refund
+  // is a deposit, decided here so it never reaches the model. A refund (DEBIT
+  // CARD RETURN, a signed money-in bare RETURN, or a credit from a merchant
+  // the ledger shows as a purchase) falls through to Other/unknown so it can
+  // net against spend.
+  if (
+    signedLedger &&
+    amountCents > 0 &&
+    !creditMatchesPurchase &&
+    !isReturnNarrative(narrative, amountCents, signedLedger)
+  ) {
+    return "money-in";
+  }
+  if (!text.trim()) return "other";
+  return "unknown";
+}
+
+function merchantCategory(text: string): Category | null {
   if (isUtilityGas(text)) return "utilities/telecom";
   if (isBlankNarrative(text)) return "other";
   if (isEventTicket(text)) return "entertainment/events";
@@ -727,13 +843,31 @@ export function categorizeNarrative(
   if (isWaterSewerUtility(text)) return "utilities/telecom";
   if (isAutoInsurance(text)) return "insurance/auto";
   if (isHealthInsurance(text)) return "insurance/health";
-  const ruled = RULES.find((rule) => matchesRule(text, rule))?.category;
-  if (ruled) return ruled;
-  // No merchant rule matched. An unmatched credit is not income, and a
-  // refund (DEBIT CARD RETURN, or a signed money-in bare RETURN) falls through
-  // to Other/unknown so it can net against spend.
-  if (!text.trim()) return "other";
-  return "unknown";
+  return RULES.find((rule) => matchesRule(text, rule))?.category ?? null;
+}
+
+/**
+ * The model never decides income or deposits. A refund row keeps a spending
+ * category (Other when the model picks a non-spending one), and any other
+ * row the model calls income is kept out of income as money-in.
+ */
+export function clampModelCategory(
+  category: Category,
+  narrative: string,
+  amountCents: number,
+  signedLedger: boolean,
+  creditMatchesPurchase = false,
+): Category {
+  const nonSpending =
+    category === "income" ||
+    category === "transfers" ||
+    category === "credit-cards" ||
+    category === "money-in";
+  const refund =
+    creditMatchesPurchase || isReturnNarrative(narrative, amountCents, signedLedger, true);
+  if (nonSpending && refund) return "other";
+  if (category === "income") return "money-in";
+  return category;
 }
 
 export const CATEGORY_BATCH = 40;
@@ -744,7 +878,7 @@ export function buildCategoryMessages(merchants: string[]): ChatTurn[] {
     {
       role: "system",
       content: `You assign exactly one category to each bank merchant string.
-Categories: ${CATEGORIES.join(", ")}.
+Categories: ${MODEL_CATEGORIES.join(", ")}.
 dining = restaurants, cafes, coffee, fast food, food delivery. A Square restaurant such as Shake Shack is dining. Dollar stores, ticket vendors, and Square memberships are not dining.
 groceries = supermarkets and grocery stores. Lowe's Foods is groceries. Lowe's hardware is home.
 gas/auto = gas stations and auto services. Natural gas utilities are utilities/telecom.
@@ -755,7 +889,7 @@ utilities/telecom = power, county or municipal water and sewer, natural gas, pho
 healthcare = doctors, dental, OBGYN, clinics, and pharmacies such as Walgreens, CVS, and Rite Aid. Not an insurance premium.
 insurance/health = health-insurance premiums such as Blue Cross, BCBS, Aetna, or Cigna. Not a doctor and not a pharmacy.
 insurance/auto = car insurance such as GEICO, Progressive, PROG PREMIER INS, State Farm, Allstate, Nationwide, Erie, or USAA. Not a store, not a doctor, and not a credit-card autopay.
-transfers = PayPal, Zelle, Venmo, wires, account-to-account transfers, 529 contributions, student-loan payments, and fee rebates. A debit-card return or refund is not a transfer: it keeps that merchant's spending category, or other when the merchant is unknown.
+transfers = PayPal, Zelle, Venmo, wires, account-to-account transfers, 529 contributions, student-loan payments, and fee rebates. A debit-card return or refund is not a transfer: it keeps that merchant's spending category, or other when the merchant is unknown. A card purchase paid through PayPal (PAYPAL *MERCHANT) is that merchant's category, not a transfer.
 credit-cards = payments to a credit-card issuer such as Chase, Amex, Synchrony, or Capital One, including CAUTOPAY, AUTOPAY, EPAYMENT, and BANKPAYMENT. Not a card purchase at a store and not car insurance.
 income = paychecks, payroll direct deposits, dividends, and interest earned. Not a generic DIRECT DEPOSIT, a PayPal transfer, a 529 contribution, a student-loan payment, a refund, or a fee rebate.
 cloud/software = Amazon Web Services and other cloud hosts. Not Amazon retail.
@@ -786,7 +920,7 @@ export function parseCategoryAssignments(
     if (typeof record.merchant !== "string" || typeof record.category !== "string") {
       continue;
     }
-    if (!isCategory(record.category)) continue;
+    if (!isCategory(record.category) || record.category === "money-in") continue;
     const original = expectedByKey.get(record.merchant.trim().toUpperCase());
     if (!original) continue;
     out.set(original, record.category);

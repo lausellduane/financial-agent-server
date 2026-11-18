@@ -1,6 +1,6 @@
 export const TOP_MERCHANT_LIMIT = 5;
 
-const NON_SPENDING = new Set(["income", "transfers", "credit-cards"]);
+const NON_SPENDING = new Set(["income", "transfers", "credit-cards", "money-in"]);
 
 const MONTH_NAMES = [
   "Jan",
@@ -31,6 +31,7 @@ const CATEGORY_LABELS: Record<string, string> = {
   "cloud/software": "Cloud/software",
   home: "Home",
   "housing/mortgage": "Housing",
+  "money-in": "Other money in",
   other: "Other",
   unknown: "Other",
 };

@@ -13,7 +13,8 @@ function isNonSpendingCategory(category: Category | "unknown"): boolean {
   return (
     category === "income" ||
     category === "transfers" ||
-    category === "credit-cards"
+    category === "credit-cards" ||
+    category === "money-in"
   );
 }
 

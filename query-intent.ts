@@ -30,6 +30,8 @@ export type TxView = {
   amountCents: number;
   // Positive means money left the account. A refund on a signed statement is negative.
   spendCents: number;
+  // What an income row adds to income. A payroll tax or adjustment is negative.
+  incomeCents?: number;
   category: Category;
 };
 
@@ -85,6 +87,19 @@ const MERCHANT_TOKEN_SKIP = new Set([
 
 const COFFEE_NEEDLES = ["coffee", "starbucks", "dunkin", "dutch bros", "peet"];
 
+// "Other money in": deposits that are not income. "direct deposit" is income
+// wording, so only other deposit phrasing names this bucket.
+const MONEY_IN_PATTERN =
+  /\b(other money in|money in|money coming in|tax refunds?|(?<!direct\s)deposits?)\b/i;
+
+// "How much did I make / have I made" is income, with an optional time or
+// "so far" tail. "Made from dining" is not: see madeFromSpending.
+const MADE_PATTERN =
+  /\bhow much(?:\s+(?:did|do|have|had)\s+i)\s+(?:make|made)(?:\s+(?:so\s+far|to\s+date|overall|in\s+total|altogether|total)\b)?(?:\s+(?:in|for|during|this|last|from)\b|\s*$|\s*[?!.])/i;
+
+const INCOME_WORDS =
+  /\b(income|paycheck|paychecks|payroll|salary|direct deposit|wages?|earn(?:ed|ings?)?)\b/i;
+
 const CATEGORY_PATTERNS: { category: Category; pattern: RegExp }[] = [
   {
     category: "dining",
@@ -123,14 +138,14 @@ const CATEGORY_PATTERNS: { category: Category; pattern: RegExp }[] = [
       /\b(healthcare|health care|medical(?!\s+insurance)|doctor|dentist|pharmacy|hospital)\b/i,
   },
   { category: "transfers", pattern: /\b(transfers?|zelle|venmo|wire)\b/i },
+  { category: "money-in", pattern: MONEY_IN_PATTERN },
   {
     category: "credit-cards",
     pattern: /\b(credit\s*cards?|credit[- ]card payments?|card payments?)\b/i,
   },
   {
     category: "income",
-    pattern:
-      /\b(income|paycheck|paychecks|payroll|salary|direct deposit|wages?|earn(?:ed|ings?)?)\b|\bhow much(?:\s+(?:did|do|have|had)\s+i)\s+(?:make|made)(?:\s+(?:in|for|during|this|last|from)\b|\s*$|\s*[?!.])/i,
+    pattern: new RegExp(`${INCOME_WORDS.source}|${MADE_PATTERN.source}`, "i"),
   },
   {
     category: "cloud/software",
@@ -240,18 +255,33 @@ export function intentFromModel(raw: string, question: string): QueryIntent | nu
 }
 
 function asksHowMuchMade(topic: string): boolean {
-  // "How much did I make?" is income. A bare "make" or "make a payment" is not.
-  return /\bhow much(?:\s+(?:did|do|have|had)\s+i)\s+(?:make|made)(?:\s+(?:in|for|during|this|last|from)\b|\s*$|\s*[?!.])/i.test(
-    topic,
-  );
+  // "How much did I make?" and "How much have I made so far?" are income. A
+  // bare "make" or "make a payment" is not.
+  return MADE_PATTERN.test(topic);
+}
+
+// "How much did I make from dining?" names a spending category, so it is a
+// dining question, not income.
+function spendingCategoryNamed(topic: string): boolean {
+  return CATEGORY_PATTERNS.some(
+    (entry) => !isNonSpendingCategory(entry.category) && entry.pattern.test(topic),
+  ) || /\b(gas|gasoline|fuel)\b/i.test(topic);
 }
 
 function asksForIncome(topic: string): boolean {
-  return (
-    /\b(income|paycheck|paychecks|payroll|salary|direct deposit|wages?|earn(?:ed|ings?)?)\b/i.test(
-      topic,
-    ) || asksHowMuchMade(topic)
-  );
+  if (INCOME_WORDS.test(topic)) return true;
+  return asksHowMuchMade(topic) && !spendingCategoryNamed(topic);
+}
+
+function asksForMoneyIn(topic: string): boolean {
+  return MONEY_IN_PATTERN.test(topic);
+}
+
+// Drop an income category that came only from "how much did I make" when the
+// question names a spending category ("made from dining").
+function dropMadeFromSpending(categories: Category[], topic: string): Category[] {
+  if (!categories.includes("income") || asksForIncome(topic)) return categories;
+  return categories.filter((category) => category !== "income");
 }
 
 function asksForTransfers(topic: string): boolean {
@@ -263,7 +293,12 @@ function asksForCreditCards(topic: string): boolean {
 }
 
 function isNonSpendingCategory(category: Category): boolean {
-  return category === "income" || category === "transfers" || category === "credit-cards";
+  return (
+    category === "income" ||
+    category === "transfers" ||
+    category === "credit-cards" ||
+    category === "money-in"
+  );
 }
 
 export function applyQuestionGuards(
@@ -275,10 +310,12 @@ export function applyQuestionGuards(
   const income = asksForIncome(topic);
   const transfers = asksForTransfers(topic);
   const creditCards = asksForCreditCards(topic);
+  const moneyIn = asksForMoneyIn(topic);
   let categories = intent.categories.filter((category) => {
     if (category === "income") return income;
     if (category === "transfers") return transfers;
     if (category === "credit-cards") return creditCards;
+    if (category === "money-in") return moneyIn;
     return true;
   });
   if (allowExpand && income && !categories.includes("income")) {
@@ -289,6 +326,9 @@ export function applyQuestionGuards(
   }
   if (allowExpand && creditCards && !categories.includes("credit-cards")) {
     categories = [...categories, "credit-cards"];
+  }
+  if (allowExpand && moneyIn && !categories.includes("money-in")) {
+    categories = [...categories, "money-in"];
   }
   // A question that names categories uses those categories. "dining and bills"
   // keeps both. A follow-up that only names the new topic replaces the old
@@ -325,7 +365,11 @@ function nonSpendingOnly(intent: QueryIntent): boolean {
 }
 
 function lineCents(tx: TxView, intent: QueryIntent): number {
-  if (nonSpendingOnly(intent)) return Math.abs(tx.amountCents);
+  if (nonSpendingOnly(intent)) {
+    // Income is net: a payroll tax or adjustment lowers it.
+    if (tx.category === "income") return tx.incomeCents ?? Math.abs(tx.amountCents);
+    return Math.abs(tx.amountCents);
+  }
   return tx.spendCents;
 }
 
@@ -479,6 +523,10 @@ function pushCategory(categories: Category[], category: Category): void {
 }
 
 function categoriesNamedIn(topic: string): Category[] {
+  return dropMadeFromSpending(categoriesPatternNamed(topic), topic);
+}
+
+function categoriesPatternNamed(topic: string): Category[] {
   const named: Category[] = [];
   const carInsurance = /\b(?:car|auto|vehicle)\s+insurance\b/i.test(topic);
   for (const entry of CATEGORY_PATTERNS) {
@@ -670,6 +718,8 @@ export function interpretQuestion(
   if (!naturalGas && /\b(gas|gasoline|fuel)\b/i.test(asked)) {
     pushCategory(categories, "gas/auto");
   }
+  const namedCategories = [...dropMadeFromSpending(categories, asked)];
+  categories.splice(0, categories.length, ...namedCategories);
 
   const merchants: string[] = [];
   if (/\b(coffee|starbucks|dunkin)\b/i.test(asked)) merchants.push(...COFFEE_NEEDLES);
