@@ -33,9 +33,11 @@ import {
   type TxView,
 } from "./query-intent.js";
 import { buildMonthlySpend, type MonthSpend, type SpendEvent } from "./monthly-spend.js";
-import { spendCentsFor } from "./spend-cents.js";
+import { isReturnNarrative, spendCentsFor } from "./spend-cents.js";
 import {
+  bareReturnMatchesPurchase,
   cleanMerchantName,
+  purchaseMerchants,
   columnStats,
   dedupeKeys,
   formatSignedCents,
@@ -194,13 +196,28 @@ function ruledCategory(record: LedgerRecord, context: RuleContext): ReturnType<t
 // A merchant rule replaces a stored category that disagrees with it, including
 // one the model previously saved. "other" with no matching rule stays put.
 // The sign and columns come from each row's saved upload layout.
+// After a rules bump, a refund row that an older rule version stored as
+// income (a signed money-in RETURN or DEBIT CARD RETURN with no merchant rule)
+// is resolved again, so old ledgers pick up return netting.
 function recordsToResolve(records: LedgerRecord[], context: RuleContext, stale: boolean): LedgerRecord[] {
   return records.filter((record) => {
     if (!stale) return needsCategory(record.category);
     const ruled = ruledCategory(record, context);
     if (ruled !== "unknown") return ruled !== record.category;
+    if (record.category === "income" && isStoredIncomeRefund(record, context)) {
+      return true;
+    }
     return needsCategory(record.category);
   });
+}
+
+function isStoredIncomeRefund(record: LedgerRecord, context: RuleContext): boolean {
+  const { fields, signed } = context(record);
+  const narrative = rowNarrative(record.payload, fields.description);
+  const cents = parseAmountCents(
+    fields.amount ? record.payload[fields.amount] : undefined,
+  );
+  return isReturnNarrative(narrative, cents, signed);
 }
 
 async function classifyUnknown(narratives: string[]): Promise<Map<string, Category>> {
@@ -481,6 +498,24 @@ async function hydrate(
   };
 }
 
+// Purchase merchants across the whole ledger, so an unsigned bare RETURN can
+// net against a purchase uploaded in the same or an earlier file. Report and
+// query both use this, so they agree.
+function ledgerPurchases(records: LedgerRecord[], fieldsFor: RuleContext): Set<string> {
+  return purchaseMerchants(
+    records.map((record) => {
+      const { fields, signed } = fieldsFor(record);
+      return {
+        narrative: rowNarrative(record.payload, fields.description),
+        amountCents: parseAmountCents(
+          fields.amount ? record.payload[fields.amount] : undefined,
+        ),
+        signedLedger: signed,
+      };
+    }),
+  );
+}
+
 type OmittedRows = {
   zeroCount: number;
   unknownCount: number;
@@ -491,6 +526,7 @@ function toViews(records: LedgerRecord[]): { views: TxView[]; omitted: OmittedRo
   const omitted: OmittedRows = { zeroCount: 0, unknownCount: 0, unknownCents: 0 };
   if (!records.length) return { views: [], omitted };
   const fieldsFor = ruleContext(records);
+  const purchases = ledgerPurchases(records, fieldsFor);
   const views: TxView[] = [];
   for (const record of records) {
     const { fields, signed } = fieldsFor(record);
@@ -499,7 +535,18 @@ function toViews(records: LedgerRecord[]): { views: TxView[]; omitted: OmittedRo
     const amountCents = parseAmountCents(
       fields.amount ? record.payload[fields.amount] : undefined,
     );
-    const spendCents = signed ? -amountCents : Math.abs(amountCents);
+    const spendCategory: Category | "unknown" =
+      record.category && !needsCategory(record.category)
+        ? (record.category as Category)
+        : "unknown";
+    const purchaseMatch = bareReturnMatchesPurchase(narrative, signed, purchases);
+    const spendCents = spendCentsFor(
+      narrative,
+      amountCents,
+      signed,
+      spendCategory,
+      purchaseMatch,
+    );
     if (needsCategory(record.category)) {
       if (amountCents !== 0) {
         omitted.unknownCount += 1;
@@ -513,7 +560,7 @@ function toViews(records: LedgerRecord[]): { views: TxView[]; omitted: OmittedRo
       omitted.zeroCount += 1;
       continue;
     }
-    let merchant = cleanMerchantName(narrative);
+    let merchant = cleanMerchantName(narrative, amountCents, signed, purchaseMatch);
     // Only a placeholder description is renamed. "CHIPOTLE PENDING" keeps Chipotle.
     if (/^(pending|processing|process)$/i.test(rawDescription.trim())) {
       merchant = "Pending";
@@ -541,6 +588,7 @@ function toViews(records: LedgerRecord[]): { views: TxView[]; omitted: OmittedRo
 function toSpendEvents(records: LedgerRecord[]): SpendEvent[] {
   if (!records.length) return [];
   const fieldsFor = ruleContext(records);
+  const purchases = ledgerPurchases(records, fieldsFor);
   const events: SpendEvent[] = [];
   for (const record of records) {
     const { fields, signed } = fieldsFor(record);
@@ -554,13 +602,15 @@ function toSpendEvents(records: LedgerRecord[]): SpendEvent[] {
       record.category && !needsCategory(record.category)
         ? (record.category as Category)
         : "unknown";
+    const purchaseMatch = bareReturnMatchesPurchase(narrative, signed, purchases);
     const spendCents = spendCentsFor(
       narrative,
       amountCents,
       signed,
       spendCategory,
+      purchaseMatch,
     );
-    let merchant = cleanMerchantName(narrative);
+    let merchant = cleanMerchantName(narrative, amountCents, signed, purchaseMatch);
     if (/^(pending|processing|process)$/i.test(rawDescription.trim())) {
       merchant = "Pending";
     }
