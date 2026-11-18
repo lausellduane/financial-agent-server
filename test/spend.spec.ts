@@ -5,6 +5,9 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite
 import {
   CATEGORY_RULES_VERSION,
   categorizeNarrative,
+  clampModelCategory,
+  incomeCentsFor,
+  isPayPalMerchantPurchase,
   parseCategoryAssignments,
 } from "../categories.ts";
 import { LEDGER_MIGRATION, LEDGER_MIGRATIONS, type DateRange } from "../ledger.ts";
@@ -29,6 +32,7 @@ import {
   parseAmountCents,
   pickDisplayFields,
 } from "../statement.ts";
+import { spendCentsFor } from "../spend-cents.ts";
 
 const ISSUER = "https://testteam.cloudflareaccess.com";
 const AUD = "test-aud";
@@ -139,7 +143,12 @@ function view(description: string, amount: string, signed: boolean): TxView {
     merchant: cleanMerchantName(description, amountCents, signed),
     narrative: description.toUpperCase(),
     amountCents,
-    spendCents: signed ? -amountCents : Math.abs(amountCents),
+    spendCents: spendCentsFor(
+      description,
+      amountCents,
+      signed,
+      found === "unknown" ? "other" : found,
+    ),
     category: found === "unknown" ? "other" : found,
   };
 }
@@ -405,8 +414,9 @@ describe("categorizeNarrative", () => {
       "utilities/telecom",
     );
     expect(categorizeNarrative("SHELL OIL 12", -4000, true)).toBe("gas/auto");
-    expect(categorizeNarrative("MOBILE DEPOSIT", 250000, true)).toBe("income");
-    expect(categorizeNarrative("MOBILE DEPOSIT", 250000, false)).toBe("income");
+    // A check deposit is money in, not income (payroll, dividends, interest).
+    expect(categorizeNarrative("MOBILE DEPOSIT", 250000, true)).toBe("money-in");
+    expect(categorizeNarrative("MOBILE DEPOSIT", 250000, false)).toBe("money-in");
     expect(categorizeNarrative("SHELLFISH SHACK", -3000, true)).toBe("unknown");
     expect(categorizeNarrative("SONICARE TOOTHBRUSH", -8000, true)).toBe("unknown");
     expect(categorizeNarrative("SONIC DRIVE IN", -500, true)).toBe("dining");
@@ -415,9 +425,11 @@ describe("categorizeNarrative", () => {
     expect(categorizeNarrative("COSTCO GASOLINE", -2500, true)).toBe("gas/auto");
     expect(categorizeNarrative("COSTCO WHSE", -8000, true)).toBe("groceries");
     expect(categorizeNarrative("SHELL FEDERAL CREDIT UNION DEPOSIT", 250000, true)).toBe(
-      "income",
+      "transfers",
     );
-    expect(categorizeNarrative("SHELL FEDERAL CREDIT UNION", 250000, true)).toBe("income");
+    expect(categorizeNarrative("SHELL FEDERAL CREDIT UNION", 250000, true)).toBe(
+      "transfers",
+    );
     expect(categorizeNarrative("SHELL OIL", 500, true)).toBe("gas/auto");
     expect(categorizeNarrative("CITY GAS BILL", -8000, true)).toBe("utilities/telecom");
     expect(categorizeNarrative("PIEDMONT NATURAL GAS", -4000, true)).toBe(
@@ -426,11 +438,14 @@ describe("categorizeNarrative", () => {
     expect(categorizeNarrative("pending", -5000, true)).toBe("other");
   });
 
-  it("keeps a merchant refund in its spending category and treats unmatched credits as income", () => {
+  it("keeps a merchant refund in its spending category and does not treat unmatched credits as income", () => {
     expect(categorizeNarrative("CHIPOTLE", 3304, true)).toBe("dining");
     expect(categorizeNarrative("AMAZON.COM", 500, true)).toBe("shopping");
     expect(categorizeNarrative("CHIPOTLE", 3304, false)).toBe("dining");
-    expect(categorizeNarrative("MYSTERY CREDIT 42", 500, true)).toBe("income");
+    // An unmatched signed credit is a deposit, decided without the model.
+    expect(categorizeNarrative("MYSTERY CREDIT 42", 500, true)).toBe("money-in");
+    // ...unless the ledger shows a purchase from that merchant.
+    expect(categorizeNarrative("MYSTERY CREDIT 42", 500, true, true)).toBe("unknown");
     expect(categorizeNarrative("DEBIT CARD RETURN ZOOPLEX GADGETS 99", 2000, true)).toBe(
       "unknown",
     );
@@ -443,6 +458,93 @@ describe("categorizeNarrative", () => {
     );
     expect(categorizeNarrative("PAYPAL *JANE VISA DIRECT", 5000, true)).toBe(
       "transfers",
+    );
+  });
+
+  it("keeps payroll, dividends, and interest as income and excludes transfers and rebates", () => {
+    expect(
+      categorizeNarrative(
+        "DIVIDEND RECEIVED FIDELITY GOVERNMENT MONEY MARKET (SPAXX) (CASH)",
+        200,
+        true,
+      ),
+    ).toBe("income");
+    expect(
+      categorizeNarrative(
+        "INTEREST EARNED FDIC INSURED DEPOSIT AT JP MORGAN HS (QHZHQ) (CASH) HSA NOT COVERED BY SIPC",
+        2,
+        true,
+      ),
+    ).toBe("income");
+    expect(
+      categorizeNarrative(
+        "INTEREST EARNED FDIC INSURED DEPOSIT AT US BANK NOT (QUSBQ)",
+        1,
+        true,
+      ),
+    ).toBe("income");
+    expect(
+      categorizeNarrative(
+        "INTEREST EARNED FDIC INSURED DEPOSIT AT WELLS FARGO (QPIQQ) BK NOT COVERED BY SIPC",
+        216,
+        true,
+      ),
+    ).toBe("income");
+    expect(categorizeNarrative("DIRECT DEPOSIT ELSEVIER INCPAYROLL", 278511, true)).toBe(
+      "income",
+    );
+    expect(categorizeNarrative("DIRECT DEPOSIT PAYPAL TRANSFER", 50500, true)).toBe(
+      "transfers",
+    );
+    expect(categorizeNarrative("ADVS ED SERV PSTUDNTLOAN", 13833, true)).toBe(
+      "transfers",
+    );
+    // After #11, a debit-card return with no merchant rule is left to the
+    // model (Other) so it nets against spending. It is still never income.
+    expect(categorizeNarrative("DEBIT CARD RETURN GROK XAI PALO ALTO", 15, true)).toBe(
+      "unknown",
+    );
+    expect(categorizeNarrative("ADJUST FEE CHARGED ATM FEE REBATE", 300, true)).toBe(
+      "transfers",
+    );
+    expect(categorizeNarrative("TRANSFERRED FROM VS X84-544623-1", 18500, true)).toBe(
+      "transfers",
+    );
+    expect(categorizeNarrative("MY529 INVESTMENT", 10000, true)).toBe("transfers");
+    expect(categorizeNarrative("529 COLLEGE SAVINGS", 10000, true)).toBe("transfers");
+    expect(categorizeNarrative("529 PLAN CONTRIBUTION", 10000, true)).toBe("transfers");
+    // Not a 529 transfer: an unmatched signed credit is money in.
+    expect(categorizeNarrative("529", 10000, true)).toBe("money-in");
+    expect(categorizeNarrative("CHECK 529", 10000, true)).toBe("money-in");
+    expect(categorizeNarrative("CHECK 529", -10000, true)).toBe("unknown");
+    expect(categorizeNarrative("DEBIT CARD RETURN CHIPOTLE", 1000, true)).toBe("dining");
+    expect(categorizeNarrative("DEBIT CARD RETURN AMAZON.COM", 500, true)).toBe(
+      "shopping",
+    );
+    // After #11, a debit-card return with no merchant rule is left to the
+    // model (Other) so it nets against spending. It is still never income.
+    expect(categorizeNarrative("DEBIT CARD RETURN GROK XAI PALO ALTO", 15, true)).toBe(
+      "unknown",
+    );
+    expect(categorizeNarrative("ADJUST FEE CHARGED ATM FEE REBATE", 300, true)).toBe(
+      "transfers",
+    );
+    expect(categorizeNarrative("DIRECT DEPOSIT ACME", 50000, true)).toBe("money-in");
+    expect(categorizeNarrative("DIRECT DEPOSIT ACME INC", 50000, true)).toBe("money-in");
+    expect(categorizeNarrative("DIRECT DEPOSIT", 50000, true)).toBe("money-in");
+    expect(categorizeNarrative("DIR DEP ACME CORP", 50000, true)).toBe("income");
+    expect(categorizeNarrative("DIR DEPOSIT ACME CORP", 50000, true)).toBe("income");
+    expect(categorizeNarrative("ACME CORP PAYROLL", 50000, true)).toBe("income");
+    expect(categorizeNarrative("DIR DEPT STORE", 50000, true)).not.toBe("income");
+    expect(categorizeNarrative("DIR DEPT STORE", -5000, true)).toBe("unknown");
+    // A payroll debit lowers income; it is never spending.
+    expect(categorizeNarrative("DIRECT DEPOSIT ELSEVIER INCPAYROLL", -13833, true)).toBe(
+      "income",
+    );
+    expect(categorizeNarrative("DIVIDEND REINVESTMENT", -200, true)).not.toBe("income");
+    expect(categorizeNarrative("INTEREST CHARGE", -1500, true)).not.toBe("income");
+    expect(categorizeNarrative("DIRECT DEPOSIT ELSEVIER INCPAYROLL", -13833, false)).toBe(
+      "income",
     );
   });
 
@@ -499,6 +601,80 @@ describe("intent validation and aggregation", () => {
         "How much I spent eating out?",
       ),
     ).toBeNull();
+  });
+
+  it("maps an income question only to the income category", () => {
+    const interpreted = interpretQuestion("How much was income?", null, []);
+    expect(interpreted?.confident).toBe(true);
+    expect(interpreted?.intent.categories).toEqual(["income"]);
+    expect(interpreted?.intent.op).toBe("sum");
+    const earned = interpretQuestion("How much did I earn?", null, []);
+    expect(earned?.confident).toBe(true);
+    expect(earned?.intent.categories).toEqual(["income"]);
+    const earning = interpretQuestion("What was my earning?", null, []);
+    expect(earning?.confident).toBe(true);
+    expect(earning?.intent.categories).toEqual(["income"]);
+    const made = interpretQuestion("How much did I make?", null, []);
+    expect(made?.confident).toBe(true);
+    expect(made?.intent.categories).toEqual(["income"]);
+    const madeIn = interpretQuestion("How much did I make in 2026?", null, []);
+    expect(madeIn?.intent.categories).toEqual(["income"]);
+    const payment = interpretQuestion("How much did I make a payment?", null, []);
+    expect(payment?.intent.categories ?? []).not.toContain("income");
+    const learning = interpretQuestion("How much did I spend on learning?", null, []);
+    expect(learning?.intent.categories ?? []).not.toContain("income");
+    const both = interpretQuestion("How much was income and transfers?", null, []);
+    expect(both?.confident).toBe(true);
+    expect(both?.intent.categories).toEqual(["transfers", "income"]);
+    const fromModel = intentFromModel(
+      JSON.stringify({
+        categories: ["income", "transfers", "dining"],
+        merchants: [],
+        excludeMerchants: [],
+        dateFrom: null,
+        dateTo: null,
+        op: "sum",
+      }),
+      "How much was income?",
+    );
+    expect(fromModel?.categories).toEqual(["income"]);
+    const bothFromModel = intentFromModel(
+      JSON.stringify({
+        categories: ["income"],
+        merchants: [],
+        excludeMerchants: [],
+        dateFrom: null,
+        dateTo: null,
+        op: "sum",
+      }),
+      "How much was income and transfers?",
+    );
+    expect(bothFromModel?.categories).toEqual(["transfers", "income"]);
+  });
+
+  it("nets a debit-card return on unsigned and signed-negative amounts", () => {
+    const dining = interpretQuestion("How much I spent eating out?", null, []);
+    expect(dining?.intent.categories).toEqual(["dining"]);
+    const unsigned = [
+      view("CHIPOTLE", "33.04", false),
+      view("DEBIT CARD RETURN CHIPOTLE", "10.00", false),
+    ];
+    const unsignedAnswer = formatAnswer(
+      selectTransactions(unsigned, dining!.intent),
+      dining!.intent,
+    );
+    expect(unsignedAnswer).toContain("Total: $23.04");
+    expect(unsignedAnswer).not.toContain("$43.04");
+    const signedNeg = [
+      view("CHIPOTLE", "-33.04", true),
+      view("DEBIT CARD RETURN CHIPOTLE", "-10.00", true),
+    ];
+    const signedAnswer = formatAnswer(
+      selectTransactions(signedNeg, dining!.intent),
+      dining!.intent,
+    );
+    expect(signedAnswer).toContain("Total: $23.04");
+    expect(signedAnswer).not.toContain("$43.04");
   });
 
   it("strips income the model added to a spending question", () => {
@@ -1053,6 +1229,58 @@ describe("ledger migration", () => {
     expect((await ada.loadIntent()).intent).toBeNull();
   });
 });
+
+// The model may only categorize, and it calls every merchant it is sent
+// Other. Any other model call (such as a question's intent) fails. Returns the
+// merchant names sent to it, so a test can check that only the GROK
+// debit-card return (no merchant rule) reached the model.
+function categoryModelSaysOther(): string[] {
+  const sent: string[] = [];
+  vi.spyOn(env.AI, "run").mockImplementation(async (_model, input) => {
+    const messages = (input as { messages?: { content?: string }[] }).messages ?? [];
+    const blob = messages.map((message) => message.content ?? "").join("\n");
+    if (!blob.includes("You assign exactly one category")) {
+      throw new Error("no live intent model in tests");
+    }
+    const names = (messages[1]?.content ?? "")
+      .split("\n")
+      .slice(1)
+      .map((line) => line.replace(/^\d+\.\s/, ""));
+    sent.push(...names);
+    return {
+      response: JSON.stringify({
+        items: names.map((merchant) => ({ merchant, category: "other" })),
+      }),
+    };
+  });
+  return sent;
+}
+
+function incomeStatementRows(): Array<[string, string, string]> {
+  return [
+    ["2026-10-01", "DIVIDEND RECEIVED FIDELITY GOVERNMENT MONEY MARKET (SPAXX) (CASH)", "2.00"],
+    [
+      "2026-10-02",
+      "INTEREST EARNED FDIC INSURED DEPOSIT AT JP MORGAN HS (QHZHQ) (CASH) HSA NOT COVERED BY SIPC",
+      "0.02",
+    ],
+    ["2026-10-03", "INTEREST EARNED FDIC INSURED DEPOSIT AT US BANK NOT (QUSBQ)", "0.01"],
+    [
+      "2026-10-04",
+      "INTEREST EARNED FDIC INSURED DEPOSIT AT WELLS FARGO (QPIQQ) BK NOT COVERED BY SIPC",
+      "2.16",
+    ],
+    ["2026-10-05", "DIRECT DEPOSIT PAYPAL TRANSFER", "505.00"],
+    ["2026-10-06", "DIRECT DEPOSIT ELSEVIER INCPAYROLL", "2785.11"],
+    ["2026-10-07", "ADVS ED SERV PSTUDNTLOAN", "138.33"],
+    ["2026-10-08", "DEBIT CARD RETURN GROK XAI PALO ALTO", "0.15"],
+    ["2026-10-09", "ADJUST FEE CHARGED ATM FEE REBATE", "3.00"],
+    ["2026-10-10", "DIRECT DEPOSIT ELSEVIER INCPAYROLL", "2785.12"],
+    ["2026-10-11", "TRANSFERRED FROM VS X84-544623-1", "185.00"],
+    ["2026-10-12", "MY529 INVESTMENT", "100.00"],
+    ["2026-10-13", "DIRECT DEPOSIT ELSEVIER INCPAYROLL", "2785.13"],
+  ];
+}
 
 function csvOf(rows: Array<[string, string, string]>): string {
   return ["Date,Description,Amount", ...rows.map((row) => row.join(","))].join("\n");
@@ -2308,7 +2536,7 @@ describe("/api spending queries", () => {
     expect(cards.answer).not.toContain("ATT");
   });
 
-  it("keeps a signed credit as income and rechecks a stale ledger once", async () => {
+  it("rechecks a stale ledger so payroll stays income and a PayPal transfer does not", async () => {
     const email = "signed-credit@example.com";
     vi.spyOn(env.AI, "run").mockImplementation(async () => {
       throw new Error("rules cover the credit");
@@ -2322,25 +2550,52 @@ describe("/api spending queries", () => {
           category: "dining",
         },
         {
-          payload: { Date: "2026-10-02", Description: "MYSTERY CREDIT 42", Amount: "5.00" },
+          payload: {
+            Date: "2026-10-02",
+            Description: "DIRECT DEPOSIT ELSEVIER INCPAYROLL",
+            Amount: "2785.11",
+          },
           category: "dining",
         },
+        {
+          payload: {
+            Date: "2026-10-03",
+            Description: "DIRECT DEPOSIT PAYPAL TRANSFER",
+            Amount: "505.00",
+          },
+          category: "income",
+        },
       ],
-      { startDate: "2026-10-01", endDate: "2026-10-02" },
+      { startDate: "2026-10-01", endDate: "2026-10-03" },
     );
     const spent = await query(email, "How much did I spend?");
     expect(spent.answer).toContain("CHIPOTLE");
     expect(spent.answer).toContain("Total: $10.00");
-    expect(spent.answer).not.toContain("5.00");
+    expect(spent.answer).not.toContain("2785.11");
+    expect(spent.answer).not.toContain("505.00");
     const once = await stub.load();
     expect(
-      once.records.find((row) => row.payload.Description === "MYSTERY CREDIT 42")?.category,
+      once.records.find(
+        (row) => row.payload.Description === "DIRECT DEPOSIT ELSEVIER INCPAYROLL",
+      )?.category,
     ).toBe("income");
+    expect(
+      once.records.find(
+        (row) => row.payload.Description === "DIRECT DEPOSIT PAYPAL TRANSFER",
+      )?.category,
+    ).toBe("transfers");
+    const income = await query(email, "How much was income?");
+    expect(income.answer).toContain("2785.11");
+    expect(income.answer).toContain("Total: $2785.11");
+    expect(income.answer).not.toContain("PAYPAL");
+    expect(income.answer).not.toContain("505.00");
     const again = await query(email, "How much did I spend?");
     expect(again.answer).toContain("Total: $10.00");
     const twice = await stub.load();
     expect(
-      twice.records.find((row) => row.payload.Description === "MYSTERY CREDIT 42")?.category,
+      twice.records.find(
+        (row) => row.payload.Description === "DIRECT DEPOSIT ELSEVIER INCPAYROLL",
+      )?.category,
     ).toBe("income");
     const stamp = await runInDurableObject(stub, async (_instance, state) => {
       return state.storage.sql
@@ -2350,6 +2605,205 @@ describe("/api spending queries", () => {
         .toArray()[0]?.value;
     });
     expect(stamp).toBe(CATEGORY_RULES_VERSION);
+  });
+
+  it("returns only payroll, dividends, and interest for an income question", async () => {
+    const email = "income-category@example.com";
+    const sent = categoryModelSaysOther();
+    const uploaded = await upload(email, csvOf(incomeStatementRows()));
+    expect(uploaded.status).toBe(200);
+    expect(((await uploaded.json()) as { uncategorized?: number }).uncategorized).toBe(0);
+    expect(sent).toEqual(["DEBIT CARD RETURN GROK XAI PALO ALTO"]);
+
+    const body = await query(email, "How much was income?");
+    expect(body.answer).toContain("Total: $8359.55");
+    expect(body.answer).toContain("2785.11");
+    expect(body.answer).toContain("2785.12");
+    expect(body.answer).toContain("2785.13");
+    expect(body.answer).toContain("$2.00");
+    expect(body.answer).toContain("$0.02");
+    expect(body.answer).toContain("$0.01");
+    expect(body.answer).toContain("$2.16");
+    expect(body.answer).not.toContain("PAYPAL");
+    expect(body.answer).not.toContain("505.00");
+    expect(body.answer).not.toContain("STUDNTLOAN");
+    expect(body.answer).not.toContain("138.33");
+    expect(body.answer).not.toContain("DEBIT CARD RETURN");
+    expect(body.answer).not.toContain("0.15");
+    expect(body.answer).not.toContain("FEE REBATE");
+    expect(body.answer).not.toContain("$3.00");
+    expect(body.answer).not.toContain("TRANSFERRED FROM");
+    expect(body.answer).not.toContain("185.00");
+    expect(body.answer).not.toContain("MY529");
+    expect(body.answer).not.toContain("100.00");
+  });
+
+  it("rechecks stale stored income that the new rules no longer call income", async () => {
+    const email = "stale-bare-deposit@example.com";
+    vi.spyOn(env.AI, "run").mockImplementation(async () => {
+      throw new Error("model should only run after rules");
+    });
+    const stub = env.LEDGER.get(env.LEDGER.idFromName(ledgerName(email)));
+    await seed(
+      stub,
+      [
+        {
+          payload: { Date: "2026-10-01", Description: "CHIPOTLE", Amount: "-10.00" },
+          category: "dining",
+        },
+        {
+          payload: {
+            Date: "2026-10-02",
+            Description: "DIRECT DEPOSIT ACME",
+            Amount: "500.00",
+          },
+          category: "income",
+        },
+        {
+          payload: {
+            Date: "2026-10-03",
+            Description: "MYSTERY CREDIT 42",
+            Amount: "5.00",
+          },
+          category: "income",
+        },
+      ],
+      { startDate: "2026-10-01", endDate: "2026-10-03" },
+    );
+    // Drop the rules stamp, as a ledger saved by an older deploy would be.
+    await restampCategories(stub, (description) =>
+      description === "CHIPOTLE" ? "dining" : "income",
+    );
+    const income = await query(email, "How much was income?");
+    expect(income.answer).toMatch(/No matching charges/i);
+    expect(income.answer).not.toContain("ACME");
+    expect(income.answer).not.toContain("MYSTERY");
+    expect(income.answer).not.toContain("DIRECT DEPOSIT ACME:");
+    const once = await stub.load();
+    expect(
+      once.records.find((row) => row.payload.Description === "DIRECT DEPOSIT ACME")
+        ?.category,
+    ).not.toBe("income");
+    expect(
+      once.records.find((row) => row.payload.Description === "MYSTERY CREDIT 42")
+        ?.category,
+    ).not.toBe("income");
+    const spent = await query(email, "How much did I spend?");
+    expect(spent.answer).toContain("CHIPOTLE");
+    expect(spent.answer).toContain("Total: $10.00");
+    expect(spent.answer).not.toContain("500.00");
+  });
+
+  it("nets a debit-card return against dining and keeps income at $8359.55", async () => {
+    const email = "debit-return@example.com";
+    const sent = categoryModelSaysOther();
+    const rows = [
+      ["2026-09-30", "CHIPOTLE", "-33.04"],
+      ["2026-09-30", "DEBIT CARD RETURN CHIPOTLE", "10.00"],
+      ...incomeStatementRows(),
+    ];
+    const uploaded = await upload(email, csvOf(rows));
+    expect(uploaded.status).toBe(200);
+    expect(((await uploaded.json()) as { uncategorized?: number }).uncategorized).toBe(0);
+    expect(sent).toEqual(["DEBIT CARD RETURN GROK XAI PALO ALTO"]);
+
+    const dining = await query(email, "How much I spent eating out?");
+    expect(dining.answer).toContain("CHIPOTLE");
+    expect(dining.answer).toContain("Total: $23.04");
+    expect(dining.answer).toContain("-$10.00");
+
+    const income = await query(email, "How much was income?");
+    expect(income.answer).toContain("Total: $8359.55");
+    expect(income.answer).not.toContain("CHIPOTLE");
+    expect(income.answer).not.toContain("PAYPAL");
+    expect(income.answer).not.toContain("GROK");
+    expect(income.answer).not.toContain("FEE REBATE");
+    expect(income.answer).not.toContain("MY529");
+    expect(income.answer).not.toContain("STUDNTLOAN");
+
+    const made = await query(email, "How much did I make?");
+    expect(made.answer).toContain("Total: $8359.55");
+    expect(made.answer).not.toContain("PAYPAL");
+    expect(made.answer).not.toContain("CHIPOTLE");
+    const earned = await query(email, "How much did I earn?");
+    expect(earned.answer).toContain("Total: $8359.55");
+    expect(earned.answer).not.toContain("PAYPAL");
+
+    const both = await query(email, "How much was income and transfers?");
+    expect(both.answer).toContain("2785.11");
+    expect(both.answer).toContain("PAYPAL");
+    expect(both.answer).toContain("MY529");
+    expect(both.answer).toContain("STUDNTLOAN");
+    // The GROK debit-card return ($0.15) is Other now, not a transfer.
+    expect(both.answer).toContain("Total: $9290.88");
+    expect(both.answer).not.toContain("CHIPOTLE");
+  });
+
+  it("nets an unsigned debit-card return against dining", async () => {
+    const email = "unsigned-debit-return@example.com";
+    categoryModelSaysOther();
+    const uploaded = await upload(
+      email,
+      csvOf([
+        ["2026-09-30", "CHIPOTLE", "33.04"],
+        ["2026-09-30", "DEBIT CARD RETURN CHIPOTLE", "10.00"],
+        ...incomeStatementRows(),
+      ]),
+    );
+    expect(uploaded.status).toBe(200);
+    expect(((await uploaded.json()) as { uncategorized?: number }).uncategorized).toBe(0);
+    const dining = await query(email, "How much I spent eating out?");
+    expect(dining.answer).toContain("Total: $23.04");
+    expect(dining.answer).not.toContain("$43.04");
+    const income = await query(email, "How much was income?");
+    expect(income.answer).toContain("Total: $8359.55");
+    expect(income.answer).not.toContain("CHIPOTLE");
+  });
+
+  it("nets a signed-negative debit-card return against dining", async () => {
+    const email = "signed-neg-return@example.com";
+    categoryModelSaysOther();
+    const uploaded = await upload(
+      email,
+      csvOf([
+        ["2026-09-30", "CHIPOTLE", "-33.04"],
+        ["2026-09-30", "DEBIT CARD RETURN CHIPOTLE", "-10.00"],
+        ...incomeStatementRows(),
+      ]),
+    );
+    expect(uploaded.status).toBe(200);
+    expect(((await uploaded.json()) as { uncategorized?: number }).uncategorized).toBe(0);
+    const dining = await query(email, "How much I spent eating out?");
+    expect(dining.answer).toContain("Total: $23.04");
+    expect(dining.answer).not.toContain("$43.04");
+    const income = await query(email, "How much was income?");
+    expect(income.answer).toContain("Total: $8359.55");
+    expect(income.answer).not.toContain("CHIPOTLE");
+  });
+
+  it("keeps a bare DIRECT DEPOSIT out of the model, income, and spending", async () => {
+    const email = "bare-deposit@example.com";
+    const run = vi.spyOn(env.AI, "run").mockImplementation(async () => {
+      throw new Error("rules cover every row here");
+    });
+    const uploaded = await upload(
+      email,
+      csvOf([
+        ["2026-10-01", "CHIPOTLE", "-10.00"],
+        ["2026-10-02", "DIRECT DEPOSIT ACME", "500.00"],
+        ["2026-10-03", "DIR DEP ACME CORP", "900.00"],
+      ]),
+    );
+    expect(uploaded.status).toBe(200);
+    expect(((await uploaded.json()) as { uncategorized?: number }).uncategorized).toBe(0);
+    expect(run).not.toHaveBeenCalled();
+    const spent = await query(email, "What did I spend in total?");
+    expect(spent.answer).toContain("Total: $10.00");
+    expect(spent.answer).not.toContain("DIRECT DEPOSIT");
+    const income = await query(email, "How much was income?");
+    expect(income.answer).toContain("Total: $900.00");
+    expect(income.answer).toContain("DIR DEP");
+    expect(income.answer).not.toContain("DIRECT DEPOSIT ACME");
   });
 
   // Skipped: workerd refuses a body read across requests, and the refused
@@ -2489,7 +2943,7 @@ describe("RETURN netting", () => {
       "credit-cards",
     );
     expect(categorizeNarrative("RETURN CHIPOTLE", 1000, false)).toBe("dining");
-    expect(CATEGORY_RULES_VERSION).toBe("13");
+    expect(CATEGORY_RULES_VERSION).toBe("15");
   });
 
   it("keeps sign-aware RETURN handling ahead of brand aliases", () => {
@@ -2584,5 +3038,225 @@ describe("RETURN netting", () => {
       loaded.records.find((row) => row.payload.Description === name)?.category;
     expect(byName("RETURN ZOOPLEX GADGETS 99")).toBe("other");
     expect(byName("RETURN DIRECT DEPOSIT ACME PAYROLL")).toBe("income");
+  });
+});
+
+// QA repros for PR #9 (/workspace/qa-pr9): deposits, PayPal purchases, payroll.
+describe("QA PR #9: deposits, PayPal purchases, payroll", () => {
+  function categoryStub(fallback: string, seen: string[]) {
+    return vi.spyOn(env.AI, "run").mockImplementation(async (_model, input) => {
+      const messages = (input as { messages?: { content?: string }[] }).messages ?? [];
+      const blob = messages.map((message) => message.content ?? "").join("\n");
+      if (!blob.includes("You assign exactly one category")) {
+        throw new Error("no live intent model in tests");
+      }
+      const names = (messages[1]?.content ?? "")
+        .split("\n")
+        .slice(1)
+        .map((line) => line.replace(/^\d+\.\s/, ""));
+      seen.push(...names);
+      return {
+        response: JSON.stringify({
+          items: names.map((merchant) => ({ merchant, category: fallback })),
+        }),
+      };
+    });
+  }
+
+  it("classifies deposits as money-in without the model, on either sign convention", () => {
+    for (const [name, cents] of [
+      ["DIRECT DEPOSIT ACME", 150000],
+      ["IRS TREAS 310 TAX REF", 50000],
+      ["SSA TREAS 310 XXSOC SEC", 120000],
+      ["ACH CREDIT ACME INC", 40000],
+      ["TAX REFUND STATE OF NC", 12000],
+      ["MOBILE DEPOSIT", 3000],
+    ] as const) {
+      expect(categorizeNarrative(name, cents, true)).toBe("money-in");
+      expect(categorizeNarrative(name, cents, false)).toBe("money-in");
+    }
+    // Any other signed credit that is not a refund is money in too.
+    expect(categorizeNarrative("MYSTERY CREDIT 42", 500, true)).toBe("money-in");
+    // An IRS payment out stays a charge for the model to place.
+    expect(categorizeNarrative("IRS USATAXPYMT", -50000, true)).toBe("unknown");
+    // Recognized payroll stays income; bank lines stay transfers.
+    expect(categorizeNarrative("ACME PAYROLL", 90000, true)).toBe("income");
+    expect(categorizeNarrative("ACME CORP DIR DEP", 100000, false)).toBe("income");
+    expect(categorizeNarrative("SHELL FEDERAL CREDIT UNION", 5000, true)).toBe("transfers");
+    // Refunds still net against spending.
+    expect(categorizeNarrative("DEBIT CARD RETURN CHIPOTLE", 1000, true)).toBe("dining");
+    expect(categorizeNarrative("DEBIT CARD RETURN GROK XAI PALO ALTO", 15, true)).toBe(
+      "unknown",
+    );
+  });
+
+  it("keeps PayPal card purchases as merchant spending and P2P PayPal as transfers", () => {
+    expect(categorizeNarrative("DEBIT CARD PURCHASE PAYPAL *ETSY SELLER", -4000, true)).toBe(
+      "shopping",
+    );
+    expect(categorizeNarrative("DEBIT CARD RETURN PAYPAL *ETSY SELLER", 1500, true)).toBe(
+      "shopping",
+    );
+    expect(categorizeNarrative("DEBIT CARD PURCHASE PAYPAL *ETSY SELLER", 4000, false)).toBe(
+      "shopping",
+    );
+    expect(isPayPalMerchantPurchase("DEBIT CARD PURCHASE PAYPAL *ZOOPLEX SHOP")).toBe(true);
+    expect(categorizeNarrative("DEBIT CARD PURCHASE PAYPAL *ZOOPLEX SHOP", -2000, true)).toBe(
+      "unknown",
+    );
+    expect(categorizeNarrative("DIRECT DEPOSIT PAYPAL TRANSFER", 50500, true)).toBe(
+      "transfers",
+    );
+    expect(categorizeNarrative("PAYPAL *JANE VISA DIRECT", -10000, true)).toBe("transfers");
+    expect(categorizeNarrative("PAYPAL INST XFER", -10000, true)).toBe("transfers");
+    expect(categorizeNarrative("DEBIT CARD RETURN PAYPAL TRANSFER", 1500, false)).toBe(
+      "transfers",
+    );
+    expect(isPayPalMerchantPurchase("PAYPAL *JANE VISA DIRECT")).toBe(false);
+  });
+
+  it("nets PayPal-routed card purchases and their returns", () => {
+    expect(spendCentsFor("DEBIT CARD PURCHASE PAYPAL *ETSY SELLER", -4000, true, "shopping")).toBe(
+      4000,
+    );
+    expect(spendCentsFor("DEBIT CARD RETURN PAYPAL *ETSY SELLER", 1500, true, "shopping")).toBe(
+      -1500,
+    );
+    expect(spendCentsFor("DEBIT CARD RETURN PAYPAL *ETSY SELLER", 1500, false, "shopping")).toBe(
+      -1500,
+    );
+  });
+
+  it("makes payroll adjustments and taxes lower income, and GUSTO PAYROLL XFER income", () => {
+    expect(categorizeNarrative("RETURN ACME PAYROLL ADJ", -15000, true)).toBe("income");
+    expect(categorizeNarrative("ACME PAYROLL TAX", -9000, true)).toBe("income");
+    expect(categorizeNarrative("GUSTO PAYROLL XFER", 80000, true)).toBe("income");
+    expect(categorizeNarrative("GUSTO PAYROLL XFER", 80000, false)).toBe("income");
+    expect(incomeCentsFor("RETURN ACME PAYROLL ADJ", -15000, true)).toBe(-15000);
+    expect(incomeCentsFor("ACME PAYROLL TAX", -9000, true)).toBe(-9000);
+    expect(incomeCentsFor("ACME PAYROLL TAX", 9000, false)).toBe(-9000);
+    expect(incomeCentsFor("RETURN ACME PAYROLL ADJ", 15000, false)).toBe(-15000);
+    expect(incomeCentsFor("ACME PAYROLL", 90000, false)).toBe(90000);
+    expect(incomeCentsFor("DIVIDEND RECEIVED", 200, false)).toBe(200);
+  });
+
+  it("never lets the model make a row income or a refund non-spending", () => {
+    expect(clampModelCategory("income", "ACME CORP", 100000, false)).toBe("money-in");
+    expect(clampModelCategory("income", "DEBIT CARD RETURN ZOOPLEX", 2000, false)).toBe("other");
+    expect(clampModelCategory("transfers", "DEBIT CARD RETURN ZOOPLEX", 2000, true)).toBe(
+      "other",
+    );
+    expect(clampModelCategory("income", "RETURNS INC STORE 22", 1500, true, true)).toBe("other");
+    expect(clampModelCategory("dining", "ZOOPLEX SNACKBAR", -500, true)).toBe("dining");
+    expect(
+      parseCategoryAssignments('{"items":[{"merchant":"ACME CORP","category":"money-in"}]}', [
+        "ACME CORP",
+      ]).size,
+    ).toBe(0);
+  });
+
+  it("reads 'made so far' as income and 'made from dining' as dining", () => {
+    const sofar = interpretQuestion("How much have I made so far?", null, []);
+    expect(sofar?.confident).toBe(true);
+    expect(sofar?.intent.categories).toEqual(["income"]);
+    const dining = interpretQuestion("How much did I make from dining?", null, []);
+    expect(dining?.confident).toBe(true);
+    expect(dining?.intent.categories).toEqual(["dining"]);
+    const made = interpretQuestion("How much did I make?", null, []);
+    expect(made?.intent.categories).toEqual(["income"]);
+  });
+
+  it("sums income net of a payroll tax", () => {
+    const intent = validateIntent({ op: "sum", categories: ["income"] }) as QueryIntent;
+    const rows: TxView[] = [
+      {
+        date: "2026-10-03",
+        merchant: "ACME PAYROLL",
+        narrative: "ACME PAYROLL",
+        amountCents: 90000,
+        spendCents: -90000,
+        incomeCents: 90000,
+        category: "income",
+      },
+      {
+        date: "2026-10-12",
+        merchant: "ACME PAYROLL TAX",
+        narrative: "ACME PAYROLL TAX",
+        amountCents: -9000,
+        spendCents: 9000,
+        incomeCents: -9000,
+        category: "income",
+      },
+    ];
+    expect(totalCents(rows, intent)).toBe(81000);
+    expect(formatAnswer(rows, intent)).toContain("ACME PAYROLL TAX: -$90.00");
+  });
+
+  it("keeps signed deposits out of the model, spending, and income over the API", async () => {
+    const email = "qa-pr9-deposits@example.com";
+    const seen: string[] = [];
+    categoryStub("other", seen);
+    const uploaded = await upload(
+      email,
+      csvOf([
+        ["2026-10-01", "DIRECT DEPOSIT ACME", "1500.00"],
+        ["2026-10-02", "ACME CORP DIR DEP", "1000.00"],
+        ["2026-10-04", "GUSTO PAYROLL XFER", "800.00"],
+        ["2026-10-09", "IRS TREAS 310 TAX REF", "500.00"],
+        ["2026-10-10", "SSA TREAS 310 XXSOC SEC", "1200.00"],
+        ["2026-10-11", "ACH CREDIT ACME INC", "400.00"],
+        ["2026-10-12", "ACME PAYROLL TAX", "-90.00"],
+        ["2026-10-13", "DEBIT CARD PURCHASE PAYPAL *ETSY SELLER", "-40.00"],
+        ["2026-10-14", "DEBIT CARD RETURN PAYPAL *ETSY SELLER", "15.00"],
+        ["2026-10-15", "COSTCO WHSE #123", "-40.00"],
+      ]),
+    );
+    expect(uploaded.status).toBe(200);
+    expect(seen).toEqual([]);
+    const spent = await query(email, "What did I spend in total?");
+    expect(spent.answer).toContain("Total: $65.00");
+    expect(spent.answer).not.toMatch(/DEPOSIT|IRS|SSA|ACH CREDIT|PAYROLL/);
+    const income = await query(email, "How much have I made so far?");
+    expect(income.answer).toContain("ACME PAYROLL TAX: -$90.00");
+    expect(income.answer).toContain("Total: $1710.00");
+    expect(income.answer).not.toMatch(/DIRECT DEPOSIT ACME|IRS|SSA|ACH CREDIT/);
+    const transfers = await query(email, "How much did I transfer?");
+    expect(transfers.answer).not.toMatch(/ETSY|GUSTO/);
+  });
+
+  it("re-resolves a stale ledger so stored deposit labels become money-in", async () => {
+    const email = "qa-pr9-stale@example.com";
+    const seen: string[] = [];
+    categoryStub("other", seen);
+    const stub = env.LEDGER.get(env.LEDGER.idFromName(ledgerName(email)));
+    await seed(
+      stub,
+      [
+        {
+          payload: { Date: "2026-10-01", Description: "DIRECT DEPOSIT ACME", Amount: "1500.00" },
+          category: "other",
+        },
+        {
+          payload: { Date: "2026-10-02", Description: "IRS TREAS 310 TAX REF", Amount: "500.00" },
+          category: "other",
+        },
+        {
+          payload: { Date: "2026-10-03", Description: "COSTCO WHSE #123", Amount: "-40.00" },
+          category: "groceries",
+        },
+      ],
+      { startDate: "2026-10-01", endDate: "2026-10-03" },
+    );
+    await restampCategories(stub, (description) =>
+      description.startsWith("COSTCO") ? "groceries" : "other",
+    );
+    const spent = await query(email, "What did I spend in total?");
+    expect(spent.answer).toContain("Total: $40.00");
+    expect(seen).toEqual([]);
+    const loaded = await stub.load();
+    const byName = (name: string) =>
+      loaded.records.find((row) => row.payload.Description === name)?.category;
+    expect(byName("DIRECT DEPOSIT ACME")).toBe("money-in");
+    expect(byName("IRS TREAS 310 TAX REF")).toBe("money-in");
   });
 });
