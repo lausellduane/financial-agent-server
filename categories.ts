@@ -1,4 +1,5 @@
 import { extractJson } from "./json-text.js";
+import { isReturnNarrative } from "./spend-cents.js";
 import type { ChatTurn } from "./llm.js";
 
 export const CATEGORIES = [
@@ -598,7 +599,11 @@ export function categorizeNarrative(
   signedLedger: boolean,
 ): Category | "unknown" {
   const text = narrative.toUpperCase();
-  if (hasIncomeKeyword(text)) return "income";
+  // Run the return check before income so a DEBIT CARD RETURN (or a signed
+  // money-in bare RETURN) never counts as income. It keeps a spending-merchant
+  // rule, or falls through to Other/unknown so it can net against spend.
+  const refund = isReturnNarrative(narrative, amountCents, signedLedger);
+  if (!refund && hasIncomeKeyword(text)) return "income";
   // A mortgage payment to a bank is still a mortgage. The institution check
   // would otherwise call every outflow a transfer.
   if (isMortgagePayment(text)) return "housing/mortgage";
@@ -608,7 +613,7 @@ export function categorizeNarrative(
   // to the institution is a transfer, not fuel.
   if (isFinancialInstitution(text)) {
     if (amountCents < 0) return "transfers";
-    return "income";
+    if (!refund) return "income";
   }
   if (isUtilityGas(text)) return "utilities/telecom";
   if (isBlankNarrative(text)) return "other";
@@ -622,7 +627,7 @@ export function categorizeNarrative(
   if (isHealthInsurance(text)) return "insurance/health";
   const ruled = RULES.find((rule) => matchesRule(text, rule))?.category;
   if (ruled) return ruled;
-  if (signedLedger && amountCents > 0) return "income";
+  if (!refund && signedLedger && amountCents > 0) return "income";
   if (!text.trim()) return "other";
   return "unknown";
 }

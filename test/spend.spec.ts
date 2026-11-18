@@ -136,7 +136,7 @@ function view(description: string, amount: string, signed: boolean): TxView {
   const found = categorizeNarrative(description, amountCents, signed);
   return {
     date: "2026-01-15",
-    merchant: cleanMerchantName(description),
+    merchant: cleanMerchantName(description, amountCents, signed),
     narrative: description.toUpperCase(),
     amountCents,
     spendCents: signed ? -amountCents : Math.abs(amountCents),
@@ -431,6 +431,13 @@ describe("categorizeNarrative", () => {
     expect(categorizeNarrative("AMAZON.COM", 500, true)).toBe("shopping");
     expect(categorizeNarrative("CHIPOTLE", 3304, false)).toBe("dining");
     expect(categorizeNarrative("MYSTERY CREDIT 42", 500, true)).toBe("income");
+    expect(categorizeNarrative("DEBIT CARD RETURN ZOOPLEX GADGETS 99", 2000, true)).toBe(
+      "unknown",
+    );
+    expect(categorizeNarrative("DEBIT CARD RETURN CHIPOTLE", 1000, true)).toBe(
+      "dining",
+    );
+    expect(categorizeNarrative("RETURN ITEM FEE", -1200, true)).toBe("unknown");
     expect(categorizeNarrative("DIRECT DEPOSIT ACME PAYROLL", 100, false)).toBe(
       "income",
     );

@@ -28,17 +28,41 @@ test("parseCsv strips a UTF-8 BOM from the header", async () => {
   assert.equal(Object.keys(rows[0] ?? {})[0], "Date");
 });
 
-test("cleanMerchantName strips return prefixes so a purchase and return merge", () => {
+test("cleanMerchantName strips DEBIT CARD RETURN always, and bare RETURN only when signed money-in", () => {
   const purchase = cleanMerchantName(
     "DEBIT CARD PURCHASE CHIPOTLE 2210 RALEIGH NC",
   );
   const debitReturn = cleanMerchantName(
     "DEBIT CARD RETURN CHIPOTLE 2210 RALEIGH NC",
   );
-  const bareReturn = cleanMerchantName("RETURN CHIPOTLE 2210 RALEIGH NC");
+  const debitReturnUnsigned = cleanMerchantName(
+    "DEBIT CARD RETURN CHIPOTLE 2210 RALEIGH NC",
+    1000,
+    false,
+  );
   assert.equal(purchase, "CHIPOTLE");
   assert.equal(debitReturn, "CHIPOTLE");
-  assert.equal(bareReturn, "CHIPOTLE");
+  assert.equal(debitReturnUnsigned, "CHIPOTLE");
+  // Unsigned or missing sign: keep the bare RETURN prefix.
+  assert.equal(
+    cleanMerchantName("RETURN CHIPOTLE 2210 RALEIGH NC"),
+    "RETURN CHIPOTLE",
+  );
+  assert.equal(
+    cleanMerchantName("RETURN CHIPOTLE 2210 RALEIGH NC", 1000, false),
+    "RETURN CHIPOTLE",
+  );
+  // Signed money-in: strip so it merges with the purchase.
+  assert.equal(
+    cleanMerchantName("RETURN CHIPOTLE 2210 RALEIGH NC", 1000, true),
+    "CHIPOTLE",
+  );
+  // Signed charges that just start with RETURN keep their names.
+  assert.equal(cleanMerchantName("RETURN ITEM FEE", -1200, true), "RETURN ITEM FEE");
+  assert.equal(
+    cleanMerchantName("RETURN OF THE MAC CAFE", -1800, true),
+    "RETURN OF THE MAC CAFE",
+  );
 });
 
 test("cleanMerchantName does not strip RETURNED or RETURNS as a bare RETURN", () => {

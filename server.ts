@@ -522,7 +522,7 @@ function toViews(records: LedgerRecord[]): { views: TxView[]; omitted: OmittedRo
       omitted.zeroCount += 1;
       continue;
     }
-    let merchant = cleanMerchantName(narrative);
+    let merchant = cleanMerchantName(narrative, amountCents, signed);
     // Only a placeholder description is renamed. "CHIPOTLE PENDING" keeps Chipotle.
     if (/^(pending|processing|process)$/i.test(rawDescription.trim())) {
       merchant = "Pending";
@@ -569,7 +569,7 @@ function toSpendEvents(records: LedgerRecord[]): SpendEvent[] {
       signed,
       spendCategory,
     );
-    let merchant = cleanMerchantName(narrative);
+    let merchant = cleanMerchantName(narrative, amountCents, signed);
     if (/^(pending|processing|process)$/i.test(rawDescription.trim())) {
       merchant = "Pending";
     }

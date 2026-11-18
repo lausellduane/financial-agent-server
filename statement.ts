@@ -1,5 +1,6 @@
 import csv from "csv-parser";
 import { Readable } from "node:stream";
+import { isReturnNarrative } from "./spend-cents.js";
 
 export type DisplayFields = {
   date: string | undefined;
@@ -336,7 +337,11 @@ const US_STATE_CODES = new Set([
   "WI", "WV", "WY",
 ]);
 
-export function cleanMerchantName(raw: string): string {
+export function cleanMerchantName(
+  raw: string,
+  amountCents = 0,
+  signedLedger = false,
+): string {
   let text = String(raw ?? "").replace(/\s+/g, " ").trim();
   if (!text || isBlankMerchant(text)) return "Unknown merchant";
 
@@ -374,11 +379,15 @@ export function cleanMerchantName(raw: string): string {
   if (upper.includes("TARGET")) return "Target";
   if (upper.includes("PUBLIX")) return "Publix";
 
-  // Keep DEBIT CARD RETURN and bare RETURN in sync with isDebitCardReturn.
+  // Always strip DEBIT CARD RETURN. Strip a bare RETURN prefix only when
+  // the row is a signed money-in refund — the same rule as isReturnNarrative.
   text = text.replace(
-    /^(DIRECT DEBIT|DEBIT CARD PURCHASE|DEBIT CARD RETURN|RETURN|ELECTRONIC WITHDRAWAL(?: REQUESTED BY YOU(?: TO)?)?|POS DEBIT|VISA DEBIT|PURCHASE AUTHORIZED ON \d{1,2}\/\d{1,2}|ACH (?:DEBIT|WITHDRAWAL)|CHECKCARD)\s+/i,
+    /^(DIRECT DEBIT|DEBIT CARD PURCHASE|DEBIT CARD RETURN|ELECTRONIC WITHDRAWAL(?: REQUESTED BY YOU(?: TO)?)?|POS DEBIT|VISA DEBIT|PURCHASE AUTHORIZED ON \d{1,2}\/\d{1,2}|ACH (?:DEBIT|WITHDRAWAL)|CHECKCARD)\s+/i,
     "",
   );
+  if (isReturnNarrative(raw, amountCents, signedLedger)) {
+    text = text.replace(/^RETURN\s+/i, "");
+  }
   text = text.replace(/\s*AUTHID:\S+/gi, "");
   text = text.replace(/\s*\([^)]*\)\s*$/g, "");
 
