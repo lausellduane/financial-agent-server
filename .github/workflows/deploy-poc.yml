@@ -1,5 +1,8 @@
 # Draft only. Do not merge until GitHub secrets are in place and Duane approves
 # enabling auto-deploy. Targets the existing POC Worker only.
+# Rollback: `npx wrangler deployments list --name financial-agent-server-poc`,
+# then `npx wrangler rollback <version-id> --name financial-agent-server-poc`
+# (needs Duane's yes).
 name: Deploy POC
 
 on:
@@ -40,6 +43,11 @@ jobs:
 
       - name: Typecheck
         run: npx tsc --noEmit
+
+      # Wrangler dry run: bundles the Worker and validates config without
+      # publishing or needing Cloudflare credentials.
+      - name: Worker check
+        run: npm run check:worker
 
   deploy:
     name: Deploy financial-agent-server-poc
