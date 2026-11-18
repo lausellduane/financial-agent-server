@@ -1076,3 +1076,78 @@ test("GET /api/report merges Chipotle returns and nets an uncategorized Zooplex 
   ]);
   setCompleteChatForTests(null);
 });
+
+test("POST /api/query nets an unsigned Chipotle purchase and return to match the report", async () => {
+  setCompleteChatForTests(async () => {
+    throw new Error("rules cover these merchants");
+  });
+  const uploaded = await upload(
+    csv([
+      "2026-11-02,DEBIT CARD PURCHASE CHIPOTLE 2210 RALEIGH NC,33.04",
+      "2026-11-03,DEBIT CARD RETURN CHIPOTLE 2210 RALEIGH NC,10.00",
+    ]),
+  );
+  assert.equal(uploaded.status, 200);
+  const report = await fetch(`${base}/api/report`);
+  assert.equal(report.status, 200);
+  const body = (await report.json()) as {
+    months: { diningCents: number }[];
+  };
+  assert.equal(body.months[0]?.diningCents, 2304);
+  const eating = await ask("How much I spent eating out?");
+  assert.match(eating, /Total: \$23\.04/);
+  const chipotle = await ask("How much did I spend at Chipotle?");
+  assert.match(chipotle, /Total: \$23\.04/);
+  setCompleteChatForTests(null);
+});
+
+test("POST /api/query nets a signed return at an Other merchant", async () => {
+  setCompleteChatForTests(async (messages: ChatTurn[]) => {
+    const blob = messages.map((message) => message.content).join("\n");
+    if (!blob.includes("ZOOPLEX")) {
+      throw new Error("rules cover these merchants");
+    }
+    return JSON.stringify({
+      items: [
+        { merchant: "ZOOPLEX GADGETS 99", category: "other" },
+        { merchant: "DEBIT CARD RETURN ZOOPLEX GADGETS 99", category: "other" },
+      ],
+    });
+  });
+  const uploaded = await upload(
+    csv([
+      "2026-11-04,ZOOPLEX GADGETS 99,-50.00",
+      "2026-11-05,DEBIT CARD RETURN ZOOPLEX GADGETS 99,-20.00",
+    ]),
+  );
+  assert.equal(uploaded.status, 200);
+  assert.equal(uploaded.body.uncategorized, 0);
+  const answer = await ask("How much did I spend at Zooplex?");
+  assert.match(answer, /Total: \$30\.00/);
+  setCompleteChatForTests(null);
+});
+
+test("POST /api/query nets a bare RETURN with the matching purchase", async () => {
+  setCompleteChatForTests(async () => {
+    throw new Error("rules cover these merchants");
+  });
+  const uploaded = await upload(
+    csv([
+      "2026-11-02,DEBIT CARD PURCHASE CHIPOTLE 2210 RALEIGH NC,33.04",
+      "2026-11-03,RETURN CHIPOTLE 2210 RALEIGH NC,10.00",
+    ]),
+  );
+  assert.equal(uploaded.status, 200);
+  const report = await fetch(`${base}/api/report`);
+  assert.equal(report.status, 200);
+  const body = (await report.json()) as {
+    months: { diningCents: number; topMerchants: { name: string; cents: number }[] }[];
+  };
+  assert.equal(body.months[0]?.diningCents, 2304);
+  assert.deepEqual(body.months[0]?.topMerchants, [
+    { name: "CHIPOTLE", cents: 2304 },
+  ]);
+  const chipotle = await ask("How much did I spend at Chipotle?");
+  assert.match(chipotle, /Total: \$23\.04/);
+  setCompleteChatForTests(null);
+});

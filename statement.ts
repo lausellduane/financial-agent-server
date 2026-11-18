@@ -374,6 +374,7 @@ export function cleanMerchantName(raw: string): string {
   if (upper.includes("TARGET")) return "Target";
   if (upper.includes("PUBLIX")) return "Publix";
 
+  // Keep DEBIT CARD RETURN and bare RETURN in sync with isDebitCardReturn.
   text = text.replace(
     /^(DIRECT DEBIT|DEBIT CARD PURCHASE|DEBIT CARD RETURN|RETURN|ELECTRONIC WITHDRAWAL(?: REQUESTED BY YOU(?: TO)?)?|POS DEBIT|VISA DEBIT|PURCHASE AUTHORIZED ON \d{1,2}\/\d{1,2}|ACH (?:DEBIT|WITHDRAWAL)|CHECKCARD)\s+/i,
     "",

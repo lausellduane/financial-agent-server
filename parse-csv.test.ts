@@ -40,3 +40,8 @@ test("cleanMerchantName strips return prefixes so a purchase and return merge", 
   assert.equal(debitReturn, "CHIPOTLE");
   assert.equal(bareReturn, "CHIPOTLE");
 });
+
+test("cleanMerchantName does not strip RETURNED or RETURNS as a bare RETURN", () => {
+  assert.equal(cleanMerchantName("RETURNED CHECK FEE"), "RETURNED CHECK FEE");
+  assert.equal(cleanMerchantName("RETURNS INC RALEIGH NC"), "RETURNS INC RALEIGH");
+});

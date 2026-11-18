@@ -1,7 +1,11 @@
 import type { Category } from "./categories.js";
 
-function isDebitCardReturn(text: string): boolean {
-  return /\bDEBIT\s+CARD\s+RETURN\b/.test(text.toUpperCase());
+// Matches a DEBIT CARD RETURN anywhere, or a description that starts with
+// "RETURN " (same start-anchored prefix cleanMerchantName strips). "RETURNS"
+// and "RETURNED…" do not match.
+export function isDebitCardReturn(text: string): boolean {
+  const upper = text.toUpperCase().trim();
+  return /\bDEBIT\s+CARD\s+RETURN\b/.test(upper) || /^RETURN\s/.test(upper);
 }
 
 function isNonSpendingCategory(category: Category | "unknown"): boolean {

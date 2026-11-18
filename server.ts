@@ -499,7 +499,16 @@ function toViews(records: LedgerRecord[]): { views: TxView[]; omitted: OmittedRo
     const amountCents = parseAmountCents(
       fields.amount ? record.payload[fields.amount] : undefined,
     );
-    const spendCents = signed ? -amountCents : Math.abs(amountCents);
+    const spendCategory: Category | "unknown" =
+      record.category && !needsCategory(record.category)
+        ? (record.category as Category)
+        : "unknown";
+    const spendCents = spendCentsFor(
+      narrative,
+      amountCents,
+      signed,
+      spendCategory,
+    );
     if (needsCategory(record.category)) {
       if (amountCents !== 0) {
         omitted.unknownCount += 1;
