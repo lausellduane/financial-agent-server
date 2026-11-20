@@ -37,10 +37,25 @@ function Fail-Job {
   exit 1
 }
 
+function Write-Utf8NoBom {
+  param([string]$Path, [string]$Text)
+  $enc = New-Object System.Text.UTF8Encoding $false
+  [System.IO.File]::AppendAllText($Path, $Text, $enc)
+}
+
 function Set-JobEnv {
   param([string]$Name, [string]$Value)
   if (-not $env:GITHUB_ENV) { return }
-  Add-Content -Path $env:GITHUB_ENV -Value ('{0}={1}' -f $Name, $Value) -Encoding UTF8
+  $Name = $Name -replace '[\r\n]', ''
+  $Value = ([string]$Value) -replace '[\r\n]', ' '
+  Write-Utf8NoBom -Path $env:GITHUB_ENV -Text ('{0}={1}{2}' -f $Name, $Value, [Environment]::NewLine)
+}
+
+function Add-JobPath {
+  param([string]$Directory)
+  if (-not $env:GITHUB_PATH) { return }
+  $Directory = ([string]$Directory) -replace '[\r\n]', ''
+  Write-Utf8NoBom -Path $env:GITHUB_PATH -Text ($Directory + [Environment]::NewLine)
 }
 
 function Add-LocalBinToPath {
@@ -60,7 +75,7 @@ function Add-LocalBinToPath {
   }
   if ($env:GITHUB_PATH) {
     foreach ($dir in $added) {
-      Add-Content -Path $env:GITHUB_PATH -Value $dir -Encoding UTF8
+      Add-JobPath $dir
     }
   }
   return $added
@@ -78,6 +93,7 @@ function Test-SafeRelPath {
   if ($n -match '(^|/)\.\.(/|$)') { return $false }
   if ($n -match '^[a-zA-Z]:') { return $false }
   if ($n.StartsWith('/')) { return $false }
+  if ($n -eq '.git' -or $n -match '(^|/)\.git(/|$)') { return $false }
   if ($n -notmatch '^[A-Za-z0-9_./-]+$') { return $false }
   return $true
 }
@@ -94,6 +110,7 @@ function Test-AiderArtifact {
 function Test-ForbiddenPath {
   param([string]$PathValue)
   $n = Get-NormalizedPath $PathValue
+  if ($n -eq '.git' -or $n -match '(^|/)\.git(/|$)') { return $true }
   if ($n -match '(^|/)\.github(/|$)') { return $true }
   if ($n -match '(^|/)wrangler\.[^/]+$') { return $true }
   if ($n -match '(^|/)migrations(/|$)') { return $true }
@@ -165,8 +182,38 @@ function Get-FilesFromTaskBody {
   return $files
 }
 
+function Get-ScenarioNamesFromTaskBody {
+  param([string]$Body)
+  $names = @()
+  $lines = $Body -split '\r?\n'
+  $inScenarios = $false
+  foreach ($line in $lines) {
+    if ($line -match '(?i)Scenarios?:\s*(.*)$') {
+      $inScenarios = $true
+      $rest = $Matches[1].Trim()
+      if ($rest) {
+        $parts = $rest -split ',' | ForEach-Object { $_.Trim().Trim('`').Trim('"').Trim() } | Where-Object { $_ }
+        foreach ($part in $parts) {
+          $names += ($part -replace '^####\s+Scenario:\s*', '')
+        }
+      }
+      continue
+    }
+    if ($inScenarios) {
+      if ($line -match '^\s*$') { $inScenarios = $false; continue }
+      if ($line -match '^\s*-\s+(.+)$') {
+        $n = $Matches[1].Trim().Trim('`').Trim('"').Trim()
+        $n = $n -replace '^(####\s+)?Scenario:\s*', ''
+        if ($n) { $names += $n; continue }
+      }
+      $inScenarios = $false
+    }
+  }
+  return $names
+}
+
 function Get-ScenarioHeadings {
-  param([string]$ChangeId)
+  param([string]$ChangeId, [string[]]$WantedNames)
   $headings = @()
   $specsRoot = Join-Path $env:GITHUB_WORKSPACE "openspec/changes/$ChangeId/specs"
   if (-not (Test-Path -LiteralPath $specsRoot)) { return $headings }
@@ -177,7 +224,27 @@ function Get-ScenarioHeadings {
       $headings += ('#### Scenario: ' + $m.Groups[1].Value.Trim())
     }
   }
-  return $headings
+  $wanted = @($WantedNames | Where-Object { $_ } | ForEach-Object { ($_ -replace '^####\s+Scenario:\s*', '').Trim() } | Sort-Object -Unique)
+  if ($wanted.Count -eq 0) {
+    Write-JobLog 'No Scenarios: list on the selected tasks; including all change-level scenario headings.'
+    return $headings
+  }
+  $filtered = @()
+  foreach ($h in $headings) {
+    $title = ($h -replace '^####\s+Scenario:\s*', '').Trim()
+    foreach ($w in $wanted) {
+      if ([string]::Equals($title, $w, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $filtered += $h
+        break
+      }
+    }
+  }
+  if ($filtered.Count -eq 0) {
+    Write-JobLog 'Scenarios: names on the selected tasks did not match any heading; including all change-level scenario headings.'
+    return $headings
+  }
+  Write-JobLog ('Filtered scenarios to selected tasks: ' + ($filtered -join '; '))
+  return $filtered
 }
 
 function Get-EstTokens {
@@ -374,7 +441,12 @@ switch ($Step) {
     }
     $editFormat = if ($maxLines -ge 80) { 'diff' } else { 'whole' }
 
-    $scenarios = @(Get-ScenarioHeadings $changeId)
+    $wantedScenarios = @()
+    foreach ($tid in $selectedIds) {
+      $block = $blocks | Where-Object { $_.Id -eq $tid } | Select-Object -First 1
+      if ($block) { $wantedScenarios += @(Get-ScenarioNamesFromTaskBody $block.Body) }
+    }
+    $scenarios = @(Get-ScenarioHeadings -ChangeId $changeId -WantedNames $wantedScenarios)
     $taskNumbers = $selectedIds -join ', '
     Set-Content -LiteralPath $AllowedPath -Value ($allowed -join "`n") -Encoding UTF8
     Set-Content -LiteralPath $ScenarioPath -Value ($scenarios -join "`n") -Encoding UTF8
@@ -389,11 +461,15 @@ switch ($Step) {
       $branch = "local-builder/issue-$($env:ISSUE_NUMBER)"
       $existing = git ls-remote --heads origin $branch
       if ($existing) {
-        Fail-Job "Branch $branch already exists. Delete it or close the previous PR before retrying."
+        Fail-Job "Branch $branch already exists on origin. Delete it or close the previous PR before retrying."
       }
-      git checkout -b $branch
-      if ($LASTEXITCODE -ne 0) { Fail-Job "Failed to create branch $branch." }
-      Write-JobLog "Created branch $branch"
+      git fetch --depth 1 origin master
+      if ($LASTEXITCODE -ne 0) { Fail-Job 'git fetch origin master failed.' }
+      # Recreate from origin/master so a stale local branch left in .git by a previous
+      # failed job cannot block the design.md §6 relabel retry path.
+      git checkout -B $branch origin/master
+      if ($LASTEXITCODE -ne 0) { Fail-Job "Failed to create branch $branch from origin/master." }
+      Write-JobLog "Created branch $branch from origin/master"
     } finally {
       Pop-Location
     }
@@ -500,6 +576,13 @@ switch ($Step) {
   }
 
   'evaluate' {
+    $blocked = Join-Path $env:GITHUB_WORKSPACE 'BLOCKED.md'
+    if (Test-Path -LiteralPath $blocked) {
+      Set-JobEnv 'NEED_ATTEMPT_2' 'false'
+      $note = Get-Content -LiteralPath $blocked -Raw -Encoding UTF8
+      Fail-Job ("The agent wrote BLOCKED.md:`n`n" + $note.Trim())
+    }
+
     $changed = @(Get-ChangedFiles)
     $hasDiff = $changed.Count -gt 0
     $testLog = Join-Path $env:RUNNER_TEMP 'npm-test-attempt1.log'
@@ -518,7 +601,9 @@ switch ($Step) {
         Set-Content -LiteralPath $ExcerptPath -Value $tail -Encoding UTF8
       }
     } else {
-      Set-Content -LiteralPath $ExcerptPath -Value 'no changes produced on attempt 1' -Encoding UTF8
+      if (-not (Test-Path -LiteralPath $ExcerptPath) -or -not (Get-Content -LiteralPath $ExcerptPath -Raw -ErrorAction SilentlyContinue)) {
+        Set-Content -LiteralPath $ExcerptPath -Value 'no changes produced on attempt 1 (or attempt 1 timed out or failed)' -Encoding UTF8
+      }
       Write-JobLog 'No diff after attempt 1.'
     }
 

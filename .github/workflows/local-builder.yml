@@ -52,8 +52,15 @@ jobs:
             Write-Host $m
             exit 1
           }
+          function Write-GithubEnv([string]$Name, [string]$Value) {
+            if (-not $env:GITHUB_ENV) { return }
+            $Name = $Name -replace '[\r\n]', ''
+            $Value = ([string]$Value) -replace '[\r\n]', ' '
+            $line = '{0}={1}{2}' -f $Name, $Value, [Environment]::NewLine
+            [System.IO.File]::AppendAllText($env:GITHUB_ENV, $line, (New-Object System.Text.UTF8Encoding $false))
+          }
           $start = [DateTime]::UtcNow.ToString('o')
-          Add-Content -Path $env:GITHUB_ENV -Value "JOB_START=$start"
+          Write-GithubEnv 'JOB_START' $start
           Add-Content -Path $log -Value "job start $start issue $env:ISSUE_NUMBER"
           $headers = @{
             Authorization          = "Bearer $($env:GH_TOKEN)"
@@ -153,9 +160,16 @@ jobs:
           } catch {
             Fail-Reason "openspec/changes/$changeId/tasks.md was not found on master."
           }
-          Add-Content -Path $env:GITHUB_ENV -Value "CHANGE_ID=$changeId"
+          function Write-GithubEnv([string]$Name, [string]$Value) {
+            if (-not $env:GITHUB_ENV) { return }
+            $Name = $Name -replace '[\r\n]', ''
+            $Value = ([string]$Value) -replace '[\r\n]', ' '
+            $line = '{0}={1}{2}' -f $Name, $Value, [Environment]::NewLine
+            [System.IO.File]::AppendAllText($env:GITHUB_ENV, $line, (New-Object System.Text.UTF8Encoding $false))
+          }
+          Write-GithubEnv 'CHANGE_ID' $changeId
           if ($taskSpec) {
-            Add-Content -Path $env:GITHUB_ENV -Value "TASK_SPEC=$taskSpec"
+            Write-GithubEnv 'TASK_SPEC' $taskSpec
           }
           Write-Host "Parsed change id $changeId (task list will be resolved after checkout)."
 
@@ -216,7 +230,9 @@ jobs:
           & "$env:GITHUB_WORKSPACE/.github/scripts/local-builder.ps1" -Step render
 
       - name: Aider attempt 1
+        id: aider1
         timeout-minutes: 25
+        continue-on-error: true
         env:
           GITHUB_TOKEN: ''
           GH_TOKEN: ''
@@ -227,6 +243,7 @@ jobs:
           & "$env:GITHUB_WORKSPACE/.github/scripts/local-builder.ps1" -Step aider
 
       - name: Evaluate attempt 1
+        if: steps.aider1.outcome == 'success' || steps.aider1.outcome == 'failure'
         timeout-minutes: 10
         env:
           GITHUB_TOKEN: ''
@@ -332,7 +349,10 @@ jobs:
             git -C $env:GITHUB_WORKSPACE config --local --unset-all http.https://github.com/.extraheader 2>$null
           }
           if ($env:GITHUB_WORKSPACE -and (Test-Path -LiteralPath $env:GITHUB_WORKSPACE)) {
-            Get-ChildItem -LiteralPath $env:GITHUB_WORKSPACE -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne '.git' } | ForEach-Object {
+            Get-ChildItem -LiteralPath $env:GITHUB_WORKSPACE -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object {
+              try { $_.Attributes = 'Normal' } catch { }
+            }
+            Get-ChildItem -LiteralPath $env:GITHUB_WORKSPACE -Force -ErrorAction SilentlyContinue | ForEach-Object {
               Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
             }
           }
