@@ -1,0 +1,4 @@
+# Pin num_ctx so Aider does not reload the model after the workflow warm-up.
+- name: ollama_chat/qwen2.5-coder:7b
+  extra_params:
+    num_ctx: 4096

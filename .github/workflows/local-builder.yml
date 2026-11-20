@@ -1,0 +1,367 @@
+# Local builder: runs Aider + qwen2.5-coder:7b on Duane's self-hosted
+# Windows runner when he (or a bot acting as him) adds the local-builder
+# label to an issue he opened. See openspec/changes/add-local-builder-runner/.
+#
+# Trigger is issues:labeled only. No pull_request, pull_request_target,
+# push, issue_comment, workflow_run, or fork events.
+# The job token is the only credential; there are no secrets.
+name: local-builder
+
+on:
+  issues:
+    types: [labeled]
+
+permissions: {}
+
+concurrency:
+  group: local-builder
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: >-
+      github.event.label.name == 'local-builder' &&
+      github.event.sender.login == 'lausellduane' &&
+      github.event.issue.user.login == 'lausellduane' &&
+      github.event.issue.pull_request == null
+    runs-on: [self-hosted, windows, local-builder]
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    env:
+      ISSUE_NUMBER: ${{ github.event.issue.number }}
+      OLLAMA_API_BASE: http://127.0.0.1:11434
+      MODEL: qwen2.5-coder:7b
+      NUM_CTX: "4096"
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - name: Record start time and mark issue running
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $reason = Join-Path $env:RUNNER_TEMP 'local-builder-reason.txt'
+          $log = Join-Path $env:RUNNER_TEMP 'local-builder.log'
+          function Fail-Reason([string]$m) {
+            Set-Content -Path $reason -Value $m -Encoding UTF8
+            Add-Content -Path $log -Value $m -Encoding UTF8
+            Write-Host $m
+            exit 1
+          }
+          function Write-GithubEnv([string]$Name, [string]$Value) {
+            if (-not $env:GITHUB_ENV) { return }
+            $Name = $Name -replace '[\r\n]', ''
+            $Value = ([string]$Value) -replace '[\r\n]', ' '
+            $line = '{0}={1}{2}' -f $Name, $Value, [Environment]::NewLine
+            [System.IO.File]::AppendAllText($env:GITHUB_ENV, $line, (New-Object System.Text.UTF8Encoding $false))
+          }
+          $start = [DateTime]::UtcNow.ToString('o')
+          Write-GithubEnv 'JOB_START' $start
+          Add-Content -Path $log -Value "job start $start issue $env:ISSUE_NUMBER"
+          $headers = @{
+            Authorization          = "Bearer $($env:GH_TOKEN)"
+            Accept                 = 'application/vnd.github+json'
+            'X-GitHub-Api-Version' = '2022-11-28'
+            'User-Agent'           = 'local-builder-workflow'
+          }
+          $repo = $env:GITHUB_REPOSITORY
+          $n = $env:ISSUE_NUMBER
+          try {
+            Invoke-RestMethod -Method POST -Uri "https://api.github.com/repos/$repo/issues/$n/labels" -Headers $headers -ContentType 'application/json' -Body '{"labels":["local-builder-running"]}' | Out-Null
+          } catch {
+            Fail-Reason "Failed to add local-builder-running to issue #$n. $($_.Exception.Message)"
+          }
+          try {
+            Invoke-RestMethod -Method DELETE -Uri "https://api.github.com/repos/$repo/issues/$n/labels/local-builder" -Headers $headers | Out-Null
+          } catch {
+            Write-Host "Could not remove local-builder from issue #$n (it may already be gone)."
+          }
+
+      - name: Pre-flight Ollama
+        timeout-minutes: 2
+        env:
+          GITHUB_TOKEN: ''
+          GH_TOKEN: ''
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $reason = Join-Path $env:RUNNER_TEMP 'local-builder-reason.txt'
+          $log = Join-Path $env:RUNNER_TEMP 'local-builder.log'
+          function Fail-Reason([string]$m) {
+            Set-Content -Path $reason -Value $m -Encoding UTF8
+            Add-Content -Path $log -Value $m -Encoding UTF8
+            Write-Host $m
+            exit 1
+          }
+          $model = $env:MODEL
+          try {
+            $tags = Invoke-RestMethod -Uri 'http://127.0.0.1:11434/api/tags' -TimeoutSec 15
+          } catch {
+            Fail-Reason "Ollama isn't reachable at 127.0.0.1:11434 on the local builder PC. Duane may need to sign in after a Windows Update reboot."
+          }
+          $names = @()
+          if ($tags.models) {
+            foreach ($m in @($tags.models)) {
+              if ($m.name) { $names += [string]$m.name }
+              if ($m.model) { $names += [string]$m.model }
+            }
+          }
+          $found = $false
+          foreach ($n in $names) {
+            if ($n -eq $model) { $found = $true }
+          }
+          if (-not $found) {
+            Fail-Reason "Ollama is running, but model $model is not in the model list. Pull it with: ollama pull $model"
+          }
+          Write-Host "Pre-flight ok: $model is listed at 127.0.0.1:11434."
+
+      - name: Parse change id
+        env:
+          GITHUB_TOKEN: ''
+          GH_TOKEN: ''
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $reason = Join-Path $env:RUNNER_TEMP 'local-builder-reason.txt'
+          $log = Join-Path $env:RUNNER_TEMP 'local-builder.log'
+          function Fail-Reason([string]$m) {
+            Set-Content -Path $reason -Value $m -Encoding UTF8
+            Add-Content -Path $log -Value $m -Encoding UTF8
+            Write-Host $m
+            exit 1
+          }
+          if (-not $env:GITHUB_EVENT_PATH -or -not (Test-Path -LiteralPath $env:GITHUB_EVENT_PATH)) {
+            Fail-Reason 'GITHUB_EVENT_PATH is missing; cannot read the issue payload.'
+          }
+          $event = Get-Content -LiteralPath $env:GITHUB_EVENT_PATH -Raw -Encoding UTF8 | ConvertFrom-Json
+          $body = [string]$event.issue.body
+          if ([string]::IsNullOrWhiteSpace($body)) {
+            Fail-Reason 'Issue body is empty. Add a line: openspec-change: <id>'
+          }
+          $changeId = $null
+          $taskSpec = $null
+          foreach ($line in ($body -split '\r?\n')) {
+            if ($line -match '^openspec-change:\s*([a-z0-9-]+)\s*$') {
+              $changeId = $Matches[1]
+            }
+            elseif ($line -match '^tasks:\s*([0-9.,]+)\s*$') {
+              $taskSpec = $Matches[1]
+            }
+          }
+          if (-not $changeId) {
+            Fail-Reason 'Missing or malformed change ID. The issue body must contain a line matching openspec-change: <id> with id ^[a-z0-9-]+$.'
+          }
+          $uri = "https://api.github.com/repos/$($env:GITHUB_REPOSITORY)/contents/openspec/changes/$changeId/tasks.md?ref=master"
+          try {
+            $headers = @{ Accept = 'application/vnd.github+json'; 'User-Agent' = 'local-builder-workflow' }
+            Invoke-RestMethod -Uri $uri -Headers $headers -TimeoutSec 30 | Out-Null
+          } catch {
+            Fail-Reason "openspec/changes/$changeId/tasks.md was not found on master."
+          }
+          function Write-GithubEnv([string]$Name, [string]$Value) {
+            if (-not $env:GITHUB_ENV) { return }
+            $Name = $Name -replace '[\r\n]', ''
+            $Value = ([string]$Value) -replace '[\r\n]', ' '
+            $line = '{0}={1}{2}' -f $Name, $Value, [Environment]::NewLine
+            [System.IO.File]::AppendAllText($env:GITHUB_ENV, $line, (New-Object System.Text.UTF8Encoding $false))
+          }
+          Write-GithubEnv 'CHANGE_ID' $changeId
+          if ($taskSpec) {
+            Write-GithubEnv 'TASK_SPEC' $taskSpec
+          }
+          Write-Host "Parsed change id $changeId (task list will be resolved after checkout)."
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: master
+          persist-credentials: false
+          clean: true
+
+      - name: Check tools
+        timeout-minutes: 2
+        env:
+          GITHUB_TOKEN: ''
+          GH_TOKEN: ''
+        run: |
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+          & "$env:GITHUB_WORKSPACE/.github/scripts/local-builder.ps1" -Step tools
+
+      - name: Parse change and create branch
+        env:
+          GITHUB_TOKEN: ''
+          GH_TOKEN: ''
+        run: |
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+          & "$env:GITHUB_WORKSPACE/.github/scripts/local-builder.ps1" -Step parse-change
+
+      - name: Warm-up model
+        timeout-minutes: 5
+        env:
+          GITHUB_TOKEN: ''
+          GH_TOKEN: ''
+        run: |
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+          & "$env:GITHUB_WORKSPACE/.github/scripts/local-builder.ps1" -Step warmup
+
+      - name: Install npm dependencies
+        timeout-minutes: 10
+        env:
+          GITHUB_TOKEN: ''
+          GH_TOKEN: ''
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) {
+            $msg = "npm ci failed with exit code $LASTEXITCODE."
+            Set-Content -Path (Join-Path $env:RUNNER_TEMP 'local-builder-reason.txt') -Value $msg -Encoding UTF8
+            Write-Host $msg
+            exit $LASTEXITCODE
+          }
+
+      - name: Render job prompt and check context budget
+        timeout-minutes: 2
+        env:
+          GITHUB_TOKEN: ''
+          GH_TOKEN: ''
+        run: |
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+          & "$env:GITHUB_WORKSPACE/.github/scripts/local-builder.ps1" -Step render
+
+      - name: Aider attempt 1
+        id: aider1
+        timeout-minutes: 25
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ''
+          GH_TOKEN: ''
+          ATTEMPT: '1'
+          OLLAMA_API_BASE: http://127.0.0.1:11434
+        run: |
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+          & "$env:GITHUB_WORKSPACE/.github/scripts/local-builder.ps1" -Step aider
+
+      - name: Evaluate attempt 1
+        if: steps.aider1.outcome == 'success' || steps.aider1.outcome == 'failure'
+        timeout-minutes: 10
+        env:
+          GITHUB_TOKEN: ''
+          GH_TOKEN: ''
+        run: |
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+          & "$env:GITHUB_WORKSPACE/.github/scripts/local-builder.ps1" -Step evaluate
+
+      - name: Aider attempt 2
+        if: env.NEED_ATTEMPT_2 == 'true'
+        timeout-minutes: 25
+        env:
+          GITHUB_TOKEN: ''
+          GH_TOKEN: ''
+          ATTEMPT: '2'
+          OLLAMA_API_BASE: http://127.0.0.1:11434
+        run: |
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+          & "$env:GITHUB_WORKSPACE/.github/scripts/local-builder.ps1" -Step aider
+
+      - name: Verify diff, tests, and typecheck
+        timeout-minutes: 10
+        env:
+          GITHUB_TOKEN: ''
+          GH_TOKEN: ''
+        run: |
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+          & "$env:GITHUB_WORKSPACE/.github/scripts/local-builder.ps1" -Step guard
+
+      - name: Commit, push, and open PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+          & "$env:GITHUB_WORKSPACE/.github/scripts/local-builder.ps1" -Step publish
+
+      - name: Comment on failure
+        if: failure() || cancelled()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $reasonPath = Join-Path $env:RUNNER_TEMP 'local-builder-reason.txt'
+          $logPath = Join-Path $env:RUNNER_TEMP 'local-builder.log'
+          $reason = 'The local-builder job failed or was cancelled.'
+          if (Test-Path -LiteralPath $reasonPath) {
+            $reason = (Get-Content -LiteralPath $reasonPath -Raw -Encoding UTF8).Trim()
+          }
+          $blocked = $null
+          if ($env:GITHUB_WORKSPACE) {
+            $blockedPath = Join-Path $env:GITHUB_WORKSPACE 'BLOCKED.md'
+            if (Test-Path -LiteralPath $blockedPath) {
+              $blocked = (Get-Content -LiteralPath $blockedPath -Raw -Encoding UTF8).Trim()
+              $reason = "The agent wrote BLOCKED.md:`n`n$blocked"
+            }
+          }
+          $excerpt = ''
+          if (Test-Path -LiteralPath $logPath) {
+            $lines = Get-Content -LiteralPath $logPath -Encoding UTF8
+            $tail = $lines | Select-Object -Last 40
+            $excerpt = ($tail | ForEach-Object { $_ -replace '^::', ' :' -replace '(?i)(Bearer\s+)[^\s]+', '$1[redacted]' -replace '(?i)gh[pousr]_[A-Za-z0-9]+', '[redacted]' }) -join "`n"
+          }
+          if (-not $reason) { $reason = 'The local-builder job failed or was cancelled.' }
+          $comment = "Local builder failed for this issue." + [char]10 + [char]10 + $reason
+          if ($excerpt) {
+            $fence = [string][char]96 * 3
+            $comment = $comment + [char]10 + [char]10 + $fence + [char]10 + $excerpt + [char]10 + $fence
+          }
+          $headers = @{
+            Authorization          = "Bearer $($env:GH_TOKEN)"
+            Accept                 = 'application/vnd.github+json'
+            'X-GitHub-Api-Version' = '2022-11-28'
+            'User-Agent'           = 'local-builder-workflow'
+          }
+          $repo = $env:GITHUB_REPOSITORY
+          $n = $env:ISSUE_NUMBER
+          $bodyObj = @{ body = $comment } | ConvertTo-Json -Depth 5
+          try {
+            Invoke-RestMethod -Method POST -Uri "https://api.github.com/repos/$repo/issues/$n/comments" -Headers $headers -ContentType 'application/json; charset=utf-8' -Body ([System.Text.Encoding]::UTF8.GetBytes($bodyObj)) | Out-Null
+            Write-Host "Posted failure comment on issue #$n."
+          } catch {
+            Write-Host "Failed to comment on issue #$n. $($_.Exception.Message)"
+          }
+          try {
+            Invoke-RestMethod -Method POST -Uri "https://api.github.com/repos/$repo/issues/$n/labels" -Headers $headers -ContentType 'application/json' -Body '{"labels":["local-builder-failed"]}' | Out-Null
+          } catch {
+            Write-Host "Failed to add local-builder-failed. $($_.Exception.Message)"
+          }
+          try {
+            Invoke-RestMethod -Method DELETE -Uri "https://api.github.com/repos/$repo/issues/$n/labels/local-builder-running" -Headers $headers | Out-Null
+          } catch {
+            Write-Host 'local-builder-running was already absent.'
+          }
+
+      - name: Cleanup workspace
+        if: always()
+        env:
+          GITHUB_TOKEN: ''
+          GH_TOKEN: ''
+        run: |
+          $ErrorActionPreference = 'Continue'
+          if ($env:GITHUB_WORKSPACE -and (Test-Path -LiteralPath (Join-Path $env:GITHUB_WORKSPACE '.git'))) {
+            git -C $env:GITHUB_WORKSPACE config --local --unset-all http.https://github.com/.extraheader 2>$null
+          }
+          if ($env:GITHUB_WORKSPACE -and (Test-Path -LiteralPath $env:GITHUB_WORKSPACE)) {
+            Get-ChildItem -LiteralPath $env:GITHUB_WORKSPACE -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object {
+              try { $_.Attributes = 'Normal' } catch { }
+            }
+            Get-ChildItem -LiteralPath $env:GITHUB_WORKSPACE -Force -ErrorAction SilentlyContinue | ForEach-Object {
+              Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }
+          $patterns = @('local-builder-*', 'aider-attempt-*', 'npm-test-*', 'tsc-guard.log', 'job-prompt.md', 'allowed-files.txt', 'scenarios.txt', 'task-numbers.txt', 'test-failure-excerpt.txt')
+          if ($env:RUNNER_TEMP -and (Test-Path -LiteralPath $env:RUNNER_TEMP)) {
+            foreach ($pat in $patterns) {
+              Get-ChildItem -LiteralPath $env:RUNNER_TEMP -Force -Filter $pat -ErrorAction SilentlyContinue | ForEach-Object {
+                Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+              }
+            }
+          }
+          Write-Host 'Cleanup finished.'
