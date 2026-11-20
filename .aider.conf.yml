@@ -1,0 +1,7 @@
+# Local builder defaults. The workflow also passes these as flags.
+model: ollama_chat/qwen2.5-coder:7b
+map-tokens: 0
+auto-commits: false
+dirty-commits: false
+analytics: false
+check-update: false

@@ -1,0 +1,5 @@
+# Custom runner labels used by local-builder.yml. actionlint does not
+# know repo-specific self-hosted labels unless they are listed here.
+self-hosted-runner:
+  labels:
+    - local-builder
