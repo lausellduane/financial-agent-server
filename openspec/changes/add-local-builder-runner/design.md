@@ -374,3 +374,13 @@ Project Manager collects this in the weekly standup. DevOps can write a small sc
 - Aider docs: Ollama, Scripting, Options reference (flags grepped from the live page), Edit formats.
 - OpenCode docs: CLI `run`, Providers (Ollama); Ollama docs: OpenCode integration.
 - Ollama FAQ (default ctx 4096, `OLLAMA_CONTEXT_LENGTH`, binds 127.0.0.1:11434, Windows env vars); ollama.com tag pages for sizes.
+
+## Decisions (Duane, Nov 20, 2026)
+
+- The bots may add the `local-builder` label under Duane's login.
+- OpenSpec changes live in `openspec/` in each repo (this PR).
+- Pilot card: add "Other money in" to the question-reading prompt (Code Reviewer's leftover LOW from #9).
+- Windows Update active hours will be set manually on the PC, with "Get me up to date" off.
+- After #7 merges: require CI checks in `protect-master`, and move the Cloudflare secrets into a `production` environment limited to `master`.
+- The UI repo gets added after the pilot succeeds.
+- No GPU upgrade for now; stay on `qwen2.5-coder:7b` at a 4096 context.
