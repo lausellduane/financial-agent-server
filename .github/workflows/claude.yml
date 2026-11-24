@@ -19,32 +19,53 @@ on:
   pull_request_review:
     types: [submitted]
 
+permissions: {}
+
 jobs:
   claude:
     # Only lausellduane can start a run, and only with a write-style
-    # association. Fork PRs and outside commenters are skipped. The
-    # action also defaults allow_fork_prs to false.
+    # association. Fork PRs and outside commenters are skipped.
+    # @claude is matched with a trailing boundary (space, end of text, or
+    # newline) so @claudette and user@claude.com do not trigger.
     if: |
       github.actor == 'lausellduane' &&
       (
         (
           github.event_name == 'issue_comment' &&
-          contains(github.event.comment.body, '@claude') &&
+          (
+            contains(format('{0} ', github.event.comment.body), '@claude ') ||
+            contains(github.event.comment.body, fromJSON('"@claude\n"')) ||
+            contains(github.event.comment.body, fromJSON('"@claude\r"'))
+          ) &&
           contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
         ) ||
         (
           github.event_name == 'pull_request_review_comment' &&
-          contains(github.event.comment.body, '@claude') &&
+          (
+            contains(format('{0} ', github.event.comment.body), '@claude ') ||
+            contains(github.event.comment.body, fromJSON('"@claude\n"')) ||
+            contains(github.event.comment.body, fromJSON('"@claude\r"'))
+          ) &&
           contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
         ) ||
         (
           github.event_name == 'pull_request_review' &&
-          contains(github.event.review.body, '@claude') &&
+          (
+            contains(format('{0} ', github.event.review.body), '@claude ') ||
+            contains(github.event.review.body, fromJSON('"@claude\n"')) ||
+            contains(github.event.review.body, fromJSON('"@claude\r"'))
+          ) &&
           contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.review.author_association)
         ) ||
         (
           github.event_name == 'issues' &&
-          (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')) &&
+          github.event.issue.user.login == 'lausellduane' &&
+          (
+            contains(format('{0} ', github.event.issue.body), '@claude ') ||
+            contains(github.event.issue.body, fromJSON('"@claude\n"')) ||
+            contains(github.event.issue.body, fromJSON('"@claude\r"')) ||
+            contains(format('{0} ', github.event.issue.title), '@claude ')
+          ) &&
           (
             (
               github.event.action == 'opened' &&
@@ -55,6 +76,7 @@ jobs:
         )
       )
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: write
       pull-requests: write
@@ -63,14 +85,23 @@ jobs:
       actions: read
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           fetch-depth: 1
 
       - name: Run Claude Code
         id: claude
-        uses: anthropics/claude-code-action@v1
+        uses: anthropics/claude-code-action@eb56b6666facdbd501035f4a0269d8caee2e7a8b # v1.0.289
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           # Alternative to the OAuth token (do not set both):
           # anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          allow_fork_prs: "false"
+          claude_args: |
+            --max-turns 15
+            --permission-mode acceptEdits
+            # npm/npx so the session can run this repo's tests under acceptEdits.
+            # Built-in file and GitHub tools still handle commits and opening a PR.
+            --allowedTools "Bash(npm:*),Bash(npx:*)"
+            # Hard-block merge, review, and approve even if the allow list grows.
+            --disallowedTools "Bash(gh pr merge:*),Bash(gh pr review:*),Bash(gh pr approve:*),Bash(git push origin master:*),Bash(git push origin main:*),Bash(git push origin HEAD:master:*),Bash(git push origin HEAD:main:*),Bash(git push -u origin master:*),Bash(git push -u origin main:*),Bash(git push --set-upstream origin master:*),Bash(git push --set-upstream origin main:*),Bash(git push --force:*),Bash(git push -f:*),Bash(git push --force-with-lease:*)"
