@@ -25,7 +25,7 @@ PR #13 (local builder workflow) may land separately. That path is a Windows self
 ## PR-only
 
 - Open a pull request against `master`.
-- Never merge, never push to `master` or `main`, never force-push, and never deploy.
+- Never merge, never approve a pull request, never push to `master` or `main`, never force-push, and never deploy.
 - Never change `.github/workflows` or repository secrets unless the approved change explicitly says to. Workflow files need the GitHub `workflow` scope; DevOps pushes those.
 
 ## If you are stuck

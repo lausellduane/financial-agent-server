@@ -8,7 +8,7 @@ body:
       value: >
         Use this only after Duane has approved the OpenSpec change and the
         change folder is on `master`. Claude will follow that folder's
-        `tasks.md`, open a pull request, and will not merge or deploy.
+        `tasks.md`, open a pull request, and will not merge, approve, or deploy.
   - type: input
     id: change-folder
     attributes:
@@ -33,7 +33,7 @@ body:
       value: |
         @claude Please implement this approved OpenSpec change.
 
-        Follow the change folder's tasks.md in order and tick tasks off as you go. Open a pull request against master. Do not merge, push to master, force-push, or deploy. If you are stuck or a requirement is unclear, comment on this issue and stop.
+        Follow the change folder's tasks.md in order and tick tasks off as you go. Open a pull request against master. Do not merge, approve a pull request, push to master, force-push, or deploy. If you are stuck or a requirement is unclear, comment on this issue and stop.
     validations:
       required: true
   - type: textarea
