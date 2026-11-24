@@ -102,6 +102,6 @@ jobs:
             --permission-mode acceptEdits
             # Exact test and typecheck commands only; no :* wildcards (args could run arbitrary scripts).
             # Built-in file and GitHub tools still handle commits and opening a PR.
-            --allowedTools "Bash(npm ci),Bash(npm test),Bash(npm run check:worker),Bash(npx tsc),Bash(npx vitest),Bash(npx tsx)"
+            --allowedTools "Bash(npm ci),Bash(npm test),Bash(npm run check:worker),Bash(npx tsc --noEmit)"
             # Hard-block all gh Bash, including merge, approve, and gh api.
             --disallowedTools "Bash(gh:*)"
