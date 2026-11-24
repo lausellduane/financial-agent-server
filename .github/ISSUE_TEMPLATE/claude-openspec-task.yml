@@ -1,0 +1,43 @@
+name: Claude OpenSpec task
+description: Hand an approved OpenSpec change to @claude to implement and open a PR.
+title: "[OpenSpec] "
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: >
+        Use this only after Duane has approved the OpenSpec change and the
+        change folder is on `master`. Claude will follow that folder's
+        `tasks.md`, open a pull request, and will not merge or deploy.
+  - type: input
+    id: change-folder
+    attributes:
+      label: OpenSpec change folder
+      description: Path or link under openspec/changes/.
+      placeholder: openspec/changes/<change-id>
+    validations:
+      required: true
+  - type: textarea
+    id: approval
+    attributes:
+      label: Approval
+      description: Confirm Duane approved this change, and link the approval if you have it (chat, Trello card, or review comment).
+      placeholder: Approved by Duane on YYYY-MM-DD. Card or note…
+    validations:
+      required: true
+  - type: textarea
+    id: claude-request
+    attributes:
+      label: Request for Claude
+      description: Keep the @claude mention so the GitHub Action starts. Do not remove it.
+      value: |
+        @claude Please implement this approved OpenSpec change.
+
+        Follow the change folder's tasks.md in order and tick tasks off as you go. Open a pull request against master. Do not merge, push to master, force-push, or deploy. If you are stuck or a requirement is unclear, comment on this issue and stop.
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Extra notes
+      description: Optional context Claude should know (scope limits, files to leave alone, related PRs).
