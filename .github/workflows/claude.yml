@@ -103,5 +103,5 @@ jobs:
             # Only this repo's test and typecheck commands under acceptEdits.
             # Built-in file and GitHub tools still handle commits and opening a PR.
             --allowedTools "Bash(npm ci),Bash(npm test:*),Bash(npm run check:worker),Bash(npx tsc:*),Bash(npx vitest:*),Bash(npx tsx:*)"
-            # Hard-block all gh and git push Bash, including merge, approve, and gh api.
-            --disallowedTools "Bash(gh:*),Bash(git push:*)"
+            # Hard-block all gh Bash, including merge, approve, and gh api.
+            --disallowedTools "Bash(gh:*)"
