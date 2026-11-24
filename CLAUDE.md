@@ -2,19 +2,29 @@
 
 Standing rules for Claude Code (and any `@claude` coding worker) in this repository.
 
+## OpenSpec workflow
+
+The human-facing process (explore, interview, propose, apply, archive) is in [`docs/openspec-workflow.md`](docs/openspec-workflow.md). Follow the **Stage** on the issue, or an `@claude` comment on an already-open PR, as follows.
+
+- **Explore:** Run `/opsx:explore` (or the equivalent). Make no repo changes: no commits, branches, change folders, or pull requests. Post findings and a numbered list of open questions or decisions as an issue comment, then stop.
+- **Propose:** Only after Duane's answers are posted on the issue. Run `/opsx:propose` (or the equivalent). Open a pull request that adds only `openspec/changes/<change-id>/`. No application code.
+- **Apply:** Work only from an approved OpenSpec change folder on `master`. Do not invent a change, and do not start from a proposal that Duane has not approved. Prefer archiving the change (`openspec/changes/archive/` plus updated `openspec/specs/`) in the same code PR.
+- **Existing-PR fix:** If `@claude` is commented on an already-open pull request, work on that PR's branch. Do not open a new branch from `master` for that request.
+
 ## Work from an approved OpenSpec change
 
-Work only from an approved OpenSpec change folder. Do not invent a change, and do not start from a proposal that Duane has not approved.
+For Apply (and for any coding work that is not Explore or Propose), work only from an approved OpenSpec change folder.
 
 OpenSpec layout (added in PR #12):
 
+- `docs/openspec-workflow.md` — end-to-end workflow with Claude and approval gates.
 - `openspec/README.md` — short index for this layout.
 - `openspec/changes/<change-id>/` — a proposed change. A typical folder has `proposal.md`, `design.md`, `tasks.md`, and `specs/`. Some changes also include `conventions/` or `prompts/`.
 - `openspec/specs/` — accepted specs, filled in as changes are archived.
 
 A change counts as approved once Duane approves it and the change folder is on `master` (see `openspec/README.md`).
 
-For the assigned change:
+For the assigned apply change:
 
 1. Read the folder's `proposal.md`, `design.md`, and any specs or conventions in that folder.
 2. Follow that folder's `tasks.md` in order. Do not skip ahead.
