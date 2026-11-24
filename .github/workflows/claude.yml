@@ -100,8 +100,8 @@ jobs:
           claude_args: |
             --max-turns 15
             --permission-mode acceptEdits
-            # npm/npx so the session can run this repo's tests under acceptEdits.
+            # Only this repo's test and typecheck commands under acceptEdits.
             # Built-in file and GitHub tools still handle commits and opening a PR.
-            --allowedTools "Bash(npm:*),Bash(npx:*)"
-            # Hard-block merge, review, and approve even if the allow list grows.
-            --disallowedTools "Bash(gh pr merge:*),Bash(gh pr review:*),Bash(gh pr approve:*),Bash(git push origin master:*),Bash(git push origin main:*),Bash(git push origin HEAD:master:*),Bash(git push origin HEAD:main:*),Bash(git push -u origin master:*),Bash(git push -u origin main:*),Bash(git push --set-upstream origin master:*),Bash(git push --set-upstream origin main:*),Bash(git push --force:*),Bash(git push -f:*),Bash(git push --force-with-lease:*)"
+            --allowedTools "Bash(npm ci),Bash(npm test:*),Bash(npm run check:worker),Bash(npx tsc:*),Bash(npx vitest:*),Bash(npx tsx:*)"
+            # Hard-block all gh and git push Bash, including merge, approve, and gh api.
+            --disallowedTools "Bash(gh:*),Bash(git push:*)"
