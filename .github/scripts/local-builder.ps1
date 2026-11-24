@@ -83,7 +83,8 @@ function Add-LocalBinToPath {
 
 function Get-NormalizedPath {
   param([string]$PathValue)
-  return (($PathValue -replace '\\', '/').Trim().TrimStart('./'))
+  # Strip only leading "./" (never every leading dot), so .github/x and .env keep their dot.
+  return (($PathValue -replace '\\', '/').Trim() -replace '^(\./+)+', '')
 }
 
 function Test-SafeRelPath {
@@ -120,11 +121,18 @@ function Test-ForbiddenPath {
   return $false
 }
 
+function Get-BaseRef {
+  # Same ref the branch was created from (set in parse-change); never local master.
+  if ($env:LOCAL_BUILDER_BASE) { return $env:LOCAL_BUILDER_BASE }
+  return 'origin/master'
+}
+
 function Get-ChangedFiles {
+  param([string]$BaseRef = (Get-BaseRef))
   Push-Location $env:GITHUB_WORKSPACE
   try {
     $names = @()
-    $names += @(git diff --name-only master 2>$null)
+    $names += @(git diff --name-only $BaseRef 2>$null)
     $names += @(git ls-files --others --exclude-standard 2>$null)
     $names = $names | Where-Object { $_ -and $_.Trim() } | ForEach-Object { Get-NormalizedPath $_ } | Sort-Object -Unique
     $names = @($names | Where-Object { -not (Test-AiderArtifact $_) })
@@ -461,13 +469,16 @@ switch ($Step) {
       $branch = "local-builder/issue-$($env:ISSUE_NUMBER)"
       $existing = git ls-remote --heads origin $branch
       if ($existing) {
-        Fail-Job "Branch $branch already exists on origin. Delete it or close the previous PR before retrying."
+        Write-JobLog "Branch $branch already exists on origin; recreating it from fresh origin/master."
       }
       git fetch --depth 1 origin master
       if ($LASTEXITCODE -ne 0) { Fail-Job 'git fetch origin master failed.' }
+      $baseSha = (git rev-parse origin/master).Trim()
+      if ($LASTEXITCODE -ne 0 -or -not $baseSha) { Fail-Job 'git rev-parse origin/master failed.' }
+      Set-JobEnv 'LOCAL_BUILDER_BASE' $baseSha
       # Recreate from origin/master so a stale local branch left in .git by a previous
       # failed job cannot block the design.md §6 relabel retry path.
-      git checkout -B $branch origin/master
+      git checkout -B $branch $baseSha
       if ($LASTEXITCODE -ne 0) { Fail-Job "Failed to create branch $branch from origin/master." }
       Write-JobLog "Created branch $branch from origin/master"
     } finally {
@@ -688,8 +699,9 @@ switch ($Step) {
     try {
       git config --local user.name 'github-actions[bot]'
       git config --local user.email '41898282+github-actions[bot]@users.noreply.github.com'
-      git reset --mixed master
-      if ($LASTEXITCODE -ne 0) { Fail-Job 'git reset --mixed master failed.' }
+      $baseRef = Get-BaseRef
+      git reset --mixed $baseRef
+      if ($LASTEXITCODE -ne 0) { Fail-Job "git reset --mixed $baseRef failed." }
       $toAdd = @()
       foreach ($p in $allowed) {
         $full = Join-Path $env:GITHUB_WORKSPACE $p
@@ -702,10 +714,18 @@ switch ($Step) {
       git diff --cached --quiet
       if ($LASTEXITCODE -eq 0) { Fail-Job 'Nothing to commit after staging allowed files.' }
       $msg = "[local-builder] ${changeId}: tasks ${taskNumbers}"
-      git commit -m $msg
-      if ($LASTEXITCODE -ne 0) { Fail-Job 'git commit failed.' }
+      # Agent-written hooks must never see the job token: no GH_TOKEN and no hooks during commit.
+      $savedToken = $env:GH_TOKEN
+      Remove-Item Env:GH_TOKEN -ErrorAction SilentlyContinue
+      try {
+        git -c core.hooksPath=NUL commit --no-verify -m $msg
+        $commitExit = $LASTEXITCODE
+      } finally {
+        $env:GH_TOKEN = $savedToken
+      }
+      if ($commitExit -ne 0) { Fail-Job 'git commit failed.' }
 
-      $changed = @(git diff --name-only master)
+      $changed = @(git diff --name-only $baseRef)
       $fileCount = @($changed).Count
 
       $headerName = 'http.https://github.com/.extraheader'
