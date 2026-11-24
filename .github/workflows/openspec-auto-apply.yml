@@ -1,0 +1,199 @@
+# When an approved OpenSpec change folder lands on master, open an Apply
+# issue and start Claude. An issue opened by github-actions[bot] would
+# not pass the @claude actor gate in claude.yml, so this workflow calls
+# claude.yml through workflow_call (automation mode) instead of relying
+# on a mention.
+#
+# Safety:
+# - Only runs on push to master.
+# - Continues only if the pusher, or the associated PR's author or
+#   merger, is lausellduane.
+# - Skips openspec/changes/archive/ and archive moves (deletes or
+#   renames out of changes/<id>/ with no remaining add/modify there).
+# - Reuses an existing open Apply issue with the same change-id marker
+#   (no duplicates) and does not start a second Claude run for it.
+# - Change IDs must match ^[a-z0-9-]+$. Issue title and body are never
+#   interpolated into ${{ }} in a run script.
+name: OpenSpec auto-apply
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "openspec/changes/**"
+
+permissions: {}
+
+jobs:
+  open-apply-issues:
+    name: Open Apply issues
+    if: github.ref == 'refs/heads/master' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
+    outputs:
+      start: ${{ steps.plan.outputs.start }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+
+      - name: Find change folders and open issues
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          echo "start=[]" >> "$GITHUB_OUTPUT"
+
+          if [[ "$BEFORE" =~ ^0+$ ]]; then
+            echo "No parent commit on this push; skipping."
+            exit 0
+          fi
+
+          extract_id() {
+            local path="$1"
+            case "$path" in
+              openspec/changes/archive/*)
+                return 0
+                ;;
+              openspec/changes/*/*)
+                local rest="${path#openspec/changes/}"
+                local id="${rest%%/*}"
+                if [[ "$id" =~ ^[a-z0-9-]+$ ]]; then
+                  printf '%s\n' "$id"
+                fi
+                ;;
+            esac
+          }
+
+          allowed=0
+          if [ "$ACTOR" = "lausellduane" ]; then
+            allowed=1
+          fi
+
+          if prs_json="$(gh api -H "Accept: application/vnd.github.groot-preview+json" "/repos/${GH_REPO}/commits/${AFTER}/pulls")"; then
+            if printf '%s' "$prs_json" | jq -e 'any(.[]; .user.login == "lausellduane" or (.merged_by.login // "") == "lausellduane")' >/dev/null; then
+              allowed=1
+            fi
+          fi
+
+          subject="$(git log -1 --format=%s "$AFTER")"
+          if [[ "$subject" =~ \#([0-9]+) ]]; then
+            pr_number="${BASH_REMATCH[1]}"
+            if [[ "$pr_number" =~ ^[1-9][0-9]*$ ]]; then
+              if pr_json="$(gh api "/repos/${GH_REPO}/pulls/${pr_number}")"; then
+                if printf '%s' "$pr_json" | jq -e '.user.login == "lausellduane" or (.merged_by.login // "") == "lausellduane"' >/dev/null; then
+                  allowed=1
+                fi
+              fi
+            fi
+          fi
+
+          if [ "$allowed" -ne 1 ]; then
+            echo "Skipping: pusher/author/merger is not lausellduane (actor=${ACTOR})."
+            exit 0
+          fi
+
+          mapfile -t diff_lines < <(git diff --name-status -M "$BEFORE" "$AFTER" -- "openspec/changes/" || true)
+
+          declare -A trigger_ids=()
+          if [ "${#diff_lines[@]}" -eq 0 ]; then
+            echo "No OpenSpec change-path diffs in this push."
+            exit 0
+          fi
+          for line in "${diff_lines[@]}"; do
+            [ -n "$line" ] || continue
+            status="${line%%$'\t'*}"
+            rest="${line#*$'\t'}"
+            src="${rest%%$'\t'*}"
+            dest=""
+            if [[ "$rest" == *$'\t'* ]]; then
+              dest="${rest#*$'\t'}"
+            fi
+            id=""
+            case "$status" in
+              A*|M*|C*)
+                id="$(extract_id "$src")"
+                ;;
+              R*)
+                id="$(extract_id "$dest")"
+                ;;
+              D*)
+                id=""
+                ;;
+            esac
+            if [ -n "$id" ]; then
+              trigger_ids["$id"]=1
+            fi
+          done
+
+          if [ "${#trigger_ids[@]}" -eq 0 ]; then
+            echo "No non-archive OpenSpec change folders were added or modified."
+            exit 0
+          fi
+
+          start_json='[]'
+          for id in "${!trigger_ids[@]}"; do
+            if [[ ! "$id" =~ ^[a-z0-9-]+$ ]]; then
+              echo "Skipping invalid change id."
+              continue
+            fi
+            folder="openspec/changes/${id}"
+            marker="openspec-auto-apply:change-id=${id}"
+
+            existing="$(gh issue list --repo "$GH_REPO" --state open --search "\"[OpenSpec] apply: ${id}\" in:title" --json number --jq '.[0].number // empty')"
+            if [ -n "$existing" ]; then
+              echo "Open Apply issue #${existing} already exists for ${folder}; not opening a duplicate or starting a second Claude run."
+              continue
+            fi
+
+            body_file="$(mktemp)"
+            {
+              printf '%s\n' "### Stage" "" "Apply" "" \
+                "### OpenSpec change folder" "" \
+                "${folder}" "" \
+                "### Approval" "" \
+                "Automatically opened after the change folder was merged to \`master\` in ${AFTER}. Merging that PR was Duane's green light for apply." \
+                "" "### Request for Claude" "" \
+                "@claude Please implement this approved OpenSpec change." \
+                "" \
+                "Follow the change folder's tasks.md in order and tick tasks off as you go. Prefer moving the change to openspec/changes/archive/ and updating openspec/specs/ in the same code PR. Open a pull request against master. Do not merge, approve a pull request, push to master, force-push, or deploy. If you are stuck or a requirement is unclear, comment on this issue and stop." \
+                "" \
+                "<!-- ${marker} -->"
+            } > "$body_file"
+            issue_url="$(gh issue create --repo "$GH_REPO" --title "[OpenSpec] apply: ${id}" --body-file "$body_file")"
+            rm -f "$body_file"
+            issue_number="${issue_url##*/}"
+            if [[ ! "$issue_number" =~ ^[1-9][0-9]*$ ]]; then
+              echo "Failed to parse issue number from ${issue_url}" >&2
+              exit 1
+            fi
+            echo "Opened Apply issue #${issue_number} for ${folder}."
+            start_json="$(jq -c --argjson n "$issue_number" --arg f "$folder" '. + [{issue_number: $n, change_folder: $f}]' <<<"$start_json")"
+          done
+
+          echo "start=${start_json}" >> "$GITHUB_OUTPUT"
+
+  start-claude:
+    name: Start Claude apply
+    needs: open-apply-issues
+    if: needs.open-apply-issues.outputs.start != '' && needs.open-apply-issues.outputs.start != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.open-apply-issues.outputs.start) }}
+    uses: ./.github/workflows/claude.yml
+    with:
+      issue_number: ${{ matrix.issue_number }}
+      change_folder: ${{ matrix.change_folder }}
+    secrets: inherit

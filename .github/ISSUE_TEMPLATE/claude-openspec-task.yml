@@ -1,43 +1,64 @@
 name: Claude OpenSpec task
-description: Hand an approved OpenSpec change to @claude to implement and open a PR.
+description: Start Claude on an OpenSpec Explore or Apply task. For Apply, the change folder must already be on master.
 title: "[OpenSpec] "
 labels: []
 body:
   - type: markdown
     attributes:
       value: >
-        Use this only after Duane has approved the OpenSpec change and the
-        change folder is on `master`. Claude will follow that folder's
-        `tasks.md`, open a pull request, and will not merge, approve, or deploy.
+        Pick a stage below. The full process is in
+        [docs/openspec-workflow.md](https://github.com/lausellduane/financial-agent-server/blob/master/docs/openspec-workflow.md).
+
+        **Explore** is for a new idea. Claude investigates and posts findings
+        plus numbered open questions. It must not change the repo.
+
+        **Apply** is for an approved change whose folder is already on
+        `master`. Claude follows that folder's `tasks.md`, opens a pull
+        request, and will not merge, approve, or deploy.
+
+        To fix an already-open pull request, do not use this form. Comment
+        `@claude` on that PR instead, after the change folder is on `master`.
+  - type: dropdown
+    id: stage
+    attributes:
+      label: Stage
+      description: Explore an idea, or apply an approved change folder that is already on master.
+      options:
+        - Explore
+        - Apply
+    validations:
+      required: true
   - type: input
     id: change-folder
     attributes:
       label: OpenSpec change folder
-      description: Path or link under openspec/changes/.
+      description: Required for Apply. Leave blank for Explore. Path or link under openspec/changes/.
       placeholder: openspec/changes/<change-id>
     validations:
-      required: true
+      required: false
   - type: textarea
     id: approval
     attributes:
       label: Approval
-      description: Confirm Duane approved this change, and link the approval if you have it (chat, Trello card, or review comment).
+      description: Required for Apply. Confirm Duane approved this change, and link the approval if you have it (chat, Trello card, or review comment). Leave blank for Explore.
       placeholder: Approved by Duane on YYYY-MM-DD. Card or note…
     validations:
-      required: true
+      required: false
   - type: textarea
     id: claude-request
     attributes:
       label: Request for Claude
-      description: Keep the @claude mention so the GitHub Action starts. Do not remove it.
+      description: Keep the @claude mention so the GitHub Action starts. Do not remove it. Follow the Stage selected above.
       value: |
-        @claude Please implement this approved OpenSpec change.
+        @claude Follow the Stage selected above.
 
-        Follow the change folder's tasks.md in order and tick tasks off as you go. Open a pull request against master. Do not merge, approve a pull request, push to master, force-push, or deploy. If you are stuck or a requirement is unclear, comment on this issue and stop.
+        If Stage is Explore: run /opsx:explore on the idea (or the equivalent if that command is not available). Make no repo changes — no commits, branches, change folders, or pull requests. Post your findings and a numbered list of open questions or decisions as a comment on this issue, then stop.
+
+        If Stage is Apply: implement this approved OpenSpec change. Follow the change folder's tasks.md in order and tick tasks off as you go. Prefer moving the change to openspec/changes/archive/ and updating openspec/specs/ in the same code PR. Open a pull request against master. Do not merge, approve a pull request, push to master, force-push, or deploy. If you are stuck or a requirement is unclear, comment on this issue and stop.
     validations:
       required: true
   - type: textarea
     id: notes
     attributes:
       label: Extra notes
-      description: Optional context Claude should know (scope limits, files to leave alone, related PRs).
+      description: Optional context Claude should know (the idea to explore, scope limits, files to leave alone, related PRs).

@@ -1,4 +1,9 @@
 # Responds to @claude mentions on issues, PR comments, and reviews.
+# Also accepts workflow_call (from openspec-auto-apply.yml) and
+# workflow_dispatch (manual retry by lausellduane) so Apply can start
+# without a mention from github-actions[bot], which would fail the
+# actor gate below.
+#
 # This file has to land through a login with the GitHub `workflow` scope
 # (DevOps). It only takes effect once it is on the default branch.
 #
@@ -7,6 +12,16 @@
 # CLAUDE_CODE_OAUTH_TOKEN. Alternative: replace the oauth input below
 # with anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}. Do not set
 # both. Never commit a token or API key.
+#
+# Actor-gate tradeoff: @claude events still require github.actor ==
+# lausellduane and a write-style association. workflow_call does not,
+# because a teammate (for example QA) may merge a proposal PR after
+# Duane's yes, and github.actor would then be that teammate. The caller
+# (openspec-auto-apply.yml) still requires the pusher, PR author, or
+# merger to be lausellduane. The remaining trust boundary is "who can
+# change workflows on master": anyone who can add a new caller could
+# already edit this file and remove the gate. workflow_dispatch stays
+# limited to lausellduane. No new secrets or paid services.
 name: Claude Code
 
 on:
@@ -18,60 +33,95 @@ on:
     types: [opened, assigned]
   pull_request_review:
     types: [submitted]
+  workflow_call:
+    inputs:
+      issue_number:
+        description: Apply issue for Claude to comment on
+        type: number
+        required: true
+      change_folder:
+        description: Path of the approved folder, for example openspec/changes/my-change
+        type: string
+        required: true
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: Apply issue number for Claude to comment on
+        type: number
+        required: true
+      change_folder:
+        description: Path of the approved folder, for example openspec/changes/my-change
+        type: string
+        required: true
 
 permissions: {}
 
 jobs:
   claude:
-    # Only lausellduane can start a run, and only with a write-style
+    # Mention path: only lausellduane, and only with a write-style
     # association. Fork PRs and outside commenters are skipped.
     # @claude is matched with a trailing boundary (space, end of text, or
     # newline) so @claudette and user@claude.com do not trigger.
+    # Automation path: workflow_call from openspec-auto-apply, or
+    # workflow_dispatch by lausellduane, with a validated change folder.
     if: |
-      github.actor == 'lausellduane' &&
       (
+        github.event_name == 'workflow_call' &&
+        inputs.change_folder != '' &&
+        inputs.issue_number != 0
+      ) ||
+      (
+        github.event_name == 'workflow_dispatch' &&
+        github.actor == 'lausellduane' &&
+        inputs.change_folder != '' &&
+        inputs.issue_number != 0
+      ) ||
+      (
+        github.actor == 'lausellduane' &&
         (
-          github.event_name == 'issue_comment' &&
           (
-            contains(format('{0} ', github.event.comment.body), '@claude ') ||
-            contains(github.event.comment.body, fromJSON('"@claude\n"')) ||
-            contains(github.event.comment.body, fromJSON('"@claude\r"'))
-          ) &&
-          contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
-        ) ||
-        (
-          github.event_name == 'pull_request_review_comment' &&
-          (
-            contains(format('{0} ', github.event.comment.body), '@claude ') ||
-            contains(github.event.comment.body, fromJSON('"@claude\n"')) ||
-            contains(github.event.comment.body, fromJSON('"@claude\r"'))
-          ) &&
-          contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
-        ) ||
-        (
-          github.event_name == 'pull_request_review' &&
-          (
-            contains(format('{0} ', github.event.review.body), '@claude ') ||
-            contains(github.event.review.body, fromJSON('"@claude\n"')) ||
-            contains(github.event.review.body, fromJSON('"@claude\r"'))
-          ) &&
-          contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.review.author_association)
-        ) ||
-        (
-          github.event_name == 'issues' &&
-          github.event.issue.user.login == 'lausellduane' &&
-          (
-            contains(format('{0} ', github.event.issue.body), '@claude ') ||
-            contains(github.event.issue.body, fromJSON('"@claude\n"')) ||
-            contains(github.event.issue.body, fromJSON('"@claude\r"')) ||
-            contains(format('{0} ', github.event.issue.title), '@claude ')
-          ) &&
-          (
+            github.event_name == 'issue_comment' &&
             (
-              github.event.action == 'opened' &&
-              contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.issue.author_association)
-            ) ||
-            github.event.action == 'assigned'
+              contains(format('{0} ', github.event.comment.body), '@claude ') ||
+              contains(github.event.comment.body, fromJSON('"@claude\n"')) ||
+              contains(github.event.comment.body, fromJSON('"@claude\r"'))
+            ) &&
+            contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+          ) ||
+          (
+            github.event_name == 'pull_request_review_comment' &&
+            (
+              contains(format('{0} ', github.event.comment.body), '@claude ') ||
+              contains(github.event.comment.body, fromJSON('"@claude\n"')) ||
+              contains(github.event.comment.body, fromJSON('"@claude\r"'))
+            ) &&
+            contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+          ) ||
+          (
+            github.event_name == 'pull_request_review' &&
+            (
+              contains(format('{0} ', github.event.review.body), '@claude ') ||
+              contains(github.event.review.body, fromJSON('"@claude\n"')) ||
+              contains(github.event.review.body, fromJSON('"@claude\r"'))
+            ) &&
+            contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.review.author_association)
+          ) ||
+          (
+            github.event_name == 'issues' &&
+            github.event.issue.user.login == 'lausellduane' &&
+            (
+              contains(format('{0} ', github.event.issue.body), '@claude ') ||
+              contains(github.event.issue.body, fromJSON('"@claude\n"')) ||
+              contains(github.event.issue.body, fromJSON('"@claude\r"')) ||
+              contains(format('{0} ', github.event.issue.title), '@claude ')
+            ) &&
+            (
+              (
+                github.event.action == 'opened' &&
+                contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.issue.author_association)
+              ) ||
+              github.event.action == 'assigned'
+            )
           )
         )
       )
@@ -89,6 +139,41 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: Build apply prompt
+        id: apply-prompt
+        if: github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch'
+        env:
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          CHANGE_FOLDER: ${{ inputs.change_folder }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$ISSUE_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+            echo "Invalid issue_number" >&2
+            exit 1
+          fi
+          folder="${CHANGE_FOLDER%/}"
+          if [[ ! "$folder" =~ ^openspec/changes/[a-z0-9-]+$ ]]; then
+            echo "Invalid change_folder (expected openspec/changes/<id>, id matching [a-z0-9-]+)" >&2
+            exit 1
+          fi
+          {
+            echo "prompt<<OPENSPEC_PROMPT_EOF"
+            echo "You were started automatically after the OpenSpec change folder was merged to master (Duane's green light for apply)."
+            echo
+            echo "Implement the approved OpenSpec change in ${folder} (issue #${ISSUE_NUMBER})."
+            echo
+            echo "Run /opsx:apply if that command is available; otherwise follow the change folder's tasks.md in order and tick tasks off as you go."
+            echo
+            echo "Prefer archiving in the same code PR: when the tasks are done, move the change folder to openspec/changes/archive/ and update openspec/specs/ so accepted specs match what is going live. If archive cannot be included in this PR, open a short follow-up PR for it after."
+            echo
+            echo "Post progress and the PR link as comments on issue #${ISSUE_NUMBER}."
+            echo
+            echo "Open a pull request against master. Do not merge, approve a pull request, push to master, force-push, or deploy. If you are stuck or a requirement is unclear, comment on the issue and stop."
+            echo
+            echo "Work only from the approved change folder. Do not invent extra scope."
+            echo "OPENSPEC_PROMPT_EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Run Claude Code
         id: claude
         uses: anthropics/claude-code-action@eb56b6666facdbd501035f4a0269d8caee2e7a8b # v1.0.289
@@ -97,6 +182,8 @@ jobs:
           # Alternative to the OAuth token (do not set both):
           # anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           allow_fork_prs: "false"
+          # Empty on @claude mention events so the action stays in interactive mode.
+          prompt: ${{ steps.apply-prompt.outputs.prompt }}
           claude_args: |
             --max-turns 50
             --permission-mode acceptEdits
