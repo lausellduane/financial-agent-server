@@ -3,7 +3,7 @@
 ## MODIFIED Requirements
 
 ### Requirement: Least-privilege, secret-free job
-The workflow SHALL authenticate only with per-job `GITHUB_TOKEN`s. The workflow-level permission MUST be `permissions: {}`. The self-hosted `build` job, which runs the agent and model-written code, MUST be granted only `contents: read`. Write scopes MUST be granted only to jobs that run on GitHub-hosted runners and run no agent or model-written code: `start` (`issues: write`), `publish` (`contents: write`, `pull-requests: write`, `issues: write`), and `report` (`issues: write`). The workflow MUST NOT reference any repository, environment, or organization secret. Every checkout MUST use `persist-credentials: false`.
+The workflow SHALL authenticate only with per-job `GITHUB_TOKEN`s. The workflow-level permission MUST be `permissions: {}`. The self-hosted `build` job, which runs the agent and model-written code, MUST be granted only `contents: read`. Write scopes MUST be granted only to jobs that run on GitHub-hosted runners and run no agent or model-written code: `start` (`contents: read`, `issues: write`), `publish` (`contents: write`, `pull-requests: write`, `issues: write`), and `report` (`contents: read`, `issues: write`). The workflow MUST NOT reference any repository, environment, or organization secret. Every checkout MUST use `persist-credentials: false`.
 
 #### Scenario: Secrets are absent
 - **WHEN** Code Reviewer inspects the workflow file
@@ -58,7 +58,7 @@ The `publish` job SHALL treat the `build` artifact as untrusted data. It MUST re
 - **THEN** `publish` rejects it, because stats values must come from fixed sets
 
 ### Requirement: Failure reporting from a GitHub-hosted job
-Failure comments and labels for `build` and `publish` failures SHALL be posted by a `report` job on `ubuntu-latest` with `issues: write`. It runs when `start` succeeded and `publish` did not succeed. Text from the `build` report artifact MUST be treated as untrusted: size-capped, token-redacted, `@` mentions neutralized, workflow-command lines neutralized, and fenced safely. If the artifact is missing, a fixed fallback message MUST be posted. `report` MUST add `local-builder-failed` and remove `local-builder-running`.
+Failure comments and labels for `start`, `build`, and `publish` failures SHALL be posted by a `report` job on `ubuntu-latest` with `issues: write`. It runs when `start` ran (was not skipped by the owner guard) and `publish` did not succeed. Text from the `build` report artifact MUST be treated as untrusted: size-capped, token-redacted, `@` mentions neutralized, workflow-command lines neutralized, and fenced safely. If the artifact is missing, a fixed fallback message MUST be posted. `report` MUST add `local-builder-failed` and remove `local-builder-running`.
 
 #### Scenario: Ollama down
 - **WHEN** the pre-flight check in `build` fails

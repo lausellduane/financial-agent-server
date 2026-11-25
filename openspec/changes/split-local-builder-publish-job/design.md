@@ -47,7 +47,7 @@ permissions: {}
 concurrency: { group: local-builder, cancel-in-progress: false }
 
 jobs:
-  start:            # ubuntu-latest, issues: write
+  start:            # ubuntu-latest, contents: read + issues: write
     if: <owner-only guard, unchanged>
     outputs: { change_id, task_spec, job_start }
     # parse event payload (regexes unchanged), swap local-builder -> local-builder-running, record start time
@@ -69,9 +69,9 @@ jobs:
     # checkout github.sha (persist-credentials: false), download local-builder-result,
     # validate + apply + commit + lease push + open/reuse PR + label PR + drop local-builder-running
 
-  report:           # ubuntu-latest, issues: write
+  report:           # ubuntu-latest, contents: read + issues: write
     needs: [start, build, publish]
-    if: always() && needs.start.result == 'success' && needs.publish.result != 'success'
+    if: always() && needs.start.result != 'skipped' && needs.publish.result != 'success'
     # reason: needs.publish.outputs.reason if build succeeded, else local-builder-report artifact
     # (continue-on-error; fallback text if missing); sanitize, comment, labels
 ```
@@ -83,7 +83,8 @@ Notes:
   removes. `start` also does the `tasks.md exists on master` API check. `build` receives `change_id`, `task_spec`,
   and `job_start` as `needs.start.outputs`, which are trusted because `start` runs no repo code.
 - **`report`'s condition** covers every failure: `build` failed, timed out, or was cancelled (so `publish` is
-  skipped), or `publish` failed. If `start` itself failed, its own failure step comments, which needs no artifact.
+  skipped), or `publish` failed, or `start` itself failed after the guard passed (it exposes a `reason` output).
+  `start`, `publish`, and `report` also get `contents: read`, which their checkout needs.
   `needs.<job>.result` and `always()` in a dependent job are standard practice but not spelled out on the pages
   checked **[unverified]**. The apply step confirms them with a dry run (task 6.2).
 - **`build` keeps `contents: read`, not `permissions: {}`** (recommended default, §10). `actions/checkout` uses

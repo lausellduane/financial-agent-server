@@ -1,10 +1,9 @@
 # Change: Move the local builder's publish into its own job (server PR #13)
 
-> **Status: DRAFT for Duane's approval.** Prepared Nov 24, 2026 from the code review of
+> **Status: BUILT on the PR #13 branch (`chore/local-builder-workflow`, commit `960c5f4`) at Duane's direct
+> request, Nov 24, 2026.** This folder records the design and its as-built notes (tasks.md).
+> Prepared Nov 24, 2026 from the code review of
 > [PR #13](https://github.com/lausellduane/financial-agent-server/pull/13) at `1ee78fb`.
-> Nothing is applied until Duane merges this folder to `master`. The work then lands on the PR #13 branch
-> (`chore/local-builder-workflow`) through an `@claude` comment on PR #13, per the
-> [Existing-PR fixes](../../../docs/openspec-workflow.md#existing-pr-fixes) path.
 > This change explicitly allows edits to `.github/workflows/local-builder.yml` and `.github/scripts/local-builder*.ps1`.
 
 ## Why
@@ -31,7 +30,7 @@ therefore can't be reached by either attack.
 
 The workflow becomes four jobs. Only the self-hosted job runs model-written code, and it gets no write token.
 
-1. **`start`** (`ubuntu-latest`, `issues: write`). It has the owner-only `if:` guard. It parses the change ID and
+1. **`start`** (`ubuntu-latest`, `contents: read`, `issues: write`). It has the owner-only `if:` guard. It parses the change ID and
    `tasks:` line from the event payload, swaps `local-builder` for `local-builder-running` on the issue, and
    records the job start time. It runs no repo code.
 2. **`build`** (`[self-hosted, windows, local-builder]`, `contents: read` only). Pre-flight, checkout of
@@ -47,7 +46,7 @@ The workflow becomes four jobs. Only the self-hosted job runs model-written code
    - It validates the manifest against those rules, writes the files, and checks the resulting git diff again.
    - It commits, does the lease-guarded push, and opens or reuses the PR (ported from `local-builder.ps1`).
    - It never runs `npm`, `node`, tests, or any file from the artifact.
-4. **`report`** (`ubuntu-latest`, `issues: write`, runs `if: always()` when `start` ran and `build` or `publish`
+4. **`report`** (`ubuntu-latest`, `contents: read`, `issues: write`, runs `if: always()` when `start` ran and `start`, `build`, or `publish`
    did not succeed). It posts the failure comment and the `local-builder-failed` label. Comment text from the
    `build` artifact is sanitized and size-capped.
 
