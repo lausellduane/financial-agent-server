@@ -17,6 +17,15 @@ $ScenarioPath = Join-Path $env:RUNNER_TEMP 'scenarios.txt'
 $ExcerptPath = Join-Path $env:RUNNER_TEMP 'test-failure-excerpt.txt'
 $PromptPath = Join-Path $env:RUNNER_TEMP 'job-prompt.md'
 $TaskNumsPath = Join-Path $env:RUNNER_TEMP 'task-numbers.txt'
+$GitIntegrityPath = Join-Path $env:RUNNER_TEMP 'local-builder-git-integrity.txt'
+
+function Assert-GitIntegrity {
+  if (-not (Test-Path -LiteralPath $GitIntegrityPath)) { Fail-Job 'The .git snapshot from parse-change is missing. Nothing will be pushed.' }
+  $expected = [string](Get-Content -LiteralPath $GitIntegrityPath -Raw -Encoding UTF8)
+  if ([string](Get-GitIntegrity) -ne $expected) {
+    Fail-Job '.git/config or .git/hooks changed after checkout. Nothing will be pushed.'
+  }
+}
 
 function Write-JobLog {
   param([string]$Message)
@@ -140,6 +149,82 @@ function Get-ChangedFiles {
   } finally {
     Pop-Location
   }
+}
+
+function Get-GitIntegrity {
+  # Hash of .git/config and every file under .git/hooks. Model-written code runs during
+  # npm test, so publish must not trust either unless it matches the post-checkout snapshot.
+  param([string]$Workspace = $env:GITHUB_WORKSPACE)
+  $gitDir = Join-Path $Workspace '.git'
+  $files = @()
+  $config = Join-Path $gitDir 'config'
+  if (Test-Path -LiteralPath $config) { $files += Get-Item -LiteralPath $config -Force }
+  $hooks = Join-Path $gitDir 'hooks'
+  if (Test-Path -LiteralPath $hooks) { $files += @(Get-ChildItem -LiteralPath $hooks -Recurse -Force -File) }
+  $lines = foreach ($f in ($files | Sort-Object FullName)) {
+    $rel = $f.FullName.Substring($gitDir.Length) -replace '\\', '/'
+    '{0} {1}' -f (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash, $rel
+  }
+  return (@($lines) -join "`n")
+}
+
+function Invoke-PublishGit {
+  # Runs git with no hooks, no fsmonitor, no global config, and no token in the environment.
+  # The auth header (if any) reaches only this git process, through GIT_CONFIG_* variables,
+  # and is never written to .git/config.
+  param([string[]]$GitArgs, [string]$AuthHeader)
+  # git writes progress to stderr; under Stop, PowerShell 5.1 would turn that into an error.
+  $ErrorActionPreference = 'Continue'
+  $names = 'GH_TOKEN', 'GITHUB_TOKEN', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0'
+  $saved = @{}
+  foreach ($n in $names) { $saved[$n] = [Environment]::GetEnvironmentVariable($n, 'Process') }
+  try {
+    foreach ($n in $names) { [Environment]::SetEnvironmentVariable($n, $null, 'Process') }
+    $env:GIT_CONFIG_GLOBAL = 'NUL'
+    if ($AuthHeader) {
+      $env:GIT_CONFIG_COUNT = '1'
+      $env:GIT_CONFIG_KEY_0 = 'http.https://github.com/.extraheader'
+      $env:GIT_CONFIG_VALUE_0 = $AuthHeader
+    }
+    $out = & git -c core.hooksPath=NUL -c core.fsmonitor=false -c credential.helper= @GitArgs 2>&1
+    return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = (($out | ForEach-Object { "$_" }) -join "`n") }
+  } finally {
+    foreach ($n in $names) { [Environment]::SetEnvironmentVariable($n, $saved[$n], 'Process') }
+  }
+}
+
+function Get-PublishPushArgs {
+  # Lease-guarded force push of the issue branch only. An empty ExpectedSha means the
+  # branch must not exist yet. Anything but local-builder/issue-N (master included) is refused.
+  param([string]$RemoteUrl, [string]$Branch, [string]$ExpectedSha)
+  if ($Branch -notmatch '^local-builder/issue-[0-9]+$') { throw "Refusing to push branch '$Branch'." }
+  if ($ExpectedSha -and $ExpectedSha -notmatch '^[0-9a-f]{40}$') { throw "Invalid expected sha '$ExpectedSha'." }
+  return @('push', "--force-with-lease=refs/heads/${Branch}:$ExpectedSha", $RemoteUrl, "HEAD:refs/heads/$Branch")
+}
+
+function Get-RemoteBranchSha {
+  param([string]$RemoteUrl, [string]$Branch, [string]$AuthHeader)
+  $r = Invoke-PublishGit -GitArgs @('ls-remote', '--heads', $RemoteUrl, "refs/heads/$Branch") -AuthHeader $AuthHeader
+  if ($r.ExitCode -ne 0) { throw "git ls-remote failed: $($r.Output)" }
+  foreach ($line in ($r.Output -split "`n")) {
+    if ($line -match "^([0-9a-f]{40})\s+refs/heads/$([regex]::Escape($Branch))$") { return $Matches[1] }
+  }
+  return ''
+}
+
+function Publish-PullRequest {
+  # Reuses an open PR for the branch (a relabel retry after a previous run opened one);
+  # otherwise opens a new one. Returns the PR object.
+  param([string]$Repo, [string]$Branch, [string]$Title, [string]$Body)
+  $owner = ($Repo -split '/')[0]
+  $open = @(Invoke-GitHub -Method GET -Uri "https://api.github.com/repos/$Repo/pulls?state=open&head=$($owner):$Branch")
+  $payload = @{ title = $Title; body = $Body }
+  if ($open.Count -gt 0 -and $open[0].number) {
+    return Invoke-GitHub -Method PATCH -Uri "https://api.github.com/repos/$Repo/pulls/$($open[0].number)" -Body ($payload | ConvertTo-Json -Depth 5)
+  }
+  $payload.head = $Branch
+  $payload.base = 'master'
+  return Invoke-GitHub -Method POST -Uri "https://api.github.com/repos/$Repo/pulls" -Body ($payload | ConvertTo-Json -Depth 5)
 }
 
 function Get-TaskBlocks {
@@ -376,6 +461,13 @@ switch ($Step) {
       Write-JobLog "Warning: CI uses Node 22; this machine has $nodeVer. Jobs may still run, but install Node 22 LTS if tests fail."
     }
 
+    # Publish relies on GIT_CONFIG_GLOBAL (2.32+) and GIT_CONFIG_COUNT (2.31+).
+    $gitVer = (& git --version 2>&1 | Out-String).Trim()
+    Write-JobLog $gitVer
+    if ($gitVer -notmatch '(\d+)\.(\d+)' -or [int]$Matches[1] -lt 2 -or ([int]$Matches[1] -eq 2 -and [int]$Matches[2] -lt 32)) {
+      Fail-Job "Git 2.32 or newer is required for the publish step; this machine has '$gitVer'."
+    }
+
     $npm = Get-Command npm -ErrorAction SilentlyContinue
     if (-not $npm) { Fail-Job 'npm was not found on PATH. Install Node.js 22 LTS for the runner account and restart the runner.' }
 
@@ -481,6 +573,8 @@ switch ($Step) {
       git checkout -B $branch $baseSha
       if ($LASTEXITCODE -ne 0) { Fail-Job "Failed to create branch $branch from origin/master." }
       Write-JobLog "Created branch $branch from origin/master"
+      # Before any model-written code runs: guard and publish compare against this.
+      Set-Content -LiteralPath $GitIntegrityPath -Value (Get-GitIntegrity) -Encoding UTF8 -NoNewline
     } finally {
       Pop-Location
     }
@@ -676,6 +770,8 @@ switch ($Step) {
     } finally {
       Pop-Location
     }
+    # npm test and tsc above ran model-written code; check .git last.
+    Assert-GitIntegrity
   }
 
   'publish' {
@@ -697,46 +793,43 @@ switch ($Step) {
 
     Push-Location $env:GITHUB_WORKSPACE
     try {
-      git config --local user.name 'github-actions[bot]'
-      git config --local user.email '41898282+github-actions[bot]@users.noreply.github.com'
+      # Model-written code ran in earlier steps. Check .git before any git command, then run
+      # every git command through Invoke-PublishGit (no hooks, no fsmonitor, no global config,
+      # no token in the environment).
+      Assert-GitIntegrity
       $baseRef = Get-BaseRef
-      git reset --mixed $baseRef
-      if ($LASTEXITCODE -ne 0) { Fail-Job "git reset --mixed $baseRef failed." }
+      $r = Invoke-PublishGit -GitArgs @('reset', '--mixed', $baseRef)
+      if ($r.ExitCode -ne 0) { Fail-Job "git reset --mixed $baseRef failed." }
       $toAdd = @()
       foreach ($p in $allowed) {
         $full = Join-Path $env:GITHUB_WORKSPACE $p
         $exists = Test-Path -LiteralPath $full
-        $tracked = git ls-files --error-unmatch $p 2>$null
-        if ($exists -or $LASTEXITCODE -eq 0) { $toAdd += $p }
+        $tracked = (Invoke-PublishGit -GitArgs @('ls-files', '--error-unmatch', '--', $p)).ExitCode -eq 0
+        if ($exists -or $tracked) { $toAdd += $p }
       }
       if ($toAdd.Count -eq 0) { Fail-Job 'Nothing to commit after staging allowed files.' }
-      git add -- @toAdd
-      git diff --cached --quiet
-      if ($LASTEXITCODE -eq 0) { Fail-Job 'Nothing to commit after staging allowed files.' }
+      $r = Invoke-PublishGit -GitArgs (@('add', '--') + $toAdd)
+      if ($r.ExitCode -ne 0) { Fail-Job "git add failed. $($r.Output)" }
+      if ((Invoke-PublishGit -GitArgs @('diff', '--cached', '--quiet')).ExitCode -eq 0) { Fail-Job 'Nothing to commit after staging allowed files.' }
       $msg = "[local-builder] ${changeId}: tasks ${taskNumbers}"
-      # Agent-written hooks must never see the job token: no GH_TOKEN and no hooks during commit.
-      $savedToken = $env:GH_TOKEN
-      Remove-Item Env:GH_TOKEN -ErrorAction SilentlyContinue
-      try {
-        git -c core.hooksPath=NUL commit --no-verify -m $msg
-        $commitExit = $LASTEXITCODE
-      } finally {
-        $env:GH_TOKEN = $savedToken
-      }
-      if ($commitExit -ne 0) { Fail-Job 'git commit failed.' }
+      $r = Invoke-PublishGit -GitArgs @('-c', 'user.name=github-actions[bot]', '-c', 'user.email=41898282+github-actions[bot]@users.noreply.github.com', 'commit', '--no-verify', '-m', $msg)
+      if ($r.ExitCode -ne 0) { Fail-Job "git commit failed. $($r.Output)" }
 
-      $changed = @(git diff --name-only $baseRef)
+      $changed = @((Invoke-PublishGit -GitArgs @('diff', '--name-only', $baseRef)).Output -split "`n" | Where-Object { $_ })
       $fileCount = @($changed).Count
 
-      $headerName = 'http.https://github.com/.extraheader'
-      $headerValue = "AUTHORIZATION: bearer $($env:GH_TOKEN)"
-      git config --local $headerName $headerValue
+      # A relabel retry recreated the branch from fresh master, so overwrite the old remote
+      # branch, but only if it is still where ls-remote saw it (lease), and never master.
+      $remoteUrl = "https://github.com/$($env:GITHUB_REPOSITORY).git"
+      $authHeader = "AUTHORIZATION: bearer $($env:GH_TOKEN)"
       try {
-        git push "https://github.com/$($env:GITHUB_REPOSITORY).git" "HEAD:refs/heads/$branch"
-        if ($LASTEXITCODE -ne 0) { Fail-Job "git push of $branch failed." }
-      } finally {
-        git config --local --unset $headerName
+        $remoteSha = Get-RemoteBranchSha -RemoteUrl $remoteUrl -Branch $branch -AuthHeader $authHeader
+      } catch {
+        Fail-Job "Could not read $branch on origin. $($_.Exception.Message)"
       }
+      if ($remoteSha) { Write-JobLog "Replacing existing $branch at $remoteSha (lease-guarded)." }
+      $r = Invoke-PublishGit -GitArgs (Get-PublishPushArgs -RemoteUrl $remoteUrl -Branch $branch -ExpectedSha $remoteSha) -AuthHeader $authHeader
+      if ($r.ExitCode -ne 0) { Fail-Job "git push of $branch failed. $($r.Output)" }
 
       $scenarios = @()
       if (Test-Path -LiteralPath $ScenarioPath) {
@@ -762,15 +855,8 @@ $scenarioMd
 | Files changed | $fileCount |
 | Issue / change | #$issue / openspec/changes/$changeId |
 "@
-      $payload = @{
-        title = "[local-builder] ${changeId}: tasks ${taskNumbers}"
-        head  = $branch
-        base  = 'master'
-        body  = $prBody
-      } | ConvertTo-Json -Depth 5
-      # PowerShell 5.1 can emit Enum-style capitalization; title/head/base/body are strings only.
-      $pr = Invoke-GitHub -Method POST -Uri "https://api.github.com/repos/$($env:GITHUB_REPOSITORY)/pulls" -Body $payload
-      Write-JobLog "Opened PR $($pr.html_url)"
+      $pr = Publish-PullRequest -Repo $env:GITHUB_REPOSITORY -Branch $branch -Title "[local-builder] ${changeId}: tasks ${taskNumbers}" -Body $prBody
+      Write-JobLog "Opened or updated PR $($pr.html_url)"
       $prNumber = $pr.number
       $labelBody = '{"labels":["local-builder"]}'
       Invoke-GitHub -Method POST -Uri "https://api.github.com/repos/$($env:GITHUB_REPOSITORY)/issues/$prNumber/labels" -Body $labelBody | Out-Null

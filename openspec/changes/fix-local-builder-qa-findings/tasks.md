@@ -12,6 +12,7 @@
 - [x] 2.1 Change the publish commit to `git -c core.hooksPath=NUL commit --no-verify -m $msg`.
 - [x] 2.2 Remove `GH_TOKEN` from the environment during commit; set it only for the push and the PR-create call.
 - [x] 2.3 Test: a planted `.git/hooks/pre-commit` that writes `$env:GH_TOKEN` does not run and nothing is leaked.
+- [x] 2.4 Review follow-up: run every publish git command with hooks, fsmonitor, global config, and tokens off; give the push its auth header only through git's environment (never `.git/config`); fail if `.git/config` or `.git/hooks` changed after checkout. Harness cases included.
 
 ## 3. Step timeouts (LOW)
 - [x] 3.1 Add `timeout-minutes` (<= 10) to: Record start time and mark issue running, Parse change id, Checkout, Parse change and create branch, Commit/push/open PR, Comment on failure, Cleanup workspace.
@@ -25,6 +26,7 @@
 ## 5. Relabel retry (LOW)
 - [x] 5.1 When `local-builder/issue-N` already exists on origin, recreate that branch from freshly fetched `origin/master` (decided by Duane, Nov 24).
 - [x] 5.2 Test or harness case for an existing branch.
+- [x] 5.3 Review follow-up: push with `--force-with-lease` to `local-builder/issue-N` only (never `master`), and reuse an open PR for that branch. Harness cases included.
 
 ## 6. Guard diff base (LOW)
 - [x] 6.1 Record the base ref used to create the branch (fresh `origin/master`) and diff `Get-ChangedFiles` against it.
