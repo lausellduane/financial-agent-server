@@ -184,11 +184,25 @@ jobs:
           allow_fork_prs: "false"
           # Empty on @claude mention events so the action stays in interactive mode.
           prompt: ${{ steps.apply-prompt.outputs.prompt }}
+          # Request workflows:write on the Claude GitHub App token minted
+          # via OIDC. Job-level `permissions: workflows: write` is not a
+          # valid GITHUB_TOKEN scope and is not set. The official Claude
+          # app already lists workflows:write, but the default token
+          # exchange only asks for contents, pull_requests, and issues.
+          # actions:read matches the job permission already declared
+          # above so Claude can read CI logs.
+          additional_permissions: |
+            actions: read
+            workflows: write
           claude_args: |
             --max-turns 50
             --permission-mode acceptEdits
-            # Exact test and typecheck commands only; no :* wildcards (args could run arbitrary scripts).
+            --append-system-prompt "This repository requests workflows:write on the Claude GitHub App token. You may create, edit, commit, and push files under .github/workflows/ when the user request or an approved OpenSpec change requires it. Ignore the earlier limitation that you cannot modify that directory. Do not merge, approve pull requests, push to master, force-push, or deploy."
+            # Exact test and typecheck commands only; no Bash(*) and no
+            # Bash(pwsh:*) (that would allow pwsh -Command). pwsh -File
+            # patterns let Claude run repo test scripts. ubuntu-latest
+            # already has pwsh, so this job does not install it.
             # Built-in file and GitHub tools still handle commits and opening a PR.
-            --allowedTools "Bash(npm ci),Bash(npm test),Bash(npm run check:worker),Bash(npx tsc --noEmit)"
+            --allowedTools "Bash(npm ci),Bash(npm test),Bash(npm run check:worker),Bash(npx tsc --noEmit),Bash(pwsh -File *),Bash(pwsh -NoProfile -File *)"
             # Hard-block all gh Bash, including merge, approve, and gh api.
             --disallowedTools "Bash(gh:*)"
