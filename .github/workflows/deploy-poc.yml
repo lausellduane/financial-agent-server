@@ -61,11 +61,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      # No `cache: npm` here on purpose: this job holds the Cloudflare token, so it
+      # must not restore (or save) an Actions cache that another default-branch
+      # run could have written. npm ci still checks lockfile integrity hashes.
       - name: Setup Node
         uses: actions/setup-node@v6
         with:
           node-version: "22"
-          cache: npm
 
       - name: Install
         run: npm ci
