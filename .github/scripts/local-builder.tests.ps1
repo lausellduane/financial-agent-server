@@ -76,5 +76,76 @@ try {
   Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 }
 
+# 3. Every step in local-builder.yml has timeout-minutes; non-Aider steps use 10 or less
+$workflow = Join-Path $PSScriptRoot '..\workflows\local-builder.yml'
+$steps = @()
+$current = $null
+foreach ($line in (Get-Content -LiteralPath $workflow -Encoding UTF8)) {
+  if ($line -match '^      - name: (.+)$') {
+    $current = [pscustomobject]@{ Name = $Matches[1].Trim(); Lines = @() }
+    $steps += $current
+  } elseif ($current -and $line -match '^        \S') {
+    $current.Lines += $line
+  }
+}
+Check 'workflow has steps' ($steps.Count -gt 10)
+foreach ($s in $steps) {
+  $t = $s.Lines | Where-Object { $_ -match '^        timeout-minutes:\s*(\d+)\s*$' } | Select-Object -First 1
+  $minutes = if ($t -and $t -match '(\d+)') { [int]$Matches[1] } else { 0 }
+  Check "timeout-minutes set: $($s.Name)" ($minutes -gt 0)
+  if ($s.Name -notlike 'Aider attempt*') {
+    Check "timeout-minutes <= 10: $($s.Name)" ($minutes -gt 0 -and $minutes -le 10)
+  }
+}
+
+# 4. Attempt 2 after a timed-out (cancelled) attempt 1
+$evalStep = $steps | Where-Object { $_.Name -eq 'Evaluate attempt 1' }
+$evalIf = ($evalStep.Lines | Where-Object { $_ -match '^        if:' }) -join ' '
+foreach ($o in 'success', 'failure', 'cancelled') {
+  Check "evaluate runs when attempt 1 is $o" ($evalIf -match "steps\.aider1\.outcome == '$o'")
+}
+$a2Step = $steps | Where-Object { $_.Name -eq 'Aider attempt 2' }
+Check 'attempt 2 gated on NEED_ATTEMPT_2' ((($a2Step.Lines | Where-Object { $_ -match '^        if:' }) -join ' ') -match "env\.NEED_ATTEMPT_2 == 'true'")
+
+# Run the evaluate step as attempt 1 leaves it after a timeout: no diff, then with BLOCKED.md.
+$shell = (Get-Process -Id $PID).Path
+$tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("lb-" + [guid]::NewGuid())
+New-Item -ItemType Directory $tmp | Out-Null
+$savedEnv = @{ GITHUB_WORKSPACE = $env:GITHUB_WORKSPACE; RUNNER_TEMP = $env:RUNNER_TEMP; GITHUB_ENV = $env:GITHUB_ENV; LOCAL_BUILDER_BASE = $env:LOCAL_BUILDER_BASE }
+try {
+  $ws = Join-Path $tmp 'ws'
+  $rt = Join-Path $tmp 'rt'
+  New-Item -ItemType Directory $ws, $rt | Out-Null
+  Push-Location $ws
+  Invoke-TestGit init -q -b master
+  Invoke-TestGit config user.email t@example.com
+  Invoke-TestGit config user.name t
+  Set-Content a.txt 'base'
+  Invoke-TestGit add a.txt
+  Invoke-TestGit commit -q -m base
+  $env:LOCAL_BUILDER_BASE = (git rev-parse HEAD).Trim()
+  Pop-Location
+  $env:GITHUB_WORKSPACE = $ws
+  $env:RUNNER_TEMP = $rt
+
+  $env:GITHUB_ENV = Join-Path $rt 'env-timeout.txt'
+  & $shell -NoProfile -ExecutionPolicy Bypass -File $script -Step evaluate | Out-Null
+  $code = $LASTEXITCODE
+  $out = if (Test-Path $env:GITHUB_ENV) { Get-Content -Raw $env:GITHUB_ENV } else { '' }
+  Check 'cancelled attempt 1, no diff: evaluate succeeds' ($code -eq 0)
+  Check 'cancelled attempt 1, no diff: attempt 2 scheduled' ($out -match '(?m)^NEED_ATTEMPT_2=true\s*$')
+
+  Set-Content (Join-Path $ws 'BLOCKED.md') 'cannot continue'
+  $env:GITHUB_ENV = Join-Path $rt 'env-blocked.txt'
+  & $shell -NoProfile -ExecutionPolicy Bypass -File $script -Step evaluate | Out-Null
+  $code = $LASTEXITCODE
+  $out = if (Test-Path $env:GITHUB_ENV) { Get-Content -Raw $env:GITHUB_ENV } else { '' }
+  Check 'BLOCKED.md: evaluate fails the job' ($code -ne 0)
+  Check 'BLOCKED.md: attempt 2 skipped' (($out -match '(?m)^NEED_ATTEMPT_2=false\s*$') -and ($out -notmatch 'NEED_ATTEMPT_2=true'))
+} finally {
+  foreach ($k in $savedEnv.Keys) { Set-Item -Path "Env:$k" -Value $savedEnv[$k] -ErrorAction SilentlyContinue; if (-not $savedEnv[$k]) { Remove-Item "Env:$k" -ErrorAction SilentlyContinue } }
+  Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+}
+
 if ($fails -gt 0) { Write-Host "$fails check(s) failed"; exit 1 }
 Write-Host 'all checks passed'

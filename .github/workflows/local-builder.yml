@@ -40,6 +40,7 @@ jobs:
         shell: powershell
     steps:
       - name: Record start time and mark issue running
+        timeout-minutes: 5
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -119,6 +120,7 @@ jobs:
           Write-Host "Pre-flight ok: $model is listed at 127.0.0.1:11434."
 
       - name: Parse change id
+        timeout-minutes: 5
         env:
           GITHUB_TOKEN: ''
           GH_TOKEN: ''
@@ -175,6 +177,7 @@ jobs:
 
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 10
         with:
           ref: master
           persist-credentials: false
@@ -190,6 +193,7 @@ jobs:
           & "$env:GITHUB_WORKSPACE/.github/scripts/local-builder.ps1" -Step tools
 
       - name: Parse change and create branch
+        timeout-minutes: 5
         env:
           GITHUB_TOKEN: ''
           GH_TOKEN: ''
@@ -243,7 +247,9 @@ jobs:
           & "$env:GITHUB_WORKSPACE/.github/scripts/local-builder.ps1" -Step aider
 
       - name: Evaluate attempt 1
-        if: steps.aider1.outcome == 'success' || steps.aider1.outcome == 'failure'
+        # cancelled covers attempt 1 hitting its 25-minute timeout. evaluate
+        # still skips attempt 2 when BLOCKED.md exists.
+        if: steps.aider1.outcome == 'success' || steps.aider1.outcome == 'failure' || steps.aider1.outcome == 'cancelled'
         timeout-minutes: 10
         env:
           GITHUB_TOKEN: ''
@@ -274,6 +280,7 @@ jobs:
           & "$env:GITHUB_WORKSPACE/.github/scripts/local-builder.ps1" -Step guard
 
       - name: Commit, push, and open PR
+        timeout-minutes: 10
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -282,6 +289,7 @@ jobs:
 
       - name: Comment on failure
         if: failure() || cancelled()
+        timeout-minutes: 5
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -340,6 +348,7 @@ jobs:
 
       - name: Cleanup workspace
         if: always()
+        timeout-minutes: 10
         env:
           GITHUB_TOKEN: ''
           GH_TOKEN: ''
