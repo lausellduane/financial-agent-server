@@ -1,0 +1,347 @@
+# Local builder: runs Aider + qwen2.5-coder:7b on Duane's self-hosted
+# Windows runner when he (or a bot acting as him) adds the local-builder
+# label to an issue he opened. See openspec/changes/add-local-builder-runner/
+# and openspec/changes/split-local-builder-publish-job/.
+#
+# Trigger is issues:labeled only. No pull_request, pull_request_target,
+# push, issue_comment, workflow_run, or fork events.
+#
+# Jobs:
+#   start   (GitHub-hosted, issues: write)  parse the issue, mark it running
+#   build   (self-hosted, contents: read)   run Aider and tests; upload artifacts
+#   publish (GitHub-hosted, write scopes)   validate the artifact as untrusted, push, open PR
+#   report  (GitHub-hosted, issues: write)  failure comment and labels
+# Only `build` runs model-written code, and it never gets a write token.
+# Nothing from `build` is trusted: publish and report use only its result and artifacts.
+name: local-builder
+
+on:
+  issues:
+    types: [labeled]
+
+permissions: {}
+
+concurrency:
+  group: local-builder
+  cancel-in-progress: false
+
+jobs:
+  start:
+    if: >-
+      github.event.label.name == 'local-builder' &&
+      github.event.sender.login == 'lausellduane' &&
+      github.event.issue.user.login == 'lausellduane' &&
+      github.event.issue.pull_request == null
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    outputs:
+      change_id: ${{ steps.start.outputs.change_id }}
+      task_spec: ${{ steps.start.outputs.task_spec }}
+      job_start: ${{ steps.start.outputs.job_start }}
+      reason: ${{ steps.start.outputs.reason }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Parse issue and mark it running
+        id: start
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          $PSVersionTable.PSVersion.ToString()
+          & ./.github/scripts/local-builder-publish.ps1 -Step start
+
+  build:
+    needs: start
+    runs-on: [self-hosted, windows, local-builder]
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      ISSUE_NUMBER: ${{ github.event.issue.number }}
+      CHANGE_ID: ${{ needs.start.outputs.change_id }}
+      TASK_SPEC: ${{ needs.start.outputs.task_spec }}
+      JOB_START: ${{ needs.start.outputs.job_start }}
+      OLLAMA_API_BASE: http://127.0.0.1:11434
+      MODEL: qwen2.5-coder:7b
+      NUM_CTX: "4096"
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - name: Pre-flight Ollama
+        timeout-minutes: 2
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $reason = Join-Path $env:RUNNER_TEMP 'local-builder-reason.txt'
+          $log = Join-Path $env:RUNNER_TEMP 'local-builder.log'
+          function Fail-Reason([string]$m) {
+            Set-Content -Path $reason -Value $m -Encoding UTF8
+            Add-Content -Path $log -Value $m -Encoding UTF8
+            Write-Host $m
+            exit 1
+          }
+          Add-Content -Path $log -Value "job start $env:JOB_START issue $env:ISSUE_NUMBER"
+          $model = $env:MODEL
+          try {
+            $tags = Invoke-RestMethod -Uri 'http://127.0.0.1:11434/api/tags' -TimeoutSec 15
+          } catch {
+            Fail-Reason "Ollama isn't reachable at 127.0.0.1:11434 on the local builder PC. Duane may need to sign in after a Windows Update reboot."
+          }
+          $names = @()
+          if ($tags.models) {
+            foreach ($m in @($tags.models)) {
+              if ($m.name) { $names += [string]$m.name }
+              if ($m.model) { $names += [string]$m.model }
+            }
+          }
+          if ($names -notcontains $model) {
+            Fail-Reason "Ollama is running, but model $model is not in the model list. Pull it with: ollama pull $model"
+          }
+          Write-Host "Pre-flight ok: $model is listed at 127.0.0.1:11434."
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 10
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          clean: true
+
+      - name: Check tools
+        timeout-minutes: 2
+        run: |
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+          & "$env:GITHUB_WORKSPACE/.github/scripts/local-builder.ps1" -Step tools
+
+      - name: Parse change and create branch
+        timeout-minutes: 5
+        run: |
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+          & "$env:GITHUB_WORKSPACE/.github/scripts/local-builder.ps1" -Step parse-change
+
+      - name: Warm-up model
+        timeout-minutes: 5
+        run: |
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+          & "$env:GITHUB_WORKSPACE/.github/scripts/local-builder.ps1" -Step warmup
+
+      - name: Install npm dependencies
+        timeout-minutes: 10
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) {
+            $msg = "npm ci failed with exit code $LASTEXITCODE."
+            Set-Content -Path (Join-Path $env:RUNNER_TEMP 'local-builder-reason.txt') -Value $msg -Encoding UTF8
+            Write-Host $msg
+            exit $LASTEXITCODE
+          }
+
+      - name: Render job prompt and check context budget
+        timeout-minutes: 2
+        run: |
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+          & "$env:GITHUB_WORKSPACE/.github/scripts/local-builder.ps1" -Step render
+
+      - name: Aider attempt 1
+        id: aider1
+        timeout-minutes: 25
+        continue-on-error: true
+        env:
+          ATTEMPT: '1'
+        run: |
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+          & "$env:GITHUB_WORKSPACE/.github/scripts/local-builder.ps1" -Step aider
+
+      - name: Evaluate attempt 1
+        # cancelled covers attempt 1 hitting its 25-minute timeout. evaluate
+        # still skips attempt 2 when BLOCKED.md exists.
+        if: steps.aider1.outcome == 'success' || steps.aider1.outcome == 'failure' || steps.aider1.outcome == 'cancelled'
+        timeout-minutes: 10
+        run: |
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+          & "$env:GITHUB_WORKSPACE/.github/scripts/local-builder.ps1" -Step evaluate
+
+      - name: Aider attempt 2
+        if: env.NEED_ATTEMPT_2 == 'true'
+        timeout-minutes: 25
+        env:
+          ATTEMPT: '2'
+        run: |
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+          & "$env:GITHUB_WORKSPACE/.github/scripts/local-builder.ps1" -Step aider
+
+      - name: Verify diff, tests, and typecheck
+        timeout-minutes: 10
+        run: |
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+          & "$env:GITHUB_WORKSPACE/.github/scripts/local-builder.ps1" -Step guard
+
+      - name: Package result for publish
+        timeout-minutes: 5
+        run: |
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+          & "$env:GITHUB_WORKSPACE/.github/scripts/local-builder.ps1" -Step package
+
+      - name: Upload result
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        timeout-minutes: 5
+        with:
+          name: local-builder-result
+          path: ${{ runner.temp }}/lb-result/
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Write failure report
+        # Inline on purpose: it must work even when checkout failed.
+        if: failure() || cancelled()
+        timeout-minutes: 2
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $dir = Join-Path $env:RUNNER_TEMP 'lb-report'
+          New-Item -ItemType Directory -Path $dir -Force | Out-Null
+          $reasonPath = Join-Path $env:RUNNER_TEMP 'local-builder-reason.txt'
+          $logPath = Join-Path $env:RUNNER_TEMP 'local-builder.log'
+          $reason = 'The local-builder build job failed or was cancelled.'
+          if (Test-Path -LiteralPath $reasonPath) { $reason = (Get-Content -LiteralPath $reasonPath -Raw -Encoding UTF8).Trim() }
+          Set-Content -LiteralPath (Join-Path $dir 'reason.txt') -Value $reason -Encoding UTF8
+          if ($env:GITHUB_WORKSPACE) {
+            $blockedPath = Join-Path $env:GITHUB_WORKSPACE 'BLOCKED.md'
+            if (Test-Path -LiteralPath $blockedPath) {
+              Copy-Item -LiteralPath $blockedPath -Destination (Join-Path $dir 'blocked.md')
+            }
+          }
+          if (Test-Path -LiteralPath $logPath) {
+            Get-Content -LiteralPath $logPath -Encoding UTF8 | Select-Object -Last 40 | Set-Content -LiteralPath (Join-Path $dir 'log-excerpt.txt') -Encoding UTF8
+          }
+
+      - name: Upload failure report
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        timeout-minutes: 5
+        with:
+          name: local-builder-report
+          path: ${{ runner.temp }}/lb-report/
+          if-no-files-found: ignore
+          retention-days: 1
+
+      - name: Cleanup workspace
+        if: always()
+        timeout-minutes: 10
+        run: |
+          $ErrorActionPreference = 'Continue'
+          if ($env:GITHUB_WORKSPACE -and (Test-Path -LiteralPath (Join-Path $env:GITHUB_WORKSPACE '.git'))) {
+            git -C $env:GITHUB_WORKSPACE config --local --unset-all http.https://github.com/.extraheader 2>$null
+          }
+          if ($env:GITHUB_WORKSPACE -and (Test-Path -LiteralPath $env:GITHUB_WORKSPACE)) {
+            Get-ChildItem -LiteralPath $env:GITHUB_WORKSPACE -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object {
+              try { $_.Attributes = 'Normal' } catch { }
+            }
+            Get-ChildItem -LiteralPath $env:GITHUB_WORKSPACE -Force -ErrorAction SilentlyContinue | ForEach-Object {
+              Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }
+          $patterns = @('local-builder-*', 'aider-attempt-*', 'npm-test-*', 'tsc-guard.log', 'job-prompt.md', 'allowed-files.txt', 'scenarios.txt', 'task-numbers.txt', 'test-failure-excerpt.txt', 'lb-result', 'lb-report')
+          if ($env:RUNNER_TEMP -and (Test-Path -LiteralPath $env:RUNNER_TEMP)) {
+            foreach ($pat in $patterns) {
+              Get-ChildItem -LiteralPath $env:RUNNER_TEMP -Force -Filter $pat -ErrorAction SilentlyContinue | ForEach-Object {
+                Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+              }
+            }
+          }
+          Write-Host 'Cleanup finished.'
+
+  publish:
+    needs: [start, build]
+    if: needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    outputs:
+      reason: ${{ steps.publish.outputs.reason }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Download result
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        timeout-minutes: 5
+        with:
+          name: local-builder-result
+          path: ${{ runner.temp }}/lb-result
+
+      - name: Validate, push, and open PR
+        id: publish
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          CHANGE_ID: ${{ needs.start.outputs.change_id }}
+          TASK_SPEC: ${{ needs.start.outputs.task_spec }}
+          JOB_START: ${{ needs.start.outputs.job_start }}
+          ARTIFACT_DIR: ${{ runner.temp }}/lb-result
+        run: |
+          $PSVersionTable.PSVersion.ToString()
+          & ./.github/scripts/local-builder-publish.ps1 -Step publish
+
+  report:
+    needs: [start, build, publish]
+    if: always() && needs.start.result != 'skipped' && needs.publish.result != 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Download failure report
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        timeout-minutes: 5
+        continue-on-error: true
+        with:
+          name: local-builder-report
+          path: ${{ runner.temp }}/lb-report
+
+      - name: Comment on failure
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          START_RESULT: ${{ needs.start.result }}
+          START_REASON: ${{ needs.start.outputs.reason }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          PUBLISH_REASON: ${{ needs.publish.outputs.reason }}
+          REPORT_DIR: ${{ runner.temp }}/lb-report
+        run: |
+          & ./.github/scripts/local-builder-publish.ps1 -Step report
