@@ -1,8 +1,8 @@
 # When an approved OpenSpec change folder lands on master, open an Apply
 # issue and start Claude. An issue opened by github-actions[bot] would
-# not pass the @claude actor gate in claude.yml, so this workflow calls
-# claude.yml through workflow_call (automation mode) instead of relying
-# on a mention.
+# not start Claude through an @claude mention (the action rejects bot
+# actors by default), so this workflow calls claude.yml through
+# workflow_call (automation mode) instead of relying on a mention.
 #
 # Safety:
 # - Only runs on push to master.

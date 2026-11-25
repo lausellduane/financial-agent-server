@@ -42,9 +42,9 @@ It is built to be safe:
 - It only runs on a push to `master`.
 - It only continues if you pushed, or if you authored or merged the associated pull request.
 - It skips `openspec/changes/archive/` and archive moves (a folder leaving `changes/` and landing under `changes/archive/`).
-- It is idempotent: if an open Apply issue already exists for that change id, it does not open a second one and does not start a second Claude run. To retry, run the **Claude Code** workflow by hand (`workflow_dispatch`) with the issue number and change folder. Only `lausellduane` can start that dispatch.
+- It is idempotent: if an open Apply issue already exists for that change id, it does not open a second one and does not start a second Claude run. To retry, run the **Claude Code** workflow by hand (`workflow_dispatch`) with the issue number and change folder. Anyone with write access to the repository can start that dispatch.
 
-The `@claude` mention in `claude.yml` still requires `github.actor == 'lausellduane'`. An issue opened by `github-actions[bot]` would not pass that gate, so auto-apply does not rely on the mention. It calls `claude.yml` through `workflow_call` instead. See the tradeoff note in that workflow file and in the pull request that added it.
+An issue opened by `github-actions[bot]` would not start Claude through an `@claude` mention, because the action rejects bot actors by default. Auto-apply therefore calls `claude.yml` through `workflow_call` (automation mode) instead of relying on a mention. A mention from anyone with write access is enough to start Claude; there is no extra `lausellduane` actor gate.
 
 ## 5. Apply, review, and test
 
@@ -63,7 +63,7 @@ When a fix has to land on a branch that is already open (a good example is QA fi
 Instead:
 
 1. Put the approved OpenSpec change folder on `master` first (a small PR that adds only that folder).
-2. Comment `@claude` on the existing PR, from `lausellduane` (or a bot acting as you with your yes). The Claude workflow only starts from your account.
+2. Comment `@claude` on the existing PR. Anyone with write access to the repository can start Claude; the action's built-in write-access check still applies.
 3. Claude works on that PR's branch.
 
 The issue form and the auto-apply workflow are the default path for new work. This comment path is the exception for fixes that belong on an already-open PR.
