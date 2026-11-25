@@ -150,6 +150,10 @@ Check 'workflow-level permissions are {}' (($wfLines | Where-Object { $_ -match 
 Check 'jobs are start, build, publish, report' ((@($jobs.Keys) -join ',') -eq 'start,build,publish,report')
 Check 'build permissions are exactly contents: read' (((Get-JobPermissions $jobs['build']) -join ';') -eq 'contents: read')
 Check 'build runs on the self-hosted runner' ((($jobs['build'] | Where-Object { $_ -match '^    runs-on:' }) -join '') -match 'self-hosted')
+$buildShell = (($jobs['build'] | Where-Object { $_ -match '^        shell:' }) -join '')
+Check 'build shell is powershell (runner keeps .ps1 and exit-code handling)' ($buildShell -match '^        shell: powershell\s')
+Check 'build shell bypasses the execution policy (dry run B, Restricted on the PC)' ($buildShell -match '-ExecutionPolicy Bypass' -and $buildShell -match "-Command `"\. '\{0\}'`"")
+Check 'build shell skips the runner profile' ($buildShell -match '-NoProfile')
 Check 'build never references a token or secret' (-not (($jobs['build'] -join "`n") -match 'github\.token|GH_TOKEN|GITHUB_TOKEN|secrets\.'))
 foreach ($j in 'start', 'publish', 'report') {
   Check "$j runs on ubuntu-latest" ((($jobs[$j] | Where-Object { $_ -match '^    runs-on:' }) -join '') -match 'runs-on:\s*ubuntu-latest\s*$')

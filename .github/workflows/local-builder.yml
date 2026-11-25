@@ -79,7 +79,11 @@ jobs:
       NUM_CTX: "4096"
     defaults:
       run:
-        shell: powershell
+        # Same as the built-in `powershell` shell (the runner still writes a .ps1 and adds its
+        # error and exit-code handling), plus -ExecutionPolicy Bypass for this process only:
+        # Windows client defaults to Restricted, which blocks the runner's temp script.
+        # -NoProfile keeps the runner account's profile out of the job.
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
     steps:
       - name: Pre-flight Ollama
         timeout-minutes: 2
