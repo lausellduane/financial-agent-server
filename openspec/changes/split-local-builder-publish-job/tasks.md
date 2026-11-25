@@ -56,9 +56,9 @@
   - artifacts work on the self-hosted runner;
   - `needs.*.result`, `always()`, and outputs from a failed step behave as expected;
   - `pwsh` exists on `ubuntu-latest`;
-  - the publish script, which was tested only on Windows, also works on Linux.
+  - publish works against the real GitHub API with a real token (tested on Linux only with a fake token and a local remote).
 - [x] 6.3 Run the harness plus `npm test`, `npx tsc --noEmit`, and `npm run check:worker`. All pass.
-  As built: 155 harness checks passed on Windows PowerShell 5.1. `pwsh` and `actionlint` aren't installed on the dev machine, so neither was run.
+  As built: 155 harness checks pass on Windows PowerShell 5.1 and PowerShell 7.7. actionlint 1.7.12 is clean. In an Ubuntu 22.04 container with pwsh 7.4, the publish functions pass 14 more checks: `/dev/null` hook isolation, no token in git, LF blobs, lease push, and real symlinks rejected. The real `-Step start` and `-Step report` entry points also set the right `reason` outputs there.
 - [ ] 6.4 Confirm PR #13's acceptance criteria, as changed in design.md §9 (QA).
 - [x] 6.5 Remove `cache: npm` from the `deploy-poc.yml` deploy job (design.md §10, item 3). Done separately in PR #22, not as part of this change.
 - [ ] 6.6 Push to the PR #13 branch (done: `960c5f4`). Code Reviewer re-reviews, QA retests, and Duane merges.
