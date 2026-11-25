@@ -1,14 +1,16 @@
-# Local builder step script for Windows PowerShell 5.1+ / pwsh.
-# Invoked by .github/workflows/local-builder.yml with -Step <name>.
-# Reads issue text only from $env:GITHUB_EVENT_PATH (never from workflow ${{ }} in run:).
+# Local builder build-job script for Windows PowerShell 5.1+ / pwsh.
+# Invoked by the self-hosted `build` job in .github/workflows/local-builder.yml with -Step <name>.
+# This job runs model-written code and holds no write token. It never pushes, comments, or labels;
+# it hands its result to the GitHub-hosted `publish` job as an artifact (see -Step package).
 [CmdletBinding()]
 param(
   [Parameter(Mandatory = $true)]
-  [ValidateSet('tools', 'parse-change', 'warmup', 'render', 'aider', 'evaluate', 'guard', 'publish')]
+  [ValidateSet('tools', 'parse-change', 'warmup', 'render', 'aider', 'evaluate', 'guard', 'package')]
   [string]$Step
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'local-builder-common.ps1')
 
 $ReasonPath = Join-Path $env:RUNNER_TEMP 'local-builder-reason.txt'
 $LogPath = Join-Path $env:RUNNER_TEMP 'local-builder.log'
@@ -17,15 +19,7 @@ $ScenarioPath = Join-Path $env:RUNNER_TEMP 'scenarios.txt'
 $ExcerptPath = Join-Path $env:RUNNER_TEMP 'test-failure-excerpt.txt'
 $PromptPath = Join-Path $env:RUNNER_TEMP 'job-prompt.md'
 $TaskNumsPath = Join-Path $env:RUNNER_TEMP 'task-numbers.txt'
-$GitIntegrityPath = Join-Path $env:RUNNER_TEMP 'local-builder-git-integrity.txt'
-
-function Assert-GitIntegrity {
-  if (-not (Test-Path -LiteralPath $GitIntegrityPath)) { Fail-Job 'The .git snapshot from parse-change is missing. Nothing will be pushed.' }
-  $expected = [string](Get-Content -LiteralPath $GitIntegrityPath -Raw -Encoding UTF8)
-  if ([string](Get-GitIntegrity) -ne $expected) {
-    Fail-Job '.git/config or .git/hooks changed after checkout. Nothing will be pushed.'
-  }
-}
+$ResultDir = Join-Path $env:RUNNER_TEMP 'lb-result'
 
 function Write-JobLog {
   param([string]$Message)
@@ -90,49 +84,10 @@ function Add-LocalBinToPath {
   return $added
 }
 
-function Get-NormalizedPath {
-  param([string]$PathValue)
-  # Strip only leading "./" (never every leading dot), so .github/x and .env keep their dot.
-  return (($PathValue -replace '\\', '/').Trim() -replace '^(\./+)+', '')
-}
-
-function Test-SafeRelPath {
-  param([string]$PathValue)
-  $n = Get-NormalizedPath $PathValue
-  if ([string]::IsNullOrWhiteSpace($n)) { return $false }
-  if ($n -match '(^|/)\.\.(/|$)') { return $false }
-  if ($n -match '^[a-zA-Z]:') { return $false }
-  if ($n.StartsWith('/')) { return $false }
-  if ($n -eq '.git' -or $n -match '(^|/)\.git(/|$)') { return $false }
-  if ($n -notmatch '^[A-Za-z0-9_./-]+$') { return $false }
-  return $true
-}
-
-function Test-AiderArtifact {
-  param([string]$PathValue)
-  $n = Get-NormalizedPath $PathValue
-  $leaf = Split-Path $n -Leaf
-  if ($leaf -like '.aider*') { return $true }
-  if ($n -like '.aider*') { return $true }
-  return $false
-}
-
-function Test-ForbiddenPath {
-  param([string]$PathValue)
-  $n = Get-NormalizedPath $PathValue
-  if ($n -eq '.git' -or $n -match '(^|/)\.git(/|$)') { return $true }
-  if ($n -match '(^|/)\.github(/|$)') { return $true }
-  if ($n -match '(^|/)wrangler\.[^/]+$') { return $true }
-  if ($n -match '(^|/)migrations(/|$)') { return $true }
-  if ($n -match '(^|/)\.env') { return $true }
-  if ($n -match '(^|/)\.dev\.vars') { return $true }
-  if ($n -match '\.(pem|key)$') { return $true }
-  return $false
-}
-
 function Get-BaseRef {
-  # Same ref the branch was created from (set in parse-change); never local master.
+  # The commit the branch was created from (github.sha, set in parse-change); never local master.
   if ($env:LOCAL_BUILDER_BASE) { return $env:LOCAL_BUILDER_BASE }
+  if ($env:GITHUB_SHA) { return $env:GITHUB_SHA }
   return 'origin/master'
 }
 
@@ -151,193 +106,52 @@ function Get-ChangedFiles {
   }
 }
 
-function Get-GitIntegrity {
-  # Hash of .git/config and every file under .git/hooks. Model-written code runs during
-  # npm test, so publish must not trust either unless it matches the post-checkout snapshot.
-  param([string]$Workspace = $env:GITHUB_WORKSPACE)
-  $gitDir = Join-Path $Workspace '.git'
-  $files = @()
-  $config = Join-Path $gitDir 'config'
-  if (Test-Path -LiteralPath $config) { $files += Get-Item -LiteralPath $config -Force }
-  $hooks = Join-Path $gitDir 'hooks'
-  if (Test-Path -LiteralPath $hooks) { $files += @(Get-ChildItem -LiteralPath $hooks -Recurse -Force -File) }
-  $lines = foreach ($f in ($files | Sort-Object FullName)) {
-    $rel = $f.FullName.Substring($gitDir.Length) -replace '\\', '/'
-    '{0} {1}' -f (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash, $rel
-  }
-  return (@($lines) -join "`n")
-}
-
-function Invoke-PublishGit {
-  # Runs git with no hooks, no fsmonitor, no global config, and no token in the environment.
-  # The auth header (if any) reaches only this git process, through GIT_CONFIG_* variables,
-  # and is never written to .git/config.
-  param([string[]]$GitArgs, [string]$AuthHeader)
-  # git writes progress to stderr; under Stop, PowerShell 5.1 would turn that into an error.
-  $ErrorActionPreference = 'Continue'
-  $names = 'GH_TOKEN', 'GITHUB_TOKEN', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0'
-  $saved = @{}
-  foreach ($n in $names) { $saved[$n] = [Environment]::GetEnvironmentVariable($n, 'Process') }
+function New-ResultArtifact {
+  # Writes manifest.json plus files/<n> (the staged, line-ending-normalized blob of each
+  # changed allowed file) to $OutDir. Blobs are named by index so no changed path is ever
+  # used as a filename, and upload-artifact's hidden-file exclusion cannot drop one.
+  # The publish job re-validates all of it; nothing here is trusted downstream.
+  param([string]$Workspace, [string]$BaseSha, [string]$ChangeId, [string[]]$Changed, [hashtable]$Stats, [string]$OutDir)
+  if (Test-Path -LiteralPath $OutDir) { Remove-Item -LiteralPath $OutDir -Recurse -Force }
+  $filesDir = Join-Path $OutDir 'files'
+  New-Item -ItemType Directory -Path $filesDir -Force | Out-Null
+  $entries = @()
+  $i = 0
+  Push-Location $Workspace
   try {
-    foreach ($n in $names) { [Environment]::SetEnvironmentVariable($n, $null, 'Process') }
-    $env:GIT_CONFIG_GLOBAL = 'NUL'
-    if ($AuthHeader) {
-      $env:GIT_CONFIG_COUNT = '1'
-      $env:GIT_CONFIG_KEY_0 = 'http.https://github.com/.extraheader'
-      $env:GIT_CONFIG_VALUE_0 = $AuthHeader
+    foreach ($p in $Changed) {
+      $full = Join-Path $Workspace $p
+      if (Test-Path -LiteralPath $full -PathType Leaf) {
+        $ErrorActionPreference = 'Continue'
+        & git -c core.hooksPath=NUL add -- $p 2>&1 | Out-Null
+        $ErrorActionPreference = 'Stop'
+        if ($LASTEXITCODE -ne 0) { throw "git add $p failed while packaging." }
+        $blobRel = "files/$i"
+        $blobFull = Join-Path $filesDir "$i"
+        # cmd redirection keeps the bytes exactly; PowerShell 5.1 pipes would re-encode them.
+        cmd /c "git cat-file blob "":$p"" > ""$blobFull"""
+        if ($LASTEXITCODE -ne 0) { throw "git cat-file for $p failed while packaging." }
+        $bytes = [System.IO.File]::ReadAllBytes($blobFull)
+        $sha = (Get-FileHash -LiteralPath $blobFull -Algorithm SHA256).Hash.ToLowerInvariant()
+        $entries += [ordered]@{ path = $p; op = 'write'; blob = $blobRel; sha256 = $sha; bytes = $bytes.Length }
+        $i++
+      } else {
+        $entries += [ordered]@{ path = $p; op = 'delete' }
+      }
     }
-    $out = & git -c core.hooksPath=NUL -c core.fsmonitor=false -c credential.helper= @GitArgs 2>&1
-    return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = (($out | ForEach-Object { "$_" }) -join "`n") }
   } finally {
-    foreach ($n in $names) { [Environment]::SetEnvironmentVariable($n, $saved[$n], 'Process') }
+    Pop-Location
   }
-}
-
-function Get-PublishPushArgs {
-  # Lease-guarded force push of the issue branch only. An empty ExpectedSha means the
-  # branch must not exist yet. Anything but local-builder/issue-N (master included) is refused.
-  param([string]$RemoteUrl, [string]$Branch, [string]$ExpectedSha)
-  if ($Branch -notmatch '^local-builder/issue-[0-9]+$') { throw "Refusing to push branch '$Branch'." }
-  if ($ExpectedSha -and $ExpectedSha -notmatch '^[0-9a-f]{40}$') { throw "Invalid expected sha '$ExpectedSha'." }
-  return @('push', "--force-with-lease=refs/heads/${Branch}:$ExpectedSha", $RemoteUrl, "HEAD:refs/heads/$Branch")
-}
-
-function Get-RemoteBranchSha {
-  param([string]$RemoteUrl, [string]$Branch, [string]$AuthHeader)
-  $r = Invoke-PublishGit -GitArgs @('ls-remote', '--heads', $RemoteUrl, "refs/heads/$Branch") -AuthHeader $AuthHeader
-  if ($r.ExitCode -ne 0) { throw "git ls-remote failed: $($r.Output)" }
-  foreach ($line in ($r.Output -split "`n")) {
-    if ($line -match "^([0-9a-f]{40})\s+refs/heads/$([regex]::Escape($Branch))$") { return $Matches[1] }
+  $manifest = [ordered]@{
+    version   = 1
+    base_sha  = $BaseSha
+    change_id = $ChangeId
+    files     = @($entries)
+    stats     = [ordered]@{ attempts = [int]$Stats.attempts; tests_first_try = [string]$Stats.tests_first_try; edit_format = [string]$Stats.edit_format }
   }
-  return ''
-}
-
-function Publish-PullRequest {
-  # Reuses an open PR for the branch (a relabel retry after a previous run opened one);
-  # otherwise opens a new one. Returns the PR object.
-  param([string]$Repo, [string]$Branch, [string]$Title, [string]$Body)
-  $owner = ($Repo -split '/')[0]
-  $open = @(Invoke-GitHub -Method GET -Uri "https://api.github.com/repos/$Repo/pulls?state=open&head=$($owner):$Branch")
-  $payload = @{ title = $Title; body = $Body }
-  if ($open.Count -gt 0 -and $open[0].number) {
-    return Invoke-GitHub -Method PATCH -Uri "https://api.github.com/repos/$Repo/pulls/$($open[0].number)" -Body ($payload | ConvertTo-Json -Depth 5)
-  }
-  $payload.head = $Branch
-  $payload.base = 'master'
-  return Invoke-GitHub -Method POST -Uri "https://api.github.com/repos/$Repo/pulls" -Body ($payload | ConvertTo-Json -Depth 5)
-}
-
-function Get-TaskBlocks {
-  param([string]$Text)
-  $blocks = @()
-  $rx = [regex]'(?m)^-\s+\[([ xX])\]\s+(\d+(?:\.\d+)*)\b.*$'
-  $matches = $rx.Matches($Text)
-  for ($i = 0; $i -lt $matches.Count; $i++) {
-    $m = $matches[$i]
-    $start = $m.Index
-    $end = if ($i -lt $matches.Count - 1) { $matches[$i + 1].Index } else { $Text.Length }
-    $blocks += [pscustomobject]@{
-      Id      = $m.Groups[2].Value
-      Checked = $m.Groups[1].Value -ne ' '
-      Body    = $Text.Substring($start, $end - $start)
-    }
-  }
-  return $blocks
-}
-
-function Get-FilesFromTaskBody {
-  param([string]$Body)
-  $files = @()
-  $lines = $Body -split '\r?\n'
-  $inFiles = $false
-  foreach ($line in $lines) {
-    if ($line -match '(?i)Files:\s*(.*)$') {
-      $inFiles = $true
-      $rest = $Matches[1].Trim()
-      if ($rest) {
-        $parts = $rest -split ',' | ForEach-Object { $_.Trim().Trim('`').Trim('"').Trim() } | Where-Object { $_ }
-        foreach ($p in $parts) { if (Test-SafeRelPath $p) { $files += (Get-NormalizedPath $p) } }
-      }
-      continue
-    }
-    if ($inFiles) {
-      if ($line -match '^\s*$') { $inFiles = $false; continue }
-      if ($line -match '^\s*-\s+(.+)$') {
-        $p = $Matches[1].Trim().Trim('`').Trim('"').Trim()
-        if (Test-SafeRelPath $p) {
-          $files += (Get-NormalizedPath $p)
-          continue
-        }
-      }
-      $inFiles = $false
-    }
-  }
-  return $files
-}
-
-function Get-ScenarioNamesFromTaskBody {
-  param([string]$Body)
-  $names = @()
-  $lines = $Body -split '\r?\n'
-  $inScenarios = $false
-  foreach ($line in $lines) {
-    if ($line -match '(?i)Scenarios?:\s*(.*)$') {
-      $inScenarios = $true
-      $rest = $Matches[1].Trim()
-      if ($rest) {
-        $parts = $rest -split ',' | ForEach-Object { $_.Trim().Trim('`').Trim('"').Trim() } | Where-Object { $_ }
-        foreach ($part in $parts) {
-          $names += ($part -replace '^####\s+Scenario:\s*', '')
-        }
-      }
-      continue
-    }
-    if ($inScenarios) {
-      if ($line -match '^\s*$') { $inScenarios = $false; continue }
-      if ($line -match '^\s*-\s+(.+)$') {
-        $n = $Matches[1].Trim().Trim('`').Trim('"').Trim()
-        $n = $n -replace '^(####\s+)?Scenario:\s*', ''
-        if ($n) { $names += $n; continue }
-      }
-      $inScenarios = $false
-    }
-  }
-  return $names
-}
-
-function Get-ScenarioHeadings {
-  param([string]$ChangeId, [string[]]$WantedNames)
-  $headings = @()
-  $specsRoot = Join-Path $env:GITHUB_WORKSPACE "openspec/changes/$ChangeId/specs"
-  if (-not (Test-Path -LiteralPath $specsRoot)) { return $headings }
-  $files = Get-ChildItem -LiteralPath $specsRoot -Recurse -Filter '*.md' -File -ErrorAction SilentlyContinue
-  foreach ($f in $files) {
-    $text = Get-Content -LiteralPath $f.FullName -Raw -Encoding UTF8
-    foreach ($m in [regex]::Matches($text, '(?m)^####\s+Scenario:\s*(.+?)\s*$')) {
-      $headings += ('#### Scenario: ' + $m.Groups[1].Value.Trim())
-    }
-  }
-  $wanted = @($WantedNames | Where-Object { $_ } | ForEach-Object { ($_ -replace '^####\s+Scenario:\s*', '').Trim() } | Sort-Object -Unique)
-  if ($wanted.Count -eq 0) {
-    Write-JobLog 'No Scenarios: list on the selected tasks; including all change-level scenario headings.'
-    return $headings
-  }
-  $filtered = @()
-  foreach ($h in $headings) {
-    $title = ($h -replace '^####\s+Scenario:\s*', '').Trim()
-    foreach ($w in $wanted) {
-      if ([string]::Equals($title, $w, [System.StringComparison]::OrdinalIgnoreCase)) {
-        $filtered += $h
-        break
-      }
-    }
-  }
-  if ($filtered.Count -eq 0) {
-    Write-JobLog 'Scenarios: names on the selected tasks did not match any heading; including all change-level scenario headings.'
-    return $headings
-  }
-  Write-JobLog ('Filtered scenarios to selected tasks: ' + ($filtered -join '; '))
-  return $filtered
+  $json = ConvertTo-Json -InputObject $manifest -Depth 6
+  [System.IO.File]::WriteAllText((Join-Path $OutDir 'manifest.json'), $json, (New-Object System.Text.UTF8Encoding $false))
+  return $manifest
 }
 
 function Get-EstTokens {
@@ -388,60 +202,12 @@ function Render-Prompt {
   return $template
 }
 
-function Invoke-GitHub {
-  param(
-    [string]$Method,
-    [string]$Uri,
-    [string]$Body
-  )
-  $headers = @{
-    Authorization             = "Bearer $($env:GH_TOKEN)"
-    Accept                    = 'application/vnd.github+json'
-    'X-GitHub-Api-Version'    = '2022-11-28'
-    'User-Agent'              = 'local-builder-workflow'
-  }
-  $params = @{
-    Method      = $Method
-    Uri         = $Uri
-    Headers     = $headers
-    TimeoutSec  = 60
-  }
-  if ($Body) {
-    $params.ContentType = 'application/json; charset=utf-8'
-    $params.Body = [System.Text.Encoding]::UTF8.GetBytes($Body)
-  }
-  return Invoke-RestMethod @params
-}
-
-function Sanitize-LogText {
-  param([string]$Text)
-  if (-not $Text) { return '' }
-  $t = $Text
-  $t = [regex]::Replace($t, '(?i)(Bearer\s+)[^\s]+', '$1[redacted]')
-  $t = [regex]::Replace($t, '(?i)(gh[pousr]_[A-Za-z0-9]+)', '[redacted]')
-  $lines = $t -split '\r?\n' | ForEach-Object { $_ -replace '^::', ' :' }
-  return ($lines -join "`n")
-}
-
 function Get-TailText {
   param([string]$Path, [int]$Lines = 40)
   if (-not (Test-Path -LiteralPath $Path)) { return '' }
   $content = Get-Content -LiteralPath $Path -Encoding UTF8
   $tail = $content | Select-Object -Last $Lines
   return (Sanitize-LogText ($tail -join "`n"))
-}
-
-function Get-ElapsedText {
-  if (-not $env:JOB_START) { return 'unknown' }
-  try {
-    $start = [DateTime]::Parse($env:JOB_START, $null, [System.Globalization.DateTimeStyles]::RoundtripKind)
-    $elapsed = [DateTime]::UtcNow - $start.ToUniversalTime()
-    $mins = [int][Math]::Floor($elapsed.TotalMinutes)
-    $secs = $elapsed.Seconds
-    return ('{0}m {1}s (job start -> PR opened)' -f $mins, $secs)
-  } catch {
-    return 'unknown'
-  }
 }
 
 switch ($Step) {
@@ -461,12 +227,8 @@ switch ($Step) {
       Write-JobLog "Warning: CI uses Node 22; this machine has $nodeVer. Jobs may still run, but install Node 22 LTS if tests fail."
     }
 
-    # Publish relies on GIT_CONFIG_GLOBAL (2.32+) and GIT_CONFIG_COUNT (2.31+).
     $gitVer = (& git --version 2>&1 | Out-String).Trim()
     Write-JobLog $gitVer
-    if ($gitVer -notmatch '(\d+)\.(\d+)' -or [int]$Matches[1] -lt 2 -or ([int]$Matches[1] -eq 2 -and [int]$Matches[2] -lt 32)) {
-      Fail-Job "Git 2.32 or newer is required for the publish step; this machine has '$gitVer'."
-    }
 
     $npm = Get-Command npm -ErrorAction SilentlyContinue
     if (-not $npm) { Fail-Job 'npm was not found on PATH. Install Node.js 22 LTS for the runner account and restart the runner.' }
@@ -483,53 +245,21 @@ switch ($Step) {
   'parse-change' {
     $changeId = $env:CHANGE_ID
     if ($changeId -notmatch '^[a-z0-9-]+$') {
-      Fail-Job 'Internal error: CHANGE_ID is missing or invalid after parse-id.'
+      Fail-Job 'Internal error: CHANGE_ID from the start job is missing or invalid.'
     }
+    $baseSha = $env:GITHUB_SHA
+    if ($baseSha -notmatch '^[0-9a-f]{40}$') { Fail-Job 'Internal error: GITHUB_SHA is missing or invalid.' }
     $tasksPath = Join-Path $env:GITHUB_WORKSPACE "openspec/changes/$changeId/tasks.md"
     if (-not (Test-Path -LiteralPath $tasksPath)) {
       Fail-Job "openspec/changes/$changeId/tasks.md was not found on the default branch checkout."
     }
     $tasksText = Get-Content -LiteralPath $tasksPath -Raw -Encoding UTF8
-    $blocks = @(Get-TaskBlocks $tasksText)
-    if ($blocks.Count -eq 0) {
-      Fail-Job "openspec/changes/$changeId/tasks.md has no task entries."
+    try {
+      $sel = Resolve-ChangeSelection -TasksText $tasksText -TaskSpec $env:TASK_SPEC -ChangeId $changeId
+    } catch {
+      Fail-Job $_.Exception.Message
     }
-
-    $selectedIds = @()
-    if ($env:TASK_SPEC -and $env:TASK_SPEC.Trim()) {
-      if ($env:TASK_SPEC -notmatch '^[0-9.,]+$') {
-        Fail-Job 'Malformed tasks: line. It must match ^[0-9.,]+$.'
-      }
-      $selectedIds = @($env:TASK_SPEC.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-      foreach ($tid in $selectedIds) {
-        if ($tid -notmatch '^\d+(?:\.\d+)*$') {
-          Fail-Job "Malformed task number '$tid'."
-        }
-        if (-not ($blocks | Where-Object { $_.Id -eq $tid })) {
-          Fail-Job "Task $tid was requested but was not found in openspec/changes/$changeId/tasks.md."
-        }
-      }
-    } else {
-      $selectedIds = @($blocks | Where-Object { -not $_.Checked } | ForEach-Object { $_.Id })
-      if ($selectedIds.Count -eq 0) {
-        Fail-Job "No unchecked tasks in openspec/changes/$changeId/tasks.md, and the issue has no tasks: line."
-      }
-    }
-
-    $allowed = @()
-    foreach ($tid in $selectedIds) {
-      $block = $blocks | Where-Object { $_.Id -eq $tid } | Select-Object -First 1
-      $allowed += @(Get-FilesFromTaskBody $block.Body)
-    }
-    $allowed = @($allowed | Sort-Object -Unique)
-    if ($allowed.Count -eq 0) {
-      Fail-Job "tasks.md has no Files: list for the selected tasks ($($selectedIds -join ', '))."
-    }
-    foreach ($p in $allowed) {
-      if (Test-ForbiddenPath $p) {
-        Fail-Job "Files: list includes forbidden path '$p'."
-      }
-    }
+    $allowed = @($sel.Allowed)
 
     $maxLines = 0
     foreach ($p in $allowed) {
@@ -541,13 +271,8 @@ switch ($Step) {
     }
     $editFormat = if ($maxLines -ge 80) { 'diff' } else { 'whole' }
 
-    $wantedScenarios = @()
-    foreach ($tid in $selectedIds) {
-      $block = $blocks | Where-Object { $_.Id -eq $tid } | Select-Object -First 1
-      if ($block) { $wantedScenarios += @(Get-ScenarioNamesFromTaskBody $block.Body) }
-    }
-    $scenarios = @(Get-ScenarioHeadings -ChangeId $changeId -WantedNames $wantedScenarios)
-    $taskNumbers = $selectedIds -join ', '
+    $scenarios = @(Get-ScenarioHeadings -Root $env:GITHUB_WORKSPACE -ChangeId $changeId -WantedNames $sel.WantedScenarios)
+    $taskNumbers = $sel.TaskNumbers
     Set-Content -LiteralPath $AllowedPath -Value ($allowed -join "`n") -Encoding UTF8
     Set-Content -LiteralPath $ScenarioPath -Value ($scenarios -join "`n") -Encoding UTF8
     Set-Content -LiteralPath $TaskNumsPath -Value $taskNumbers -Encoding UTF8
@@ -558,23 +283,13 @@ switch ($Step) {
 
     Push-Location $env:GITHUB_WORKSPACE
     try {
+      # The branch is local only (publish recreates it on a fresh checkout). Base it on github.sha,
+      # the default-branch head when the label was added, which publish also checks out.
       $branch = "local-builder/issue-$($env:ISSUE_NUMBER)"
-      $existing = git ls-remote --heads origin $branch
-      if ($existing) {
-        Write-JobLog "Branch $branch already exists on origin; recreating it from fresh origin/master."
-      }
-      git fetch --depth 1 origin master
-      if ($LASTEXITCODE -ne 0) { Fail-Job 'git fetch origin master failed.' }
-      $baseSha = (git rev-parse origin/master).Trim()
-      if ($LASTEXITCODE -ne 0 -or -not $baseSha) { Fail-Job 'git rev-parse origin/master failed.' }
       Set-JobEnv 'LOCAL_BUILDER_BASE' $baseSha
-      # Recreate from origin/master so a stale local branch left in .git by a previous
-      # failed job cannot block the design.md §6 relabel retry path.
       git checkout -B $branch $baseSha
-      if ($LASTEXITCODE -ne 0) { Fail-Job "Failed to create branch $branch from origin/master." }
-      Write-JobLog "Created branch $branch from origin/master"
-      # Before any model-written code runs: guard and publish compare against this.
-      Set-Content -LiteralPath $GitIntegrityPath -Value (Get-GitIntegrity) -Encoding UTF8 -NoNewline
+      if ($LASTEXITCODE -ne 0) { Fail-Job "Failed to create branch $branch from $baseSha." }
+      Write-JobLog "Created local branch $branch from $baseSha"
     } finally {
       Pop-Location
     }
@@ -770,103 +485,21 @@ switch ($Step) {
     } finally {
       Pop-Location
     }
-    # npm test and tsc above ran model-written code; check .git last.
-    Assert-GitIntegrity
   }
 
-  'publish' {
-    if (-not $env:GH_TOKEN) { Fail-Job 'GH_TOKEN is missing in the publish step.' }
-    $changeId = $env:CHANGE_ID
-    $taskNumbers = $env:TASK_NUMBERS
-    if (Test-Path -LiteralPath $TaskNumsPath) {
-      $taskNumbers = (Get-Content -LiteralPath $TaskNumsPath -Raw -Encoding UTF8).Trim()
-    }
-    $issue = $env:ISSUE_NUMBER
-    $branch = "local-builder/issue-$issue"
-    $allowed = @(Get-Content -LiteralPath $AllowedPath -Encoding UTF8 | Where-Object { $_ })
-    $attempts = $env:ATTEMPTS_USED
-    if (-not $attempts) { $attempts = '2' }
-    $firstTry = $env:TESTS_FIRST_TRY
-    if (-not $firstTry) { $firstTry = 'no' }
-    $editFormat = $env:EDIT_FORMAT
-    if (-not $editFormat) { $editFormat = 'unknown' }
-
-    Push-Location $env:GITHUB_WORKSPACE
+  'package' {
+    # Hands the result to the publish job. Everything written here is re-validated there.
+    $changed = @(Get-ChangedFiles)
+    if ($changed.Count -eq 0) { Fail-Job 'no changes produced' }
+    $attempts = if ($env:ATTEMPTS_USED -eq '2') { 2 } else { 1 }
+    $firstTry = if ($env:TESTS_FIRST_TRY -eq 'yes') { 'yes' } else { 'no' }
+    $editFormat = if ($env:EDIT_FORMAT -eq 'whole') { 'whole' } else { 'diff' }
     try {
-      # Model-written code ran in earlier steps. Check .git before any git command, then run
-      # every git command through Invoke-PublishGit (no hooks, no fsmonitor, no global config,
-      # no token in the environment).
-      Assert-GitIntegrity
-      $baseRef = Get-BaseRef
-      $r = Invoke-PublishGit -GitArgs @('reset', '--mixed', $baseRef)
-      if ($r.ExitCode -ne 0) { Fail-Job "git reset --mixed $baseRef failed." }
-      $toAdd = @()
-      foreach ($p in $allowed) {
-        $full = Join-Path $env:GITHUB_WORKSPACE $p
-        $exists = Test-Path -LiteralPath $full
-        $tracked = (Invoke-PublishGit -GitArgs @('ls-files', '--error-unmatch', '--', $p)).ExitCode -eq 0
-        if ($exists -or $tracked) { $toAdd += $p }
-      }
-      if ($toAdd.Count -eq 0) { Fail-Job 'Nothing to commit after staging allowed files.' }
-      $r = Invoke-PublishGit -GitArgs (@('add', '--') + $toAdd)
-      if ($r.ExitCode -ne 0) { Fail-Job "git add failed. $($r.Output)" }
-      if ((Invoke-PublishGit -GitArgs @('diff', '--cached', '--quiet')).ExitCode -eq 0) { Fail-Job 'Nothing to commit after staging allowed files.' }
-      $msg = "[local-builder] ${changeId}: tasks ${taskNumbers}"
-      $r = Invoke-PublishGit -GitArgs @('-c', 'user.name=github-actions[bot]', '-c', 'user.email=41898282+github-actions[bot]@users.noreply.github.com', 'commit', '--no-verify', '-m', $msg)
-      if ($r.ExitCode -ne 0) { Fail-Job "git commit failed. $($r.Output)" }
-
-      $changed = @((Invoke-PublishGit -GitArgs @('diff', '--name-only', $baseRef)).Output -split "`n" | Where-Object { $_ })
-      $fileCount = @($changed).Count
-
-      # A relabel retry recreated the branch from fresh master, so overwrite the old remote
-      # branch, but only if it is still where ls-remote saw it (lease), and never master.
-      $remoteUrl = "https://github.com/$($env:GITHUB_REPOSITORY).git"
-      $authHeader = "AUTHORIZATION: bearer $($env:GH_TOKEN)"
-      try {
-        $remoteSha = Get-RemoteBranchSha -RemoteUrl $remoteUrl -Branch $branch -AuthHeader $authHeader
-      } catch {
-        Fail-Job "Could not read $branch on origin. $($_.Exception.Message)"
-      }
-      if ($remoteSha) { Write-JobLog "Replacing existing $branch at $remoteSha (lease-guarded)." }
-      $r = Invoke-PublishGit -GitArgs (Get-PublishPushArgs -RemoteUrl $remoteUrl -Branch $branch -ExpectedSha $remoteSha) -AuthHeader $authHeader
-      if ($r.ExitCode -ne 0) { Fail-Job "git push of $branch failed. $($r.Output)" }
-
-      $scenarios = @()
-      if (Test-Path -LiteralPath $ScenarioPath) {
-        $scenarios = @(Get-Content -LiteralPath $ScenarioPath -Encoding UTF8 | Where-Object { $_ })
-      }
-      $scenarioMd = if ($scenarios.Count -gt 0) { ($scenarios | ForEach-Object { "- $_" }) -join "`n" } else { '- (none found in the change specs)' }
-      $runTime = Get-ElapsedText
-      $prBody = @"
-Opened by the local builder for issue #$issue (``openspec/changes/$changeId``), tasks $taskNumbers.
-
-### Spec scenarios
-$scenarioMd
-
-<!-- local-builder-stats -->
-### Local builder stats
-| Field | Value |
-|---|---|
-| Model | qwen2.5-coder:7b (num_ctx 4096) |
-| Attempts | $attempts of 2 |
-| Run time | $runTime |
-| Tests passed on first try | $firstTry |
-| Edit format | $editFormat |
-| Files changed | $fileCount |
-| Issue / change | #$issue / openspec/changes/$changeId |
-"@
-      $pr = Publish-PullRequest -Repo $env:GITHUB_REPOSITORY -Branch $branch -Title "[local-builder] ${changeId}: tasks ${taskNumbers}" -Body $prBody
-      Write-JobLog "Opened or updated PR $($pr.html_url)"
-      $prNumber = $pr.number
-      $labelBody = '{"labels":["local-builder"]}'
-      Invoke-GitHub -Method POST -Uri "https://api.github.com/repos/$($env:GITHUB_REPOSITORY)/issues/$prNumber/labels" -Body $labelBody | Out-Null
-      try {
-        Invoke-GitHub -Method DELETE -Uri "https://api.github.com/repos/$($env:GITHUB_REPOSITORY)/issues/$issue/labels/local-builder-running" | Out-Null
-      } catch {
-        Write-JobLog 'Could not remove local-builder-running from the issue (it may already be gone).'
-      }
-    } finally {
-      Pop-Location
+      $m = New-ResultArtifact -Workspace $env:GITHUB_WORKSPACE -BaseSha (Get-BaseRef) -ChangeId $env:CHANGE_ID -Changed $changed `
+        -Stats @{ attempts = $attempts; tests_first_try = $firstTry; edit_format = $editFormat } -OutDir $ResultDir
+    } catch {
+      Fail-Job "Packaging the result failed. $($_.Exception.Message)"
     }
+    Write-JobLog ("Packaged {0} file(s) for publish: {1}" -f @($m.files).Count, ($changed -join ', '))
   }
 }
