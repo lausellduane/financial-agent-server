@@ -12,7 +12,7 @@ $fails = 0
 function Check($name, $ok) {
   if ($ok) { Write-Host "ok   $name" } else { Write-Host "FAIL $name"; $script:fails++ }
 }
-function Git { & git @args 2>&1 | Out-Null; if ($LASTEXITCODE -ne 0) { throw "git $args failed" } }
+function Invoke-TestGit { & git @args 2>&1 | Out-Null; if ($LASTEXITCODE -ne 0) { throw "git $args failed" } }
 
 # 1. Forbidden-path guard
 foreach ($p in '.github/x', '.git/config', '.env', '.dev.vars', './.github/x') {
@@ -29,18 +29,18 @@ $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("lb-" + [guid]::NewGuid())
 New-Item -ItemType Directory $tmp | Out-Null
 try {
   Push-Location $tmp
-  Git init -q -b master
-  Git config user.email t@example.com
-  Git config user.name t
+  Invoke-TestGit init -q -b master
+  Invoke-TestGit config user.email t@example.com
+  Invoke-TestGit config user.name t
   Set-Content a.txt 'base'
-  Git add a.txt
-  Git commit -q -m base
+  Invoke-TestGit add a.txt
+  Invoke-TestGit commit -q -m base
   $base = (git rev-parse HEAD).Trim()
   $leak = Join-Path $tmp 'leak.txt'
   Set-Content (Join-Path $tmp '.git/hooks/pre-commit') "#!/bin/sh`necho `$GH_TOKEN > '$leak'`n"
   if ($IsLinux -or $IsMacOS) { chmod +x (Join-Path $tmp '.git/hooks/pre-commit') }
   Set-Content b.txt 'x'
-  Git add b.txt
+  Invoke-TestGit add b.txt
   $env:GH_TOKEN = 'secret'
   $saved = $env:GH_TOKEN
   Remove-Item Env:GH_TOKEN
@@ -50,17 +50,18 @@ try {
   Check 'commit succeeded' ($LASTEXITCODE -eq 0)
   Check 'pre-commit hook did not run' (-not (Test-Path $leak))
   Remove-Item Env:GH_TOKEN
+  Remove-Item (Join-Path $tmp '.git/hooks/pre-commit') -Force   # later setup commits must not run it
 
   # 5/6. Base ref: local master behind origin/master, existing branch recreated
-  Git checkout -q -b local-builder/issue-1
-  Git checkout -q master
+  Invoke-TestGit checkout -q -b local-builder/issue-1
+  Invoke-TestGit checkout -q master
   Set-Content c.txt 'upstream'
-  Git add c.txt
-  Git commit -q -m upstream
+  Invoke-TestGit add c.txt
+  Invoke-TestGit commit -q -m upstream
   $fresh = (git rev-parse HEAD).Trim()
-  Git checkout -q local-builder/issue-1
-  Git branch -q -f master $base            # local master is stale
-  Git checkout -q -B local-builder/issue-1 $fresh   # relabel retry recreates the branch
+  Invoke-TestGit checkout -q local-builder/issue-1
+  Invoke-TestGit branch -q -f master $base            # local master is stale
+  Invoke-TestGit checkout -q -B local-builder/issue-1 $fresh   # relabel retry recreates the branch
   Check 'existing branch recreated from fresh base' ((git rev-parse HEAD).Trim() -eq $fresh)
   Set-Content d.txt 'agent'
   $env:GITHUB_WORKSPACE = $tmp
