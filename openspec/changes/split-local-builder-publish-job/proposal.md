@@ -71,8 +71,9 @@ Also:
 - **Behavior Duane sees:** the same labels, comments, branch name, PR title, label, and stats block. The PR still
   opens as `github-actions[bot]`, and CI still waits for "Approve workflows to run".
 - **Base commit:** `build` checks out `github.sha`, the default-branch commit when the label was added, instead
-  of re-fetching `origin/master` mid-job. That is still "fresh master" for a relabel retry (see design.md §4 and
-  open question 1).
+  of re-fetching `origin/master` mid-job. That is still "fresh master" for a relabel retry (see design.md §4).
+- **Recommended defaults:** design.md §10 lists five defaults (base commit, `build` permissions, npm cache
+  follow-up, artifact visibility, size limits). Merging this folder accepts them.
 
 ## Acceptance criteria
 

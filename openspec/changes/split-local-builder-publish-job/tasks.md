@@ -32,7 +32,7 @@
 - [ ] 4.2 Add `.github/scripts/local-builder-publish.ps1` with every check in design.md §4: size limits, schema, base sha equals `github.sha`, change id equals `start`'s, re-derived allowed list, path rules, sha256 and bytes, no symlinks, and a post-write diff that matches the manifest exactly. Port `Invoke-PublishGit`, `Get-PublishPushArgs`, `Get-RemoteBranchSha`, and `Publish-PullRequest` from `1ee78fb`. Build the PR title, body, and stats block from trusted values only.
   Files:
   - .github/scripts/local-builder-publish.ps1
-- [ ] 4.3 Harness cases, each of which must make `publish` push nothing: a path not in the allowed list; `.github/x`; `../x`; an absolute path; a duplicate path; a wrong `base_sha`; a wrong `change_id`; a sha256 mismatch; an extra unlisted file in the artifact; an oversize manifest; `attempts: 3`; an unknown key; and a symlink at the target path.
+- [ ] 4.3 Harness cases, each of which must make `publish` push nothing: a path not in the allowed list; `.github/x`; `../x`; an absolute path; a duplicate path; a wrong `base_sha`; a wrong `change_id`; a sha256 mismatch; an extra unlisted file in the artifact; 11 files; a blob over 512 KB; over 1 MB in total; a manifest over 16 KB; `attempts: 3`; an unknown key; and a symlink at the target path.
 - [ ] 4.4 Steps: checkout `github.sha` (`persist-credentials: false`), download `local-builder-result` with `actions/download-artifact` pinned to a full commit SHA, then run the publish script. No `npm`, `npx`, or `node`.
 
 ## 5. `report` job
@@ -46,4 +46,5 @@
 - [ ] 6.2 [Duane, with Team] Dry runs on the PC: (a) a bad change id, so `start` comments; (b) Ollama quit, so `report` comments with the pre-flight reason; (c) a real small card, so the PR opens with the label, title, branch, and stats block; (d) a cancelled `build`, so `report` comments with the fallback text. These confirm artifacts on the self-hosted runner and the `needs.*.result` and `always()` behavior.
 - [ ] 6.3 Run `pwsh -File .github/scripts/local-builder.tests.ps1` plus `npm test`, `npx tsc --noEmit`, and `npm run check:worker`. All pass.
 - [ ] 6.4 Confirm PR #13's acceptance criteria, as changed in design.md §9.
-- [ ] 6.5 Push to the PR #13 branch. Code Reviewer re-reviews, QA retests, and Duane merges.
+- [ ] 6.5 [Team] Open a separate small Explore issue for removing `cache: npm` from the `deploy-poc.yml` deploy job (design.md §10, item 3). Not part of this change.
+- [ ] 6.6 Push to the PR #13 branch. Code Reviewer re-reviews, QA retests, and Duane merges.

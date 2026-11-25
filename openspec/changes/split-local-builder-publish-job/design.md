@@ -86,8 +86,9 @@ Notes:
   skipped), or `publish` failed. If `start` itself failed, its own failure step comments, which needs no artifact.
   `needs.<job>.result` and `always()` in a dependent job are standard practice but not spelled out on the pages
   checked **[unverified]**. The apply step confirms them with a dry run (task 6.2).
-- **`build` keeps `contents: read`, not `permissions: {}`.** `actions/checkout` uses the job token. On a public
-  repo, read access is harmless if leaked. With `{}`, checkout might fail. Pilot can try `{}` later.
+- **`build` keeps `contents: read`, not `permissions: {}`** (recommended default, §10). `actions/checkout` uses
+  the job token. On a public repo, a leaked read token reveals nothing that isn't already public. With `{}`,
+  checkout might fail **[unverified]**, and a broken pilot costs more than the tiny gain. It can be tightened later.
 - **Cost:** `start`, `publish`, and `report` each take about 1 to 2 minutes on `ubuntu-latest`, which is free for
   public repos.
 - **`pwsh` on `ubuntu-latest`:** the Ubuntu 24.04 image ships PowerShell 7. `ubuntu-latest` is moving to 26.04
@@ -137,8 +138,9 @@ files/1
 `publish` re-derives everything it can from trusted sources: the event payload, `start`'s outputs, and the
 checkout of `github.sha`. From the artifact it takes only file bytes and three enumerated stats.
 
-1. **Size before parsing.** The downloaded directory has at most 50 files and 2 MB in total, and
-   `manifest.json` is at most 64 KB. Anything else in the directory that the manifest doesn't list is rejected.
+1. **Size before parsing.** The manifest lists at most 10 files. Each blob is at most 512 KB, the downloaded
+   directory is at most 1 MB in total, and `manifest.json` is at most 16 KB. A normal card is about 20 KB; the
+   per-file limit leaves room for `package-lock.json` (147 KB today) if a task lists it. Anything else in the directory that the manifest doesn't list is rejected.
 2. **Schema.** `version == 1`. `base_sha` matches `^[0-9a-f]{40}$` **and equals `github.sha`**. `change_id`
    equals `needs.start.outputs.change_id`. `op` is `write` or `delete`. `blob` matches `^files/[0-9]+$`. The
    stats come from fixed sets: `attempts` is 1 or 2, `tests_first_try` is `yes` or `no`, and `edit_format` is
@@ -166,7 +168,7 @@ comments. The artifact's own text is never echoed into that reason.
 Pinning both jobs to `github.sha` (the default-branch head when the label was added) gives one trusted base with
 nothing to prove. A relabel retry still starts from the latest `master`, because relabeling creates a new
 event. The only difference: if `master` moves while the job is queued, the PR is based on the older commit
-and GitHub shows any conflict. See open question 1.
+and GitHub shows any conflict. This is the recommended default (§10).
 
 ## 5. Failure reporting (`report` job)
 
@@ -230,8 +232,12 @@ and GitHub shows any conflict. See open question 1.
   by every branch. If a compromised `build` can write to the Actions cache, it could poison `deploy-poc.yml`'s
   `setup-node` npm cache. `npm ci` checks each package against `package-lock.json` integrity hashes, which limits
   this. Whether a `run:` step, or a lingering process, can get the cache credential is **[unverified]**; the
-  docs say the cache mode env is set only for JavaScript and container actions. See open question 3.
-- **Artifact visibility.** It's public for one day (§3).
+  docs say the cache mode env is set only for JavaScript and container actions. Cache entries also can't be
+  overwritten, so an attacker would have to create the entry before the real one exists. **Follow-up, outside
+  this change (§10):** remove `cache: npm` from the deploy job only (the one with Cloudflare secrets), and keep it
+  on the test job. That costs about 20 to 30 seconds per deploy and removes the path where it matters.
+- **Artifact visibility.** Any signed-in GitHub user can download it for one day (§3). Accepted (§10): it holds
+  only what becomes public anyway in the PR or the failure comment, and the PC holds no secrets.
 
 ## 8. Steps that change
 
@@ -272,6 +278,19 @@ From `add-local-builder-runner` (spec and design §3, §6, §8) and `fix-local-b
   from `start` to PR opened.
 - **Pilot criterion 6** (failure path) is now done by `report`. The comment and labels are unchanged.
 - **Pilot criterion 7** (no secrets on the PC) is strengthened: no write-scoped token is ever sent to the PC.
+
+## 10. Recommended defaults (Duane confirms or overrules)
+
+These are the defaults this change is written to. Merging this folder accepts them. To overrule one, comment
+on the proposal PR before merging.
+
+| # | Question | Default | Why |
+|---|---|---|---|
+| 1 | Which `master` commit the PR builds on | `github.sha` (head of `master` when the label was added), used by both `build` and `publish` | One trusted value, read straight from GitHub; `publish` has nothing to prove. Jobs run one at a time, so the gap is small, and a relabel gets a fresh `github.sha`. The alternative (fetch fresh `master` in `build`) makes `publish` prove an untrusted sha is on `master`. |
+| 2 | `build` permissions | `contents: read` | Harmless on a public repo. `{}` might break checkout for a tiny gain. Can be tightened later. |
+| 3 | npm cache in `deploy-poc.yml` | Accept for now; **separate follow-up** removes `cache: npm` from the deploy job only | Low risk: `run:` steps don't get the cache credential, entries can't be overwritten, and `npm ci` checks integrity hashes. Dropping it in the one job with secrets is cheap insurance. |
+| 4 | Artifact visibility | Accept, with `retention-days: 1` | Holds nothing that isn't public anyway in the PR or the failure comment. The PC holds no secrets. |
+| 5 | Artifact size limits | At most 10 files, 512 KB per file, 1 MB total, 16 KB manifest | Normal cards are about 20 KB. Leaves room for `package-lock.json` (147 KB) and rejects anything absurd. The allowed-file check is the main limit; these are a backstop. |
 
 ## Sources checked (Nov 24, 2026)
 
