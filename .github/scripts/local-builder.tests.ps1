@@ -310,6 +310,17 @@ $script:openPrs = @([pscustomobject]@{ number = 12 })
 Publish-PullRequest -Repo 'o/r' -Branch 'local-builder/issue-7' -Title 't' -Body 'b' | Out-Null
 Check 'PR: reuses the open PR on a relabel retry' ((@($script:ghCalls | Where-Object Method -eq 'POST').Count -eq 0) -and (($script:ghCalls | Where-Object Method -eq 'PATCH').Uri -like '*/pulls/12'))
 Check 'PR: looks up open PRs by owner:branch' (($script:ghCalls | Where-Object Method -eq 'GET').Uri -like '*head=o:local-builder/issue-7*')
+
+# Failure labels: the trigger label comes off too, so a retry is just re-adding it (dry run A, issue #24).
+$script:ghCalls = @()
+Set-FailureLabels -Repo 'o/r' -Issue '24'
+Check 'labels: adds local-builder-failed' (@($script:ghCalls | Where-Object { $_.Method -eq 'POST' -and $_.Uri -like '*/issues/24/labels' -and $_.Body -match 'local-builder-failed' }).Count -eq 1)
+Check 'labels: removes local-builder-running' (@($script:ghCalls | Where-Object { $_.Method -eq 'DELETE' -and $_.Uri -like '*/issues/24/labels/local-builder-running' }).Count -eq 1)
+Check 'labels: removes the local-builder trigger' (@($script:ghCalls | Where-Object { $_.Method -eq 'DELETE' -and $_.Uri -like '*/issues/24/labels/local-builder' }).Count -eq 1)
+function Invoke-GitHub { param([string]$Method, [string]$Uri, [string]$Body) throw '404 label not on issue' }
+$threw = $false
+try { Set-FailureLabels -Repo 'o/r' -Issue '24' 6>$null | Out-Null } catch { $threw = $true }
+Check 'labels: missing labels do not fail the report' (-not $threw)
 ${function:Invoke-GitHub} = $realInvokeGitHub
 
 # Result artifact: build packages it, publish validates it as untrusted input, then applies it.

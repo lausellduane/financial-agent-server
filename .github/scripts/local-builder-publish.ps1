@@ -311,6 +311,25 @@ function Format-FailureComment {
   return $c
 }
 
+function Set-FailureLabels {
+  # Adds local-builder-failed and removes both local-builder-running and the local-builder
+  # trigger label. start removes the trigger only after the issue parses, so an early
+  # failure would otherwise leave it on and a retry would need a remove and re-add.
+  param([string]$Repo, [string]$Issue)
+  try {
+    Invoke-GitHub -Method POST -Uri "https://api.github.com/repos/$Repo/issues/$Issue/labels" -Body '{"labels":["local-builder-failed"]}' | Out-Null
+  } catch {
+    Write-Host "Failed to add local-builder-failed. $($_.Exception.Message)"
+  }
+  foreach ($label in 'local-builder-running', 'local-builder') {
+    try {
+      Invoke-GitHub -Method DELETE -Uri "https://api.github.com/repos/$Repo/issues/$Issue/labels/$label" | Out-Null
+    } catch {
+      Write-Host "$label was already absent."
+    }
+  }
+}
+
 function Read-OptionalText {
   param([string]$Dir, [string]$Name)
   if (-not $Dir) { return '' }
@@ -472,15 +491,6 @@ $scenarioMd
     } catch {
       Write-Host "Failed to comment on issue #$issue. $($_.Exception.Message)"
     }
-    try {
-      Invoke-GitHub -Method POST -Uri "https://api.github.com/repos/$repo/issues/$issue/labels" -Body '{"labels":["local-builder-failed"]}' | Out-Null
-    } catch {
-      Write-Host "Failed to add local-builder-failed. $($_.Exception.Message)"
-    }
-    try {
-      Invoke-GitHub -Method DELETE -Uri "https://api.github.com/repos/$repo/issues/$issue/labels/local-builder-running" | Out-Null
-    } catch {
-      Write-Host 'local-builder-running was already absent.'
-    }
+    Set-FailureLabels -Repo $repo -Issue $issue
   }
 }
